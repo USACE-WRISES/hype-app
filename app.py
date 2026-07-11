@@ -2199,6 +2199,7 @@ def server(input, output, session):
                  "g_qual_left", "g_qual_right", "g_ref_slope", "g_left_ctl", "g_right_ctl",
                  "usgs_region", "usgs_lat", "usgs_lon", "usgs_national",
                  "soil_policy", "use_soil_k", "sens_design",
+                 "site_name", "site_analyst", "site_org", "site_date", "site_notes",
                  "ras_flow", "ras_slope", "ras_n", "ras_cell", "ras_hours", "ras_dt",
                  "ras_out_min", "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
                  "cell_size", "gw_mod_depth", "z", "pt_per_cell", "pt_min_mult",
@@ -2695,6 +2696,41 @@ def server(input, output, session):
             pass
         return None
 
+    def _reach_endpoints_latlon():
+        """(upstream, downstream) LatLon of the oriented reach centerline, in WGS84."""
+        try:
+            from hype_app.contracts import LatLon
+            feat = reach_feat()
+            coords = ((feat or {}).get("geometry") or {}).get("coordinates") or []
+            if len(coords) >= 2:
+                up, dn = coords[0], coords[-1]
+                return (LatLon(lat=float(up[1]), lon=float(up[0])),
+                        LatLon(lat=float(dn[1]), lon=float(dn[0])))
+        except Exception:  # noqa: BLE001
+            pass
+        return None, None
+
+    def _site_metadata():
+        """SiteMetadata (§11.1) from the analyst-entered fields + geometry-derived reach length,
+        outlet, and endpoints. Descriptive metadata — it never affects the physics or staleness."""
+        from datetime import date as _date
+
+        from hype_app.contracts import SiteMetadata
+        up, dn = _reach_endpoints_latlon()
+        ad = _safe("site_date", "")
+        try:
+            adate = _date.fromisoformat(ad) if ad else None
+        except Exception:  # noqa: BLE001
+            adate = None
+        return SiteMetadata(
+            site_name=(str(_safe("site_name", "")).strip() or None),
+            analyst=(str(_safe("site_analyst", "")).strip() or None),
+            organization=(str(_safe("site_org", "")).strip() or None),
+            notes=(str(_safe("site_notes", "")).strip() or None),
+            assessment_date=adate,
+            upstream_point=up, downstream_point=dn, outlet=dn,
+            reach_length_m=_reach_length_m())
+
     def _report_modal(res, paths):
         html = report_mod.render_html(res, app_version=APP_VERSION)
         return ui.modal(
@@ -2753,6 +2789,13 @@ def server(input, output, session):
         try:
             from hype_app.contracts import AssessmentInputSnapshot
             snap = AssessmentInputSnapshot.model_validate(snap_dict)
+            # Overlay the CURRENT site metadata (name/analyst/date…) so fields filled after the
+            # run still appear — descriptive metadata, never physics, so this doesn't reopen the
+            # frozen inputs.
+            try:
+                snap = snap.model_copy(update={"site": _site_metadata()})
+            except Exception:  # noqa: BLE001
+                pass
             stats = (hz.get("stats") or {}).get("classes") or hz.get("stats") or {}
             hyp = stats.get("hyporheic") or {}
             vol, porosity = hyp.get("volume_m3"), snap.k.porosity
@@ -3684,8 +3727,11 @@ def server(input, output, session):
                     reach_geojson=reach_feat(), domain_geojson=domain_feat(),
                     boundary_geojson={"upstream": up_feat(), "left": left_feat(),
                                       "right": right_feat(), "downstream": down_feat()},
+                    site=_site_metadata(),
                     terrain=snapshot.TerrainSource(
                         wse_mode=wse_mode_v(), crs_epsg=(int(epsg) if epsg else None),
+                        dem_source=((dem_meta() or {}).get("source") or ("3DEP" if active_dem() else None)),
+                        dem_resolution_m=(dem_meta() or {}).get("resolution_m"),
                         model_origin_elev=payload["params"].get("model_origin_elev")),
                     use_kzones=use_kz, kzone_count=len(payload["kzones"]),
                     kzone_kh=payload["kzone_kh"], kzone_kv=payload["kzone_kv"],
@@ -5783,7 +5829,18 @@ def server(input, output, session):
         hd_contours_v.set(bool(st.get("head_contours", True)))
         # frozen run snapshot: prefer config/assessment_input.json, fall back to the state copy
         # (None for v1 projects — the legacy adapter).
-        input_snapshot.set(payload.get("assessment_input") or st.get("input_snapshot"))
+        _snap_in = payload.get("assessment_input") or st.get("input_snapshot")
+        input_snapshot.set(_snap_in)
+        # Repopulate the site-metadata inputs from the frozen snapshot so a reopened project can
+        # regenerate an identical report — the accordion is collapsed at save time, so these
+        # widgets otherwise come back empty even though the data is in the snapshot.
+        _site = (_snap_in or {}).get("site") or {}
+        for _iid, _key in (("site_name", "site_name"), ("site_analyst", "analyst"),
+                           ("site_org", "organization"), ("site_notes", "notes")):
+            if _site.get(_key):
+                _kept[_iid] = _site[_key]
+        if _site.get("assessment_date"):
+            _kept["site_date"] = str(_site["assessment_date"])
         flow_lookup.set(st.get("flow_lookup"))
         flow_source.set(st.get("flow_source"))
         _soil = st.get("soil_snapshot")
@@ -6271,6 +6328,24 @@ def server(input, output, session):
                 parts.append(_next_hint("gw.res.hz", "Delineate the hyporheic zone →",
                                         primary=True))
             else:                          # hyporheic zone delineated -> the site report is available
+                parts.append(ui.accordion(
+                    ui.accordion_panel(
+                        "Site details (for the report)",
+                        ui.input_text("site_name", "Site name",
+                                      value=_keep("site_name", ""), placeholder="e.g. Mink Brook"),
+                        ui.div(
+                            ui.input_text("site_analyst", "Analyst",
+                                          value=_keep("site_analyst", "")),
+                            ui.input_text("site_org", "Organization",
+                                          value=_keep("site_org", "")),
+                            class_="hype-field-row"),
+                        ui.input_text("site_date", "Assessment date (YYYY-MM-DD)",
+                                      value=_keep("site_date", "")),
+                        ui.input_text_area("site_notes", "Notes",
+                                           value=_keep("site_notes", ""), rows=2),
+                        ui.div("Outlet, endpoints and reach length are taken from the drawn "
+                               "reach automatically.", class_="hype-instr")),
+                    open=False, id="site_meta_acc"))
                 parts.append(ui.div(_evt_btn("gen_report_evt", "Generate site report",
                                              "btn-primary btn-sm"),
                                     class_="hype-actions"))

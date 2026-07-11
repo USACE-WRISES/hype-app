@@ -56,6 +56,29 @@ def test_v2_roundtrip(tmp_path):
     assert (dst / "inputs" / "dem.tif").read_bytes() == b"FAKE-DEM"
     assert (dst / "data_sources" / "usgs" / "delineate.json").exists()
     assert (dst / "sensitivity" / "manifest.json").exists()
+
+
+def test_site_metadata_survives_roundtrip(tmp_path):
+    """The site identity (name/analyst/org/date) in the frozen snapshot must round-trip through
+    the archive so a reopened project regenerates an identical report (§11.1, §14.18). This is
+    the exact data _apply_project reads back into the site-metadata inputs."""
+    src = tmp_path / "s"
+    src.mkdir()
+    _make_workspace(src)
+    snap = {"schema_version": "assessment-input-snapshot/2.0", "assessment_id": "A1",
+            "site": {"site_name": "Mink Brook", "analyst": "A. Hydrologist",
+                     "organization": "USACE ERDC", "assessment_date": "2026-07-11",
+                     "reach_length_m": 904.7}}
+    zip_path = bundle.zip_workspace(src, vectors={}, state={"format_version": 2},
+                                    assessment_input=snap)
+    dst = tmp_path / "d"
+    dst.mkdir()
+    site = (bundle.restore_workspace(zip_path, dst)["assessment_input"] or {}).get("site") or {}
+    assert site["site_name"] == "Mink Brook"
+    assert site["analyst"] == "A. Hydrologist"
+    assert site["organization"] == "USACE ERDC"
+    assert site["assessment_date"] == "2026-07-11"
+    assert site["reach_length_m"] == 904.7
     assert (dst / "report" / "report.html").exists()
 
 
