@@ -27,6 +27,14 @@ BASE_URL = "https://streamstats.usgs.gov"
 PEAK_FLOW_STATISTIC_GROUP = "2"
 METHOD_VERSION = "streamstats-nss/1.0"
 
+# ss-hydro returns these as "not computable at this point" sentinels; treating them as real
+# values would poison the regression estimate (garbage discharge or a solver error).
+_NODATA_SENTINELS = (-999.0, -998.0, -9999.0, -9998.0)
+
+
+def _is_nodata(v) -> bool:
+    return (not isinstance(v, (int, float))) or v in _NODATA_SENTINELS
+
 # name pattern that unambiguously states annual-exceedance probability, e.g. "50-percent AEP flood"
 _AEP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*percent\s+AEP", re.IGNORECASE)
 
@@ -171,7 +179,8 @@ class StreamStatsClient:
 
         bc = self.basin_characteristics(region, lat, lon, codes, cancel=cancel) if codes else []
         values = {str(p.get("code")).upper(): p.get("value") for p in bc
-                  if isinstance(p, dict) and p.get("code") is not None}
+                  if isinstance(p, dict) and p.get("code") is not None
+                  and not _is_nodata(p.get("value"))}    # drop -999 NoData (§5.7)
         snap.basin_characteristics = values
         missing = [c for c in codes if c.upper() not in values]
         if missing:
@@ -208,26 +217,51 @@ class StreamStatsClient:
         return snap
 
     def _national(self, region, lat, lon, statistic_groups, *, cancel=None):
-        """National catalog fallback (§5.2 step 9). Best-effort — flags candidates is_national and
-        never raises: a national outage must not sink the regional result."""
+        """National catalog fallback / comparison (§5.2 step 9). Best-effort — flags candidates
+        is_national and never raises: a national outage must not sink the regional result.
+
+        The national NSS regression ("US") is discovered and estimated under region "US", but its
+        basin characteristics must be computed through a REAL ss-delineate region (the state that
+        delineated) — "US" is not a delineation region and 500s. When required national basin
+        characteristics come back as NoData for this point, the national estimate simply isn't
+        available here; that is reported as a warning, not an error.
+        """
         warnings: list[HypeWarning] = []
         try:
             scen = self.scenarios("US", statistic_groups=statistic_groups, cancel=cancel)
             if not scen:
+                warnings.append(HypeWarning(
+                    code="national_unavailable",
+                    message="USGS returned no national peak-flow regression for this point."))
                 return [], warnings
             codes = sorted({str(p.get("code")) for s in scen
                             for rr in s.get("regressionRegions", [])
                             for p in rr.get("parameters", []) if p.get("code")})
-            bc = self.basin_characteristics("US", lat, lon, codes, cancel=cancel) if codes else []
+            # compute the national params through the REAL delineation region (not "US")
+            bc = self.basin_characteristics(region, lat, lon, codes, cancel=cancel) if codes else []
             values = {str(p.get("code")).upper(): p.get("value") for p in bc
-                      if isinstance(p, dict) and p.get("code") is not None}
+                      if isinstance(p, dict) and p.get("code") is not None
+                      and not _is_nodata(p.get("value"))}
+            missing = [c for c in codes if c.upper() not in values]
+            if missing:
+                warnings.append(HypeWarning(
+                    code="national_unavailable",
+                    message=("National estimate needs basin characteristics that aren't "
+                             f"computable at this point: {', '.join(missing)}. Regional "
+                             "statistics above are unaffected.")))
+                return [], warnings
             for s in scen:
                 for rr in s.get("regressionRegions", []):
                     for p in rr.get("parameters", []):
                         if str(p.get("code", "")).upper() in values:
                             p["value"] = values[str(p["code"]).upper()]
             est = self.estimate("US", scen, cancel=cancel)
-            return self._normalize(est, region="US", national=True), warnings
+            cands = self._normalize(est, region="US", national=True)
+            if not cands:
+                warnings.append(HypeWarning(
+                    code="national_unavailable",
+                    message="USGS returned no usable national discharge estimate for this point."))
+            return cands, warnings
         except Exception as e:  # noqa: BLE001
             warnings.append(HypeWarning(code="national_unavailable",
                                         message=f"National fallback unavailable: {e}"))

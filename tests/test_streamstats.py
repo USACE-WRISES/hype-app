@@ -141,6 +141,49 @@ def test_national_fallback_when_no_regional_discharge():
     assert not any(c.insertable and not c.is_national for c in snap.candidates)  # no regional discharge
 
 
+def test_national_nodata_degrades_without_crash():
+    """When the national basin characteristics come back as -999 NoData sentinels, the national
+    estimate isn't computable at this point — the client must emit an actionable warning and keep
+    the regional results, NOT crash (the live regression that broke national comparison)."""
+    reg_scen = [{"statisticGroupID": 2, "statisticGroupName": "Peak-Flow Statistics",
+                 "regressionRegions": [{"id": 1, "name": "RR", "code": "GC1",
+                                        "parameters": [{"code": "DRNAREA", "value": 12.8,
+                                                        "limits": {"min": 0.1, "max": 100.0}}]}]}]
+    us_scen = [{"statisticGroupID": 2, "regressionRegions": [
+        {"name": "National Urban", "code": "USRR",
+         "parameters": [{"code": "IMPERV"}, {"code": "BDF"}]}]}]
+    regional_est = [{"statisticGroupID": 2, "regressionRegions": [
+        {"name": "RR", "code": "GC1", "statusID": 4,
+         "parameters": [{"code": "DRNAREA", "value": 12.8, "limits": {"min": 0.1, "max": 100.0}}],
+         "results": [{"name": "50-percent AEP flood", "code": "PK50AEP", "value": 415.0,
+                      "unit": {"abbr": "ft^3/s"}}]}]}]
+
+    def handler(request):
+        p = request.url.path
+        region_us = (request.url.params.get("regions") == "US")
+        if "ss-delineate" in p:
+            return httpx.Response(200, json={"bcrequest": {"wsresp": {
+                "workspace_id": "w", "featurecollection": [{"name": "globalwatershed"}]}}})
+        if "basin-characteristics" in p:
+            bcs = (request.url.params.get("BCs") or "")
+            if "IMPERV" in bcs or "BDF" in bcs:                 # national urban params: NoData here
+                return httpx.Response(200, json=[{"code": "IMPERV", "value": -999.0},
+                                                 {"code": "BDF", "value": -999.0}])
+            return httpx.Response(200, json=[{"code": "DRNAREA", "value": 12.8}])
+        if p.endswith("/scenarios"):
+            return httpx.Response(200, json=us_scen if region_us else reg_scen)
+        if p.endswith("/estimate"):
+            return httpx.Response(200, json=regional_est)      # national estimate must NOT be called
+        return httpx.Response(404)
+
+    snap = _client(handler).lookup_flow("NH", 43.688, -72.243, want_national=True)
+    regional = [c for c in snap.candidates if not c.is_national]
+    national = [c for c in snap.candidates if c.is_national]
+    assert regional and any(c.insertable for c in regional)     # regional survives
+    assert not national                                          # no bogus national candidate
+    assert any(w.code == "national_unavailable" and "IMPERV" in w.message for w in snap.warnings)
+
+
 def test_cancellation_stops_workflow(fixture_handler):
     from hype_app.services.http import ServiceCancelled
     with pytest.raises(ServiceCancelled):

@@ -82,9 +82,30 @@ def test_html_self_contained_and_escaped(results):
     # user text is escaped (no raw script tag)
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
-    # self-contained: no external resource references
-    assert "http://" not in html and "https://" not in html
+    # self-contained: nothing is FETCHED from the network — no external stylesheet/script/img/font
+    # (citation URLs printed as plain text are fine; the page still renders fully offline).
+    import re
+    assert not re.search(r'<(?:script|img|link)\b[^>]*\b(?:src|href)\s*=\s*["\']https?://', html)
+    assert "@import" not in html and "url(http" not in html
     assert "<style>" in html            # inline CSS
+
+
+def test_report_covers_all_spec_sections(results):
+    """§11.3: the report must document inputs, data sources/provenance, software, and
+    references — not just the metric tables."""
+    from hype_app.report import (
+        data_source_rows, input_rows, report_references)
+    irows = input_rows(results)
+    assert any(r["name"] == "Porosity" for r in irows)
+    assert any(r["section"] == "Grid" for r in irows)
+    dsrc = data_source_rows(results)
+    assert any(r["item"] == "Streamflow" and "USGS" in r["source"] for r in dsrc)
+    refs = report_references(results)
+    assert any("Harvey" in (r.get("authors") or "") for r in refs)
+    html = render_html(results, app_version="2026.07", model_version="MODFLOW 6")
+    for heading in ("Model inputs", "Data sources", "Software versions", "References"):
+        assert heading in html, f"HTML missing section: {heading}"
+    assert "USACE" in html and "500" in html      # analyst org + reach length surfaced
 
 
 def test_json_roundtrips_and_agrees(results):
