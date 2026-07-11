@@ -36,8 +36,9 @@ warnings.filterwarnings("ignore", message=r".*Widget\.widgets is deprecated.*")
 import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
-from hype_app import (bieger, bundle, carve, delineate, dem, estimate, geocode, geometry,  # noqa: E402
-                      hydro, hz_results, mesh, ras_results, results, scene, snapshot, ui_tree)
+from hype_app import (assess, bieger, bundle, carve, delineate, dem, estimate, geocode,  # noqa: E402
+                      geometry, hydro, hz_results, mesh, ras_results, report as report_mod,
+                      results, scene, snapshot, ui_tree)
 from hype_app import hz_run  # noqa: E402
 from hype_app import soil_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
@@ -320,6 +321,8 @@ def server(input, output, session):
     flow_source = reactive.value(None)      # {"source","candidate_id","inserted_cfs"} provenance
     soil_snapshot = reactive.value(None)    # NRCS SoilDataSnapshot (dict) from the soils fetch
     soil_overrides = reactive.value([])     # list[SoilOverride dict] applied by the analyst
+    results_model = reactive.value(None)    # AssessmentResultsV2 (dict) — the canonical report model
+    report_paths = reactive.value(None)     # {format: path} of the last generated report
     fp_stats = reactive.value(None)         # per-particle flow-path metrics DataFrame (Results)
     fp_gdf = reactive.value(None)           # 4326 pathlines gdf — the drawn = selectable set
     sel_pids = reactive.value(())           # selected flow-path particleids (tuple)
@@ -2568,6 +2571,87 @@ def server(input, output, session):
                        class_="hype-instr") if bedrock else None,
                 class_="hype-soil-comp"))
         return ui.div(*blocks)
+
+    # ------------------------------------------------------------------
+    # Site Summary report (revision §11): assemble canonical model -> HTML/PDF/CSV/JSON
+    # ------------------------------------------------------------------
+    def _reach_length_m():
+        try:
+            snap = input_snapshot() or {}
+            rl = (snap.get("site") or {}).get("reach_length_m")
+            if rl:
+                return float(rl)
+            crs = proj_crs()
+            gdf = geometry.single_feature_gdf(reach_feat())
+            if crs is not None and gdf is not None and len(gdf):
+                return float(gdf.to_crs(crs).length.iloc[0])
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _report_modal(res, paths):
+        html = report_mod.render_html(res, app_version=APP_VERSION)
+        return ui.modal(
+            ui.div(
+                ui.download_button("dl_report_html", "HTML", class_="btn-sm btn-outline-primary"),
+                ui.download_button("dl_report_pdf", "PDF", class_="btn-sm btn-outline-primary"),
+                ui.download_button("dl_report_csv", "Metrics CSV", class_="btn-sm btn-outline-primary"),
+                ui.download_button("dl_report_json", "JSON", class_="btn-sm btn-outline-primary"),
+                class_="hype-actions"),
+            ui.tags.iframe(srcdoc=html, style="width:100%;height:60vh;border:1px solid #ccc"),
+            title="Site Summary Report", size="xl", easy_close=True,
+            footer=ui.modal_button("Close"))
+
+    @reactive.effect
+    def _gen_report():
+        if not _clicked_dynamic("gen_report"):
+            return
+        hz, snap_dict = hz_result(), input_snapshot()
+        if not hz or not snap_dict:
+            ui.notification_show("Delineate the hyporheic zone first (its stats feed the report).",
+                                 type="warning")
+            return
+        try:
+            from hype_app.contracts import AssessmentInputSnapshot
+            snap = AssessmentInputSnapshot.model_validate(snap_dict)
+            stats = hz.get("stats") or {}
+            hyp = stats.get("hyporheic") or {}
+            vol, porosity = hyp.get("volume_m3"), snap.k.porosity
+            res = assess.build_results(
+                snap, hz_stats=stats, streamflow_cms=snap.streamflow.value_cms,
+                reach_length_m=_reach_length_m(), exchange=None,
+                mobile_pore_storage_m3=(float(vol) * float(porosity) if vol is not None else None),
+                reference_area_m2=hyp.get("footprint_m2"),
+                footprint_weighted_m2=hyp.get("footprint_m2"), porosity=porosity,
+                app_version=APP_VERSION)
+            results_model.set(res.model_dump(mode="json"))
+            paths = report_mod.generate_report(res, work_dir / "report", app_version=APP_VERSION,
+                                               model_version="MODFLOW 6 / MODPATH 7")
+            report_paths.set(paths)
+            ui.modal_show(_report_modal(res, paths))
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Report generation failed: {type(e).__name__}: {e}",
+                                 type="error", duration=8)
+
+    def _report_bytes(fmt):
+        p = (report_paths() or {}).get(fmt)
+        return Path(p).read_bytes() if p and Path(p).is_file() else b""
+
+    @render.download(filename="site_report.html")
+    def dl_report_html():
+        yield _report_bytes("html")
+
+    @render.download(filename="site_report.pdf")
+    def dl_report_pdf():
+        yield _report_bytes("pdf")
+
+    @render.download(filename="site_metrics.csv")
+    def dl_report_csv():
+        yield _report_bytes("csv_metrics")
+
+    @render.download(filename="assessment_results.json")
+    def dl_report_json():
+        yield _report_bytes("json")
 
     @reactive.effect
     async def _start_surface():
@@ -4928,6 +5012,7 @@ def server(input, output, session):
                 "input_snapshot": input_snapshot(),
                 "flow_lookup": flow_lookup(), "flow_source": flow_source(),
                 "soil_snapshot": soil_snapshot(), "soil_overrides": soil_overrides(),
+                "results_model": results_model(),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
                 "hz_result": _tokenize_paths(hz_result()),
@@ -5104,6 +5189,7 @@ def server(input, output, session):
         _soil = st.get("soil_snapshot")
         soil_snapshot.set(_soil)
         soil_overrides.set(st.get("soil_overrides") or [])
+        results_model.set(st.get("results_model"))
         if _soil and _HAS_MAP:
             _show_soils_layer(_soil)
         rn = st.get("run_result")
@@ -5561,6 +5647,10 @@ def server(input, output, session):
             if hz_result() is None:        # the one obvious next action after a run
                 parts.append(_next_hint("gw.res.hz", "Delineate the hyporheic zone →",
                                         primary=True))
+            else:                          # hyporheic zone delineated -> the site report is available
+                parts.append(ui.div(ui.input_action_button(
+                    "gen_report", "Generate site report", class_="btn-primary btn-sm"),
+                    class_="hype-actions"))
             parts.append(ui.div("Results are in temporary storage — use ",
                                 ui.tags.b("Download project"),
                                 " in the header before you leave.", class_="hype-warn"))
