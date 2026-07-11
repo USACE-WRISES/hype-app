@@ -1,0 +1,2 @@
+# Small deterministic MODFLOW6/MODPATH7 fixtures (built by tests/build_model_fixture.py,
+# Phase 0/5) land here — used by @pytest.mark.engine numerical integration tests.

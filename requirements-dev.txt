@@ -1,0 +1,7 @@
+# HYPE — developer/test-only dependencies (NOT installed on Connect Cloud).
+# The production runtime deps live in requirements.txt; this file adds the
+# first-party test suite tooling introduced by the HYPE revision (notes/HYPE_revision_plan.md).
+-r requirements.txt
+
+pytest>=8.0
+pytest-cov>=5.0
