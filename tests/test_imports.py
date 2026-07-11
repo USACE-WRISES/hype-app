@@ -43,6 +43,7 @@ HYPE_APP_MODULES = [
     "hype_app.hfci",
     "hype_app.report",
     "hype_app.sensitivity",
+    "hype_app.assess",
 ]
 
 HYPETOOL_MODULES = [
