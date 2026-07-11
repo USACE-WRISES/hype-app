@@ -40,6 +40,10 @@ h5py>=3.11
 matplotlib>=3.8
 seaborn>=0.12
 
+# --- HTTP client for USGS StreamStats/NSS + NRCS Soil Data Access (revision) ---
+# Separate connect/read timeouts, retries, and a MockTransport for offline contract tests.
+httpx>=0.27
+
 # --- The hyporheic engine (headless core) ---
 # VENDORED: the `hypetool` package is included in this repo (./hypetool), so no extra
 # install is needed — the dependencies above already cover it. (To switch to a git

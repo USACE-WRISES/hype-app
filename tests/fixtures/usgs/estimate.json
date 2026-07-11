@@ -1,0 +1,318 @@
+[
+ {
+  "statisticGroupID": 2,
+  "statisticGroupName": "Peak-Flow Statistics",
+  "regressionRegions": [
+   {
+    "id": 370,
+    "name": "Peak_Flow_Statewide_DAonly_SIR2008_5206",
+    "code": "GC1459",
+    "description": "",
+    "statusID": 3,
+    "citationID": 92,
+    "parameters": [
+     {
+      "id": 7978,
+      "name": "Drainage Area",
+      "description": "Area that drains to a point on a stream",
+      "code": "DRNAREA",
+      "unitType": {
+       "id": 35,
+       "unit": "square miles",
+       "abbr": "mi^2"
+      },
+      "value": 0.56,
+      "limits": {
+       "max": 1290.0,
+       "min": 0.7
+      }
+     }
+    ],
+    "results": [
+     {
+      "id": 0,
+      "name": "50-percent AEP flood",
+      "code": "PK50AEP",
+      "description": "Maximum instantaneous flow that occurs with a 50% annual exceedance probability",
+      "value": 26.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "43.5*(DRNAREA)^(0.885)"
+     },
+     {
+      "id": 0,
+      "name": "20-percent AEP flood",
+      "code": "PK20AEP",
+      "description": "Maximum instantaneous flow that occurs with a 20% annual exceedance probability",
+      "value": 45.9,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "75.5*(DRNAREA)^(0.858)"
+     },
+     {
+      "id": 0,
+      "name": "10-percent AEP flood",
+      "code": "PK10AEP",
+      "description": "Maximum instantaneous flow that occurs with a 10% annual exceedance probability",
+      "value": 62.6,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "102*(DRNAREA)^(0.842)"
+     },
+     {
+      "id": 0,
+      "name": "4-percent AEP flood",
+      "code": "PK4AEP",
+      "description": "Maximum instantaneous flow that occurs with a 4% annual exceedance probability",
+      "value": 88.7,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "143*(DRNAREA)^(0.824)"
+     },
+     {
+      "id": 0,
+      "name": "2-percent AEP flood",
+      "code": "PK2AEP",
+      "description": "Maximum instantaneous flow that occurs with a 2% annual exceedance probability",
+      "value": 112.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "179*(DRNAREA)^(0.811)"
+     },
+     {
+      "id": 0,
+      "name": "1-percent AEP flood",
+      "code": "PK1AEP",
+      "description": "Maximum instantaneous flow that occurs with a 1% annual exceedance probability",
+      "value": 138.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "219*(DRNAREA)^(0.8)"
+     },
+     {
+      "id": 0,
+      "name": "0.2-percent AEP flood",
+      "code": "PK0_2AEP",
+      "description": "Maximum instantaneous flow that occurs with a 0.2% annual exceedance probability",
+      "value": 211.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "331*(DRNAREA)^(0.777)"
+     }
+    ],
+    "disclaimer": "One or more of the parameters is outside the suggested range. Estimates were extrapolated with unknown errors. "
+   },
+   {
+    "id": 371,
+    "name": "Peak_Flow_Statewide_SIR2008_5206",
+    "code": "GC1460",
+    "description": "",
+    "statusID": 4,
+    "methodID": 1,
+    "citationID": 92,
+    "parameters": [
+     {
+      "id": 7985,
+      "name": "Drainage Area",
+      "description": "Area that drains to a point on a stream",
+      "code": "DRNAREA",
+      "unitType": {
+       "id": 35,
+       "unit": "square miles",
+       "abbr": "mi^2"
+      },
+      "value": 0.56,
+      "limits": {
+       "max": 1290.0,
+       "min": 0.7
+      }
+     },
+     {
+      "id": 7986,
+      "name": "Mean April Precipitation",
+      "description": "Mean April Precipitation",
+      "code": "APRAVPRE",
+      "unitType": {
+       "id": 36,
+       "unit": "inches",
+       "abbr": "in"
+      },
+      "value": 3.2,
+      "limits": {
+       "max": 6.23,
+       "min": 2.79
+      }
+     },
+     {
+      "id": 7987,
+      "name": "Percent Wetlands",
+      "description": "Percentage of Wetlands",
+      "code": "WETLAND",
+      "unitType": {
+       "id": 11,
+       "unit": "percent",
+       "abbr": "%"
+      },
+      "value": 1.823,
+      "limits": {
+       "max": 21.8,
+       "min": 0.0
+      }
+     },
+     {
+      "id": 7988,
+      "name": "Stream Slope 10 and 85 Method",
+      "description": "Change in elevation divided by length between points 10 and 85 percent of distance along main channel to basin divide - main channel method not known",
+      "code": "CSL10_85",
+      "unitType": {
+       "id": 39,
+       "unit": "feet per mi",
+       "abbr": "ft/mi"
+      },
+      "value": 515.48,
+      "limits": {
+       "max": 543.0,
+       "min": 5.43
+      }
+     }
+    ],
+    "results": [
+     {
+      "id": 0,
+      "name": "50-percent AEP flood",
+      "code": "PK50AEP",
+      "description": "Maximum instantaneous flow that occurs with a 50% annual exceedance probability",
+      "value": 27.7,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "2.6*(DRNAREA)^(0.958)*(APRAVPRE)^(1.5)*(CSL10_85)^(0.205)*(+10)^(-0.0245*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "20-percent AEP flood",
+      "code": "PK20AEP",
+      "description": "Maximum instantaneous flow that occurs with a 20% annual exceedance probability",
+      "value": 47.5,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "3.23*(DRNAREA)^(0.929)*(APRAVPRE)^(1.73)*(CSL10_85)^(0.211)*(+10)^(-0.0245*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "10-percent AEP flood",
+      "code": "PK10AEP",
+      "description": "Maximum instantaneous flow that occurs with a 10% annual exceedance probability",
+      "value": 64.7,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "3.88*(DRNAREA)^(0.912)*(APRAVPRE)^(1.83)*(CSL10_85)^(0.211)*(+10)^(-0.0247*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "4-percent AEP flood",
+      "code": "PK4AEP",
+      "description": "Maximum instantaneous flow that occurs with a 4% annual exceedance probability",
+      "value": 88.9,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "4.99*(DRNAREA)^(0.892)*(APRAVPRE)^(1.9)*(CSL10_85)^(0.207)*(+10)^(-0.025*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "2-percent AEP flood",
+      "code": "PK2AEP",
+      "description": "Maximum instantaneous flow that occurs with a 2% annual exceedance probability",
+      "value": 109.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "5.96*(DRNAREA)^(0.879)*(APRAVPRE)^(1.94)*(CSL10_85)^(0.203)*(+10)^(-0.0252*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "1-percent AEP flood",
+      "code": "PK1AEP",
+      "description": "Maximum instantaneous flow that occurs with a 1% annual exceedance probability",
+      "value": 134.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "7.13*(DRNAREA)^(0.867)*(APRAVPRE)^(1.98)*(CSL10_85)^(0.198)*(+10)^(-0.0254*(WETLAND))"
+     },
+     {
+      "id": 0,
+      "name": "0.2-percent AEP flood",
+      "code": "PK0_2AEP",
+      "description": "Maximum instantaneous flow that occurs with a 0.2% annual exceedance probability",
+      "value": 194.0,
+      "errors": [],
+      "unit": {
+       "id": 44,
+       "unit": "cubic feet per second",
+       "abbr": "ft^3/s"
+      },
+      "equation": "10.6*(DRNAREA)^(0.841)*(APRAVPRE)^(2.03)*(CSL10_85)^(0.183)*(+10)^(-0.0259*(WETLAND))"
+     }
+    ],
+    "disclaimer": "One or more of the parameters is outside the suggested range. Estimates were extrapolated with unknown errors. "
+   }
+  ],
+  "links": [
+   {
+    "rel": "Citations",
+    "href": "https://streamstats.usgs.gov/nssservices/citations?regressionregions=370,371",
+    "method": "GET"
+   }
+  ]
+ }
+]

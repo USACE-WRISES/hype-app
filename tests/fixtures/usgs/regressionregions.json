@@ -1,0 +1,60 @@
+[
+ {
+  "id": 369,
+  "name": "Low_Flow_Statewide",
+  "code": "GC1457",
+  "description": "",
+  "citationID": 91,
+  "statusID": 4,
+  "methodID": 1,
+  "locationID": 234,
+  "status": {
+   "id": 4,
+   "name": "SS Approved",
+   "description": "Approved and enabled for all public NSS and StreamStats users"
+  }
+ },
+ {
+  "id": 370,
+  "name": "Peak_Flow_Statewide_DAonly_SIR2008_5206",
+  "code": "GC1459",
+  "description": "",
+  "citationID": 92,
+  "statusID": 3,
+  "status": {
+   "id": 3,
+   "name": "Approved",
+   "description": "Approved and enabled for public NSS users, disabled for StreamStats users"
+  }
+ },
+ {
+  "id": 371,
+  "name": "Peak_Flow_Statewide_SIR2008_5206",
+  "code": "GC1460",
+  "description": "",
+  "citationID": 92,
+  "statusID": 4,
+  "methodID": 1,
+  "locationID": 235,
+  "status": {
+   "id": 4,
+   "name": "SS Approved",
+   "description": "Approved and enabled for all public NSS and StreamStats users"
+  }
+ },
+ {
+  "id": 372,
+  "name": "Groundwater_Recharge_Statewide_2004_5019",
+  "code": "GC1611",
+  "description": "",
+  "citationID": 93,
+  "statusID": 4,
+  "methodID": 4,
+  "locationID": 233,
+  "status": {
+   "id": 4,
+   "name": "SS Approved",
+   "description": "Approved and enabled for all public NSS and StreamStats users"
+  }
+ }
+]

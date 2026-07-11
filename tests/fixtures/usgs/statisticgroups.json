@@ -1,0 +1,314 @@
+[
+ {
+  "id": 1,
+  "name": "Physical Characteristics",
+  "code": "PC",
+  "defType": "BC"
+ },
+ {
+  "id": 2,
+  "name": "Peak-Flow Statistics",
+  "code": "PFS",
+  "defType": "FS"
+ },
+ {
+  "id": 3,
+  "name": "Flood-Volume Statistics",
+  "code": "FVS",
+  "defType": "FS"
+ },
+ {
+  "id": 4,
+  "name": "Low-Flow Statistics",
+  "code": "LFS",
+  "defType": "FS"
+ },
+ {
+  "id": 5,
+  "name": "Flow-Duration Statistics",
+  "code": "FDS",
+  "defType": "FS"
+ },
+ {
+  "id": 6,
+  "name": "Annual Flow Statistics",
+  "code": "AFS",
+  "defType": "FS"
+ },
+ {
+  "id": 7,
+  "name": "Monthly Flow Statistics",
+  "code": "MFS",
+  "defType": "FS"
+ },
+ {
+  "id": 8,
+  "name": "Seasonal Flow Statistics",
+  "code": "SFS",
+  "defType": "FS"
+ },
+ {
+  "id": 9,
+  "name": "January Flow-Duration Statistics",
+  "code": "JANFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 10,
+  "name": "February Flow-Duration Statistics",
+  "code": "FEBFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 11,
+  "name": "March Flow-Duration Statistics",
+  "code": "MARFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 12,
+  "name": "April Flow-Duration Statistics",
+  "code": "APRFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 13,
+  "name": "May Flow-Duration Statistics",
+  "code": "MAYFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 14,
+  "name": "June Flow-Duration Statistics",
+  "code": "JUNFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 15,
+  "name": "July Flow-Duration Statistics",
+  "code": "JULFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 16,
+  "name": "August Flow-Duration Statistics",
+  "code": "AUGFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 17,
+  "name": "September Flow-Duration Statistics",
+  "code": "SEPFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 18,
+  "name": "October Flow-Duration Statistics",
+  "code": "OCTFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 19,
+  "name": "November Flow-Duration Statistics",
+  "code": "NOVFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 20,
+  "name": "December Flow-Duration Statistics",
+  "code": "DECFDS",
+  "defType": "FS"
+ },
+ {
+  "id": 21,
+  "name": "General Flow Statistics",
+  "code": "GFS",
+  "defType": "FS"
+ },
+ {
+  "id": 22,
+  "name": "Base Flow Statistics",
+  "code": "BF",
+  "defType": "FS"
+ },
+ {
+  "id": 23,
+  "name": "Flow Percentile Statistics",
+  "code": "FPS",
+  "defType": "FS"
+ },
+ {
+  "id": 24,
+  "name": "Bankfull Statistics",
+  "code": "BNKF",
+  "defType": "FS"
+ },
+ {
+  "id": 25,
+  "name": "Yield Statistics (flow per area)",
+  "code": "YIELD",
+  "defType": "FS"
+ },
+ {
+  "id": 26,
+  "name": "Recharge Statistics",
+  "code": "RCHG",
+  "defType": "FS"
+ },
+ {
+  "id": 27,
+  "name": "Depth Statistics",
+  "code": "DPS",
+  "defType": "FS"
+ },
+ {
+  "id": 28,
+  "name": "Low-Flow Current Statistics",
+  "code": "LFCS",
+  "defType": "FS"
+ },
+ {
+  "id": 29,
+  "name": "Low-Flow Base Statistics",
+  "code": "LFBS",
+  "defType": "FS"
+ },
+ {
+  "id": 30,
+  "name": "Probability Statistics",
+  "code": "PROB",
+  "defType": "FS"
+ },
+ {
+  "id": 31,
+  "name": "Urban Peak-Flow Statistics",
+  "code": "UPFS",
+  "defType": "FS"
+ },
+ {
+  "id": 32,
+  "name": "Rural Peak-Flow Statistics",
+  "code": "RPFS",
+  "defType": "FS"
+ },
+ {
+  "id": 39,
+  "name": "Burned Area Flow Statistics",
+  "code": "BURNFS",
+  "defType": "FS"
+ },
+ {
+  "id": 47,
+  "name": "Burned Area Characteristics",
+  "code": "BURN",
+  "defType": "BC"
+ },
+ {
+  "id": 48,
+  "name": "Stream Channel Properties",
+  "code": "CHAN",
+  "defType": "BC"
+ },
+ {
+  "id": 49,
+  "name": "Climate Characteristics",
+  "code": "CLIM",
+  "defType": "BC"
+ },
+ {
+  "id": 50,
+  "name": "Descriptive Information",
+  "code": "D",
+  "defType": "BC"
+ },
+ {
+  "id": 51,
+  "name": "Basin Dimensional Characteristics",
+  "code": "DIM",
+  "defType": "BC"
+ },
+ {
+  "id": 52,
+  "name": "Geological Characteristics",
+  "code": "GEO",
+  "defType": "BC"
+ },
+ {
+  "id": 53,
+  "name": "Land Cover Characteristics",
+  "code": "LC",
+  "defType": "BC"
+ },
+ {
+  "id": 54,
+  "name": "Lithology Characteristics",
+  "code": "LITHO",
+  "defType": "BC"
+ },
+ {
+  "id": 55,
+  "name": "Precipitation Statistics",
+  "code": "PREC",
+  "defType": "BC"
+ },
+ {
+  "id": 56,
+  "name": "Regional indicators",
+  "code": "REG",
+  "defType": "BC"
+ },
+ {
+  "id": 57,
+  "name": "Mean Annual Runoff Statistics",
+  "code": "RUNOFF",
+  "defType": "BC"
+ },
+ {
+  "id": 58,
+  "name": "Soil Properties",
+  "code": "SOIL",
+  "defType": "BC"
+ },
+ {
+  "id": 59,
+  "name": "Temperature Statistics",
+  "code": "TEMP",
+  "defType": "BC"
+ },
+ {
+  "id": 60,
+  "name": "Topographical Characteristics",
+  "code": "TOPO",
+  "defType": "BC"
+ },
+ {
+  "id": 74,
+  "name": "Maximum Probable Flood Statistics",
+  "code": "MPF",
+  "defType": "FS"
+ },
+ {
+  "id": 76,
+  "name": "Boolean Combination basin characteristics",
+  "code": "BCBC",
+  "defType": "BC"
+ },
+ {
+  "id": 77,
+  "name": "Daily Mean Streamflow Exceedance Probabilities",
+  "code": "DAILYEP",
+  "defType": "FS"
+ },
+ {
+  "id": 78,
+  "name": "Regulation Characteristics",
+  "code": "RC",
+  "defType": "BC"
+ },
+ {
+  "id": 79,
+  "name": "Regulated Peak-Flow Statistics",
+  "code": "GPFS",
+  "defType": "FS"
+ }
+]

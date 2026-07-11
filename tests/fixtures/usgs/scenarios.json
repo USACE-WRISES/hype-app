@@ -1,0 +1,116 @@
+[
+ {
+  "statisticGroupID": 2,
+  "statisticGroupName": "Peak-Flow Statistics",
+  "regressionRegions": [
+   {
+    "id": 370,
+    "name": "Peak_Flow_Statewide_DAonly_SIR2008_5206",
+    "code": "GC1459",
+    "description": "",
+    "statusID": 3,
+    "citationID": 92,
+    "parameters": [
+     {
+      "id": 7978,
+      "name": "Drainage Area",
+      "description": "Area that drains to a point on a stream",
+      "code": "DRNAREA",
+      "unitType": {
+       "id": 35,
+       "unit": "square miles",
+       "abbr": "mi^2"
+      },
+      "value": -999.99,
+      "limits": {
+       "max": 1290.0,
+       "min": 0.7
+      }
+     }
+    ]
+   },
+   {
+    "id": 371,
+    "name": "Peak_Flow_Statewide_SIR2008_5206",
+    "code": "GC1460",
+    "description": "",
+    "statusID": 4,
+    "methodID": 1,
+    "citationID": 92,
+    "parameters": [
+     {
+      "id": 7985,
+      "name": "Drainage Area",
+      "description": "Area that drains to a point on a stream",
+      "code": "DRNAREA",
+      "unitType": {
+       "id": 35,
+       "unit": "square miles",
+       "abbr": "mi^2"
+      },
+      "value": -999.99,
+      "limits": {
+       "max": 1290.0,
+       "min": 0.7
+      }
+     },
+     {
+      "id": 7986,
+      "name": "Mean April Precipitation",
+      "description": "Mean April Precipitation",
+      "code": "APRAVPRE",
+      "unitType": {
+       "id": 36,
+       "unit": "inches",
+       "abbr": "in"
+      },
+      "value": -999.99,
+      "limits": {
+       "max": 6.23,
+       "min": 2.79
+      }
+     },
+     {
+      "id": 7987,
+      "name": "Percent Wetlands",
+      "description": "Percentage of Wetlands",
+      "code": "WETLAND",
+      "unitType": {
+       "id": 11,
+       "unit": "percent",
+       "abbr": "%"
+      },
+      "value": -999.99,
+      "limits": {
+       "max": 21.8,
+       "min": 0.0
+      }
+     },
+     {
+      "id": 7988,
+      "name": "Stream Slope 10 and 85 Method",
+      "description": "Change in elevation divided by length between points 10 and 85 percent of distance along main channel to basin divide - main channel method not known",
+      "code": "CSL10_85",
+      "unitType": {
+       "id": 39,
+       "unit": "feet per mi",
+       "abbr": "ft/mi"
+      },
+      "value": -999.99,
+      "limits": {
+       "max": 543.0,
+       "min": 5.43
+      }
+     }
+    ]
+   }
+  ],
+  "links": [
+   {
+    "rel": "Citations",
+    "href": "https://streamstats.usgs.gov/nssservices/citations?regressionregions=370,371",
+    "method": "GET"
+   }
+  ]
+ }
+]

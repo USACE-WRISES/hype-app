@@ -27,7 +27,15 @@ HYPE_APP_MODULES = [
     "hype_app.results",
     "hype_app.run",
     "hype_app.scene",
+    "hype_app.snapshot",
     "hype_app.ui_tree",
+    "hype_app.units",
+    "hype_app.hashing",
+    "hype_app.provenance",
+    "hype_app.contracts",
+    "hype_app.services.http",
+    "hype_app.services.streamstats",
+    "hype_app.services.nrcs",
 ]
 
 HYPETOOL_MODULES = [

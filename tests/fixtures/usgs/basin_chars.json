@@ -1,0 +1,34 @@
+[
+ {
+  "name": "Mean April Precipitation",
+  "description": "Mean April Precipitation",
+  "code": "APRAVPRE",
+  "unit": "inches",
+  "value": 3.2,
+  "msg": "Local SSZonal successful"
+ },
+ {
+  "name": "Stream Slope 10 and 85 Method",
+  "description": "Change in elevation divided by length between points 10 and 85 percent of distance along main channel to basin divide - main channel method not known",
+  "code": "CSL10_85",
+  "unit": "feet per mi",
+  "value": 515.48,
+  "msg": "Successful Slope calculation"
+ },
+ {
+  "name": "Drainage Area",
+  "description": "Area that drains to a point on a stream",
+  "code": "DRNAREA",
+  "unit": "square miles",
+  "value": 0.56,
+  "msg": "Local AreaOp successful"
+ },
+ {
+  "name": "Percent Wetlands",
+  "description": "Percentage of Wetlands",
+  "code": "WETLAND",
+  "unit": "percent",
+  "value": 1.823,
+  "msg": "Local SSZonal successful"
+ }
+]
