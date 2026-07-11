@@ -145,6 +145,10 @@ def run_hyporheic(*,
                   aerial_path: str | Path | None = None,
                   # optional K zones
                   kh_polygon_gdf: "gpd.GeoDataFrame | None" = None,
+                  # optional soil-derived per-cell K (HYPE revision §6): callable
+                  # (cfg, gwf, idomain) -> (k, k33) arrays, invoked after the grid exists.
+                  # Manual K zones overlay it (§6.8). Never serialized — set in-process only.
+                  cell_k_builder=None,
                   # numeric params (engine defaults mirror Settings)
                   cell_size_x: float = 10.0,
                   cell_size_y: float = 10.0,
@@ -262,6 +266,8 @@ def run_hyporheic(*,
     # CRS is supplied directly (replaces setup_projection / no .prj file).
     cfg.hec_ras_crs = crs_obj
     cfg.project_crs = crs_obj
+    if cell_k_builder is not None:
+        cfg.cell_k_builder = cell_k_builder      # Settings(extra="allow") carries the hook
 
     log(f"Headless run - work_dir={work_dir}")
     log(f"Target CRS: {crs_obj.to_string()}")

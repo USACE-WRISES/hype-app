@@ -61,6 +61,8 @@ NODES: list[dict] = [
      "check": True, "layers": ("grid",)},
     {"id": "gw.run", "label": "Model run", "parent": "gw", "group": False,
      "check": False, "layers": ()},                       # hidden until a run first starts
+    {"id": "gw.sens", "label": "Sensitivity", "parent": "gw", "group": False,
+     "check": False, "layers": ()},   # gradient-sensitivity scenarios (revision §10)
     {"id": "gw.res", "label": "Results", "parent": "gw", "group": True,
      "check": True, "layers": ()},
     {"id": "gw.res.head", "label": "Hydraulic head", "parent": "gw.res", "group": False,
@@ -121,6 +123,7 @@ NODE_STEP: dict[str, str | None] = {
     "sw.wetted": _BOUNDARIES,
     "sw.wse": _SURFACE, "sw.depth": _SURFACE,
     "gw": _MESH, "gw.k": _K, "gw.soils": _K, "gw.mesh": _MESH, "gw.run": _RUN,
+    "gw.sens": _RUN,
     "gw.res": _RESULTS, "gw.res.head": _RESULTS, "gw.res.paths": _RESULTS,
     "gw.res.paths.hyp": _RESULTS, "gw.res.paths.los": _RESULTS,
     "gw.res.paths.gain": _RESULTS, "gw.res.paths.thru": _RESULTS,

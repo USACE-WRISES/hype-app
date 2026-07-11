@@ -68,7 +68,9 @@ def build_input_snapshot(
     kzone_kv: float | None = None,
     use_kzones: bool = False,
     soil_snapshot_id: str | None = None,
+    soil_aggregation_policy: str | None = None,
     anisotropy_ratio: float | None = None,
+    gradients_config: GradientBoundaryConfigV2 | None = None,
     app_version: str | None = None,
     model_version: str | None = None,
     created_at: datetime | None = None,
@@ -81,11 +83,14 @@ def build_input_snapshot(
         flow_lookup_id=flow_lookup_id,
         provenance=Provenance(source=streamflow_source, user_modified=streamflow_user_modified),
     )
+    from .contracts import AggregationPolicy
     k = KSettings(
         kh_m_day=float(params["kh"]), kv_m_day=float(params["kv"]),
         porosity=float(params["porosity"]),
         use_kzones=bool(use_kzones), kzone_kh=kzone_kh, kzone_kv=kzone_kv,
         kzone_count=int(kzone_count), soil_snapshot_id=soil_snapshot_id,
+        aggregation_policy=(AggregationPolicy(soil_aggregation_policy)
+                            if soil_aggregation_policy else None),
         anisotropy_ratio=anisotropy_ratio,
     )
     grid = GridSettings(
@@ -108,7 +113,8 @@ def build_input_snapshot(
         terrain=terrain,
         streamflow=streamflow,
         k=k,
-        gradients=gradients_from_params(params),
+        gradients=(gradients_config if gradients_config is not None
+                   else gradients_from_params(params)),
         grid=grid,
         model_version=model_version,
         app_version=app_version,

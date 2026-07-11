@@ -74,6 +74,20 @@ def footprint_geojson(hz_dir, cls: str) -> dict | None:
         return None
 
 
+def flux_arrays(hz_dir) -> dict | None:
+    """Per-release-particle arrays from the flux-weighted stream-interface pass (§8.3):
+    {source_node, weight (m3/day), cls (0 unresolved / 1 returning / 2 losing),
+    time_days, status, exit_code}. None when the pass didn't run (fully gaining reach)."""
+    p = Path(hz_dir) / "hz_flux.npz"
+    if not p.exists():
+        return None
+    try:
+        with np.load(p) as z:
+            return {k: np.asarray(z[k]) for k in z.files}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def volume_arrays(hz_dir, cls: str) -> tuple[np.ndarray, np.ndarray] | None:
     """(points (P,3) absolute model coords, quads (Q,4)) of the zone's exterior
     shell, for scene.volume_payload."""

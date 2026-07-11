@@ -337,6 +337,182 @@ def run_mp7(mp: Modpath7, log: Callable = print) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1c-bis. Flux-weighted stream-interface pass (HYPE revision §8.3)
+# ---------------------------------------------------------------------------
+
+def read_river_downwelling(gwf_ws: str | Path, member: np.ndarray) -> dict[int, float]:
+    """{0-based node: downwelling inflow, model units (m3/day)} for the stream (top) cells.
+
+    MF6's cell budget stores only the MODEL name — the split CHD_RIVER/CHD_SIDES packages
+    can't be filtered by name — so river cells are identified by node MEMBERSHIP. The budget's
+    `node` field is 1-BASED (raw MODFLOW); membership nodes are 0-based (flopy zero-bases on
+    read), hence the -1. A CHD flow > 0 is water entering the aquifer = stream downwelling.
+    """
+    from flopy.utils import CellBudgetFile
+
+    gwf_ws = Path(gwf_ws)
+    cbb = None
+    for pat in ("*.cbb", "*.cbc", "*.bud"):
+        hits = sorted(gwf_ws.glob(pat))
+        if hits:
+            cbb = hits[0]
+            break
+    if cbb is None:
+        raise FileNotFoundError(f"No cell-budget file (*.cbb/*.cbc/*.bud) in {gwf_ws}")
+
+    member = np.asarray(member)
+    river = {int(n) for n in np.nonzero(member == MEMBER["top"])[0]}
+    out: dict[int, float] = {}
+    cbc = CellBudgetFile(str(cbb), precision="double")
+    for rec in cbc.get_data(text="CHD"):
+        for node, q in zip(np.asarray(rec["node"]).ravel(), np.asarray(rec["q"]).ravel()):
+            n = int(node) - 1                      # 1-based budget -> 0-based membership
+            if n in river and q > 0:
+                out[n] = out.get(n, 0.0) + float(q)
+    return out
+
+
+_IFACE_TEMPLATES: dict[int, tuple[tuple[float, float], ...]] = {
+    1: _PLAN_CENTER, 3: _PLAN_TRIANGLE, 4: _PLAN_CENTER + _PLAN_TRIANGLE}
+
+
+def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np.ndarray,
+                       T: np.ndarray, B: np.ndarray, gwf_ws: str | Path, hz_ws: str | Path,
+                       exe: str, porosity: float, max_time_days: float | None,
+                       particles_per_cell: int = 3, log: Callable = print) -> dict | None:
+    """Flux-weighted stream-interface pass (§8.3): where does downwelling stream water GO?
+
+    1. Read CHD_RIVER downwelling inflows from the MODFLOW budget.
+    2. Release forward particles in the first active NON-boundary cell under each downwelling
+       stream cell (just below the streambed interface, at the top of the saturated part) —
+       CHD cells themselves can't host seeds because weak sinks are stop_at.
+    3. Give each particle a source-flow weight = its share of that cell's inflow.
+    4. Track to the first terminal boundary and classify the WEIGHTED flow:
+       returning to the stream (top) | leaving through a side | unresolved/censored.
+    5. Verify the weighted mass balance (weights sum to total downwelling by construction;
+       the closure error reports any unreleased inflow, e.g. no active cell below).
+
+    Returns {"accounting": ..., "per_particle": {...arrays...}, "rtd": ...} or None when the
+    model has no downwelling stream cells (fully gaining reach).
+    """
+    tpl = _IFACE_TEMPLATES.get(int(particles_per_cell))
+    if tpl is None:
+        raise ValueError(f"interface particles_per_cell must be one of "
+                         f"{sorted(_IFACE_TEMPLATES)}, got {particles_per_cell}")
+
+    nlay, nrow, ncol = idomain.shape
+    member3 = np.asarray(member).reshape(nlay, nrow, ncol)
+    downwelling = read_river_downwelling(gwf_ws, member)
+    total_down = float(sum(downwelling.values()))
+    if not downwelling:
+        log("Interface pass: no downwelling stream cells (fully gaining reach) — skipped")
+        return None
+
+    thick = np.maximum(T - B, 1e-9)
+    sat = np.clip((head - B) / thick, 0.0, 1.0)
+    sat = np.where(np.isnan(sat), 0.0, sat)
+
+    kij_rows, lx, ly, lz = [], [], [], []
+    src_nodes, weights = [], []
+    unreleased = 0.0
+    for node, q in sorted(downwelling.items()):
+        k, rem = divmod(node, nrow * ncol)
+        i, j = divmod(rem, ncol)
+        k2 = None                                   # first active non-boundary cell below
+        for kk in range(k + 1, nlay):
+            if idomain[kk, i, j] == 1 and member3[kk, i, j] == 0:
+                k2 = kk
+                break
+        if k2 is None or sat[k2, i, j] <= 0.01:
+            unreleased += q
+            continue
+        w = q / len(tpl)
+        for (x, y) in tpl:
+            kij_rows.append((k2, i, j))
+            lx.append(x)
+            ly.append(y)
+            lz.append(0.98 * float(sat[k2, i, j])) # just below the interface, in saturated part
+            src_nodes.append(node)
+            weights.append(w)
+
+    n = len(kij_rows)
+    if n == 0:
+        log("Interface pass: no releasable cells under the downwelling stream — skipped")
+        return None
+    if unreleased > 0:
+        log(f"Interface pass: {unreleased:.3g} of {total_down:.3g} m3/day inflow had no "
+            f"active cell beneath the stream and is reported as unreleased")
+
+    seeds = {"kij": np.asarray(kij_rows, dtype=np.int32),
+             "localx": np.asarray(lx, dtype=np.float32),
+             "localy": np.asarray(ly, dtype=np.float32),
+             "localz": np.asarray(lz, dtype=np.float32),
+             "particleids": np.arange(1, n + 1, dtype=np.int32)}
+    mp = build_hz_mp7_sim(gwf, seeds, mp7_ws=hz_ws, exe=exe, direction="forward",
+                          mode="endpoint", porosity=porosity,
+                          max_time_days=max_time_days, name="hz_flux_fwd")
+    run_mp7(mp, log=log)
+    ep_path = Path(hz_ws) / f"{mp.name}.mpend"
+    ep = np.sort(np.asarray(EndpointFile(str(ep_path)).get_alldata()), order="particleid")
+    ep_path.unlink(missing_ok=True)
+    (Path(hz_ws) / f"{mp.name}.sloc").unlink(missing_ok=True)
+    if ep.shape[0] != n:
+        raise RuntimeError(f"Interface pass endpoint count {ep.shape[0]} != seeds {n}")
+
+    member_flat = np.asarray(member)
+    exit_code = member_flat[np.asarray(ep["node"], dtype=np.int64)]
+    status = np.asarray(ep["status"], dtype=np.int16)
+    time_days = np.asarray(ep["time"], dtype=float)
+    w = np.asarray(weights, dtype=float)
+    src = np.asarray(src_nodes, dtype=np.int64)
+
+    resolved = np.isin(status, list(RESOLVED_STATUSES))
+    returning = resolved & (exit_code == MEMBER["top"])
+    losing = resolved & np.isin(exit_code, list(_SIDE_CODES))
+    unresolved = ~(returning | losing)
+
+    ret_w = float(w[returning].sum())
+    los_w = float(w[losing].sum())
+    unres_w = float(w[unresolved].sum()) + unreleased
+    classified = ret_w + los_w + unres_w
+    mbe = abs(classified - total_down) / total_down if total_down > 0 else float("nan")
+
+    cls = np.zeros(n, dtype=np.uint8)              # 0 unresolved, 1 returning, 2 losing
+    cls[returning] = 1
+    cls[losing] = 2
+
+    rtd = None
+    if ret_w > 0:
+        t_ret, w_ret = time_days[returning], w[returning]
+        order = np.argsort(t_ret)
+        cw = np.cumsum(w_ret[order])
+        med = float(np.interp(0.5 * cw[-1], cw, t_ret[order]))
+        rtd = {"weighted_mean_days": round(float((t_ret * w_ret).sum() / ret_w), 4),
+               "weighted_median_days": round(med, 4),
+               "min_days": round(float(t_ret.min()), 5),
+               "max_days": round(float(t_ret.max()), 3),
+               "n_returning": int(returning.sum())}
+
+    log(f"Interface pass: downwelling {total_down:.3g} m3/day over {len(downwelling)} stream "
+        f"cells -> returning {ret_w:.3g}, losing {los_w:.3g}, unresolved {unres_w:.3g} "
+        f"(mass-balance error {mbe:.2e})")
+    return {
+        "accounting": {"units": "m3/day",
+                       "total_downwelling": round(total_down, 6),
+                       "returning": round(ret_w, 6), "losing": round(los_w, 6),
+                       "unresolved": round(unres_w, 6), "unreleased": round(unreleased, 6),
+                       "mass_balance_error": (round(mbe, 8) if mbe == mbe else None),
+                       "n_stream_cells_downwelling": len(downwelling),
+                       "n_particles": int(n),
+                       "particles_per_cell": int(particles_per_cell)},
+        "per_particle": {"source_node": src, "weight": w, "cls": cls,
+                         "time_days": time_days, "status": status,
+                         "exit_code": exit_code.astype(np.uint8)},
+        "rtd": rtd,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 1d. Classification
 # ---------------------------------------------------------------------------
 
@@ -808,27 +984,46 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
             footprints[name] = fp
     runtimes["classify"] = round(time.monotonic() - t0, 2)
 
-    # ---- STEP 6: display pathlines -----------------------------------------
-    log("HZ STEP 6/7 - Tracing display pathlines (stratified sample)")
+    # ---- STEP 5b: flux-weighted stream-interface pass (§8.3) ---------------
+    log("HZ STEP 5b/7 - Flux-weighted stream-interface pass")
     t0 = time.monotonic()
-    sample_idx = sample_display_seeds(cls, per_class=int(sample_per_class))
-    sample = subset_seeds(seeds, sample_idx)
-    log(f"Sampled {_fmt_int(sample['n_seeds'])} paths for display "
-        f"(cap {sample_per_class}/class)")
-    pl_paths: dict[str, Path] = {}
-    for direction in ("forward", "backward"):
-        mp = build_hz_mp7_sim(gwf, sample, mp7_ws=hz_ws, exe=exe, direction=direction,
-                              mode="pathline", porosity=porosity,
-                              max_time_days=max_time_days,
-                              name=f"hz_pl_{direction[:3]}")
-        run_mp7(mp, log=log)
-        pl_paths[direction] = hz_ws / f"{mp.name}.mppth"
-    paths_gdf = build_display_paths(pl_paths["forward"], pl_paths["backward"],
-                                    sample, classes, gwf, crs, log=log)
+    flux = None
+    try:
+        flux = run_interface_pass(gwf, member=member, idomain=idomain, head=head, T=T, B=B,
+                                  gwf_ws=gwf_ws, hz_ws=hz_ws, exe=exe, porosity=porosity,
+                                  max_time_days=max_time_days, log=log)
+    except Exception as e:  # noqa: BLE001 — the classification results stand on their own
+        log(f"Interface pass failed (continuing without flux metrics): {e}")
+    runtimes["flux"] = round(time.monotonic() - t0, 2)
+
+    # ---- STEP 6: display pathlines -----------------------------------------
+    t0 = time.monotonic()
+    sample_idx = (sample_display_seeds(cls, per_class=int(sample_per_class))
+                  if int(sample_per_class) > 0 else np.array([], dtype=np.int64))
+    if sample_idx.size == 0:
+        # metrics-only mode (e.g. sensitivity alternatives, §10.4): skip the pathline MP7s
+        log("HZ STEP 6/7 - Display pathlines skipped (sample_per_class=0)")
+        import geopandas as _gpd
+        paths_gdf = _gpd.GeoDataFrame({"hz_class": [], "length_m": []}, geometry=[], crs=crs)
+    else:
+        log("HZ STEP 6/7 - Tracing display pathlines (stratified sample)")
+        sample = subset_seeds(seeds, sample_idx)
+        log(f"Sampled {_fmt_int(sample['n_seeds'])} paths for display "
+            f"(cap {sample_per_class}/class)")
+        pl_paths: dict[str, Path] = {}
+        for direction in ("forward", "backward"):
+            mp = build_hz_mp7_sim(gwf, sample, mp7_ws=hz_ws, exe=exe, direction=direction,
+                                  mode="pathline", porosity=porosity,
+                                  max_time_days=max_time_days,
+                                  name=f"hz_pl_{direction[:3]}")
+            run_mp7(mp, log=log)
+            pl_paths[direction] = hz_ws / f"{mp.name}.mppth"
+        paths_gdf = build_display_paths(pl_paths["forward"], pl_paths["backward"],
+                                        sample, classes, gwf, crs, log=log)
+        if not keep_raw_outputs:
+            for p in pl_paths.values():
+                p.unlink(missing_ok=True)
     runtimes["pathlines"] = round(time.monotonic() - t0, 2)
-    if not keep_raw_outputs:
-        for p in pl_paths.values():
-            p.unlink(missing_ok=True)
 
     # ---- STEP 7: export -----------------------------------------------------
     log("HZ STEP 7/7 - Writing artifacts")
@@ -845,6 +1040,9 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
                         n_classified=fracs["n_classified"],
                         **{f"frac_{k}": fracs[k] for k in HZ_CLASSES})
     artifacts["fractions"] = "hz_cell_fractions.npz"
+    if flux is not None:
+        np.savez_compressed(hz_dir / "hz_flux.npz", **flux["per_particle"])
+        artifacts["flux"] = "hz_flux.npz"
 
     total_time = classes["bwd_time"].astype(float) + classes["fwd_time"].astype(float)
     for name in HZ_CLASSES:
@@ -908,6 +1106,8 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
                    "boundary_cells": member_info["counts"]},
         "domain": {"active_saturated_volume_m3": round(domain_volume, 1)},
         "classes": stats_by_class,
+        "flux": ({"accounting": flux["accounting"], "rtd": flux["rtd"]}
+                 if flux is not None else None),
         "runtimes_s": runtimes,
         "artifacts": artifacts,
     }

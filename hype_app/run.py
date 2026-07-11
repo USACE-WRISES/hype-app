@@ -43,7 +43,8 @@ def _prepare_linux_bin(bin_dir: str) -> None:
 
 
 def execute(*, domain_gdf, left_gdf, right_gdf, crs, dem_path, wse_path, wse_mode,
-            wse_relief_thresh, kh_polygon_gdf, params, work_dir, log):
+            wse_relief_thresh, kh_polygon_gdf, params, work_dir, log,
+            cell_k_builder=None):
     """Thin wrapper so the worker thread has one obvious call. Returns the artifact dict."""
     return run_hyporheic(
         domain_gdf=domain_gdf,
@@ -55,6 +56,7 @@ def execute(*, domain_gdf, left_gdf, right_gdf, crs, dem_path, wse_path, wse_mod
         wse_mode=wse_mode,
         wse_relief_thresh=wse_relief_thresh,
         kh_polygon_gdf=kh_polygon_gdf,
+        cell_k_builder=cell_k_builder,
         work_dir=str(work_dir),
         modflow_bin_dir=modflow_bin_dir(),
         log=log,
@@ -106,11 +108,16 @@ def child_run(payload: dict, q) -> None:
             khgdf["KH"] = float(payload["kzone_kh"])
             khgdf["KV"] = float(payload["kzone_kv"])
             khgdf = khgdf.to_crs(crs)
+        builder = None
+        if payload.get("soil_k"):
+            from hype_app.soil_k import make_cell_k_builder
+            builder = make_cell_k_builder(payload["soil_k"])
         result = execute(
             domain_gdf=dom, left_gdf=left, right_gdf=right, crs=crs,
             dem_path=payload["dem"], wse_path=payload["wse_path"],
             wse_mode=payload["wse_mode"], wse_relief_thresh=payload["wse_relief_thresh"],
-            kh_polygon_gdf=khgdf, params=payload["params"], work_dir=payload["work_dir"],
+            kh_polygon_gdf=khgdf, cell_k_builder=builder,
+            params=payload["params"], work_dir=payload["work_dir"],
             log=lambda m: q.put(("log", str(m))),
         )
         q.put(("result", result))

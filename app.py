@@ -40,6 +40,7 @@ from hype_app import (assess, bieger, bundle, carve, delineate, dem, estimate, g
                       geometry, hydro, hz_results, mesh, ras_results, report as report_mod,
                       results, scene, snapshot, ui_tree)
 from hype_app import hz_run  # noqa: E402
+from hype_app import sens_run  # noqa: E402
 from hype_app import soil_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
@@ -124,6 +125,13 @@ HZ_MAX_PARTICLES = int(os.environ.get("HYPE_HZ_MAX_PARTICLES", "2000000"))
 
 BC_CORNER = "4 Corner Gradients"
 BC_PROFILE = "Spatially Varying Gradient"
+BC_QUAL = "Qualitative"          # app-side only: category × reference slope -> profile strings
+# Locked qualitative categories (revision §3.4): multiplier × reference slope.
+_QUAL_CHOICES = {"strongly_gaining": "Strongly gaining (+1.0 × slope)",
+                 "slightly_gaining": "Slightly gaining (+0.5 × slope)",
+                 "neutral": "Neutral (0)",
+                 "slightly_losing": "Slightly losing (−0.5 × slope)",
+                 "strongly_losing": "Strongly losing (−1.0 × slope)"}
 
 # Progress labels keyed by the driver's "STEP N" log markers (the headless run emits 2–7).
 RUN_TOTAL = 7
@@ -1938,7 +1946,7 @@ def server(input, output, session):
     # ---- parameters + estimate ----
     @reactive.calc
     def params():
-        bc = _safe("bc_mode", BC_CORNER)
+        bc = _safe("bc_mode", BC_QUAL)
         base = dict(
             cell_size_x=float(_safe("cell_size", 10.0)), cell_size_y=float(_safe("cell_size", 10.0)),
             gw_mod_depth=float(_safe("gw_mod_depth", 6.0)), z=float(_safe("z", 0.25)),
@@ -1952,9 +1960,19 @@ def server(input, output, session):
             nper=1, nstp=1, perlen=1.0, tsmult=1.0, sim_name="hyporheic",
             boundary_condition_mode=bc,
         )
-        if bc == BC_PROFILE:
-            base["left_boundary_gradient_profile"] = _safe("g_left_profile", "0,0.005 0.5,0.005 1,0.005")
-            base["right_boundary_gradient_profile"] = _safe("g_right_profile", "0,0.005 0.5,0.005 1,0.005")
+        if bc in (BC_QUAL, BC_PROFILE):
+            # Structured/qualitative controls serialize losslessly onto the engine's
+            # spatially-varying path (§7.5 head-anchor method). A parse error here falls
+            # back to a flat default; _start_run re-validates and blocks with the message.
+            from hype_app import gradients as grad_mod
+            base["boundary_condition_mode"] = BC_PROFILE     # the engine's mode name
+            try:
+                cfg = _gradient_config()
+                base["left_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.left_controls)
+                base["right_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.right_controls)
+            except Exception:  # noqa: BLE001
+                base["left_boundary_gradient_profile"] = "0,0.005 1,0.005"
+                base["right_boundary_gradient_profile"] = "0,0.005 1,0.005"
         else:
             base.update(
                 upstream_left_fpl_gw_gradient=float(_safe("g_ul", 0.005)),
@@ -2177,6 +2195,8 @@ def server(input, output, session):
     _restore_stamp: dict = {}  # {"t": monotonic} of the last Open — see _safe's staleness rule
     _KEEP_IDS = ("address", "manual_da", "dem_res", "fp_mult", "bc_mode",
                  "g_ul", "g_ur", "g_dl", "g_dr", "g_left_profile", "g_right_profile",
+                 "g_qual_left", "g_qual_right", "g_ref_slope", "g_left_ctl", "g_right_ctl",
+                 "usgs_region", "soil_policy", "use_soil_k",
                  "ras_flow", "ras_slope", "ras_n", "ras_cell", "ras_hours", "ras_dt",
                  "ras_out_min", "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
                  "cell_size", "gw_mod_depth", "z", "pt_per_cell", "pt_min_mult",
@@ -2527,10 +2547,38 @@ def server(input, output, session):
         cov = ui.div(ui.tags.strong(f"{len(polys)} polygons · {len(mus)} map units"), ui.br(),
                      "Columns used: " + (", ".join(f"{k}={v}" for k, v in cols.items()) or "—"),
                      class_="hype-instr")
+        kv0 = float(_safe("kv", 1.0)) or 1.0
+        aniso = float(_safe("kh", 10.0)) / kv0
+        use_k = ui.TagList(
+            ui.input_select("soil_policy", "Aggregation method (confirm before use)",
+                            {"dominant": "Dominant component (largest %, its horizons)",
+                             "weighted": "Weighted (component % · arithmetic KH / harmonic KV)"},
+                            selected=str(_keep("soil_policy", "dominant"))),
+            ui.input_checkbox("use_soil_k",
+                              f"Use NRCS soils for model K (KV = Ksat × 0.0864; KH = {aniso:g} × KV; "
+                              "manual K-zones still override)",
+                              value=bool(_keep("use_soil_k", False))),
+            ui.output_ui("soil_k_coverage_note"))
         choices = {mu["mukey"]: f"{mu.get('musym') or mu['mukey']} — {mu.get('name') or ''}"
                    for mu in mus}
         selector = ui.input_select("soil_mukey", "Map unit", choices) if choices else None
-        return ui.TagList(header, cov, selector, ui.output_ui("soil_detail"))
+        return ui.TagList(header, cov, use_k, selector, ui.output_ui("soil_detail"))
+
+    @render.ui
+    def soil_k_coverage_note():
+        _ = run_result()                          # re-render after each run
+        p = work_dir / "summary" / "soil_k_coverage.json"
+        if not p.is_file():
+            return None
+        try:
+            import json as _json
+            rep = _json.loads(p.read_text())
+            pct = rep.get("volume_pct_by_origin") or {}
+            return ui.div(f"Last run: soils covered {rep.get('domain_area_covered_pct', 0)}% of "
+                          f"the domain — K volume {pct.get('derived', 0)}% derived, "
+                          f"{pct.get('fallback', 0)}% global fallback.", class_="hype-instr")
+        except Exception:  # noqa: BLE001
+            return None
 
     @render.ui
     def soil_detail():
@@ -2602,6 +2650,40 @@ def server(input, output, session):
             title="Site Summary Report", size="xl", easy_close=True,
             footer=ui.modal_button("Close"))
 
+    def _flux_metrics(hz_stats: dict, hz_dir):
+        """(ExchangeAccounting in m3/s, transit_times, transit_weights, censored, transit_rows)
+        from the §8.3 interface-pass artifacts. The model budget is m3/day; the canonical
+        results + streamflow are m3/s, hence the /86400."""
+        from hype_app.metrics import ExchangeAccounting
+        DAY = 86400.0
+        exchange = transit_t = transit_w = censored = None
+        transit_rows = []
+        acct = ((hz_stats or {}).get("flux") or {}).get("accounting") \
+            if isinstance((hz_stats or {}).get("flux"), dict) else None
+        if acct:
+            exchange = ExchangeAccounting(
+                total_downwelling=acct["total_downwelling"] / DAY,
+                returning_hyporheic=acct["returning"] / DAY,
+                losing_to_sides=acct["losing"] / DAY,
+                unresolved=acct["unresolved"] / DAY)
+            if acct.get("total_downwelling"):
+                censored = acct["unresolved"] / acct["total_downwelling"]
+        fx = hz_results.flux_arrays(hz_dir) if hz_dir else None
+        if fx is not None:
+            ret = fx["cls"] == 1
+            if ret.any():
+                transit_t = fx["time_days"][ret]
+                transit_w = fx["weight"][ret]
+            cls_names = {0: "unresolved", 1: "returning", 2: "losing"}
+            transit_rows = [
+                {"particle_id": int(i), "source_cell": int(fx["source_node"][i]),
+                 "flow_weight": float(fx["weight"][i] / DAY),
+                 "endpoint_class": cls_names.get(int(fx["cls"][i]), "unresolved"),
+                 "transit_time_days": float(fx["time_days"][i]),
+                 "termination": int(fx["status"][i])}
+                for i in range(len(fx["cls"]))]
+        return exchange, transit_t, transit_w, censored, transit_rows
+
     @reactive.effect
     def _gen_report():
         if not _clicked_dynamic("gen_report"):
@@ -2614,18 +2696,25 @@ def server(input, output, session):
         try:
             from hype_app.contracts import AssessmentInputSnapshot
             snap = AssessmentInputSnapshot.model_validate(snap_dict)
-            stats = hz.get("stats") or {}
+            stats = (hz.get("stats") or {}).get("classes") or hz.get("stats") or {}
             hyp = stats.get("hyporheic") or {}
             vol, porosity = hyp.get("volume_m3"), snap.k.porosity
+            exchange, transit_t, transit_w, censored, transit_rows = _flux_metrics(
+                hz.get("stats") or {}, hz.get("hz_dir"))
+
             res = assess.build_results(
                 snap, hz_stats=stats, streamflow_cms=snap.streamflow.value_cms,
-                reach_length_m=_reach_length_m(), exchange=None,
+                reach_length_m=_reach_length_m(), exchange=exchange,
+                transit_times_days=transit_t, transit_weights=transit_w,
                 mobile_pore_storage_m3=(float(vol) * float(porosity) if vol is not None else None),
                 reference_area_m2=hyp.get("footprint_m2"),
                 footprint_weighted_m2=hyp.get("footprint_m2"), porosity=porosity,
+                censored_fraction=censored,
                 app_version=APP_VERSION)
             results_model.set(res.model_dump(mode="json"))
-            paths = report_mod.generate_report(res, work_dir / "report", app_version=APP_VERSION,
+            paths = report_mod.generate_report(res, work_dir / "report",
+                                               transit_rows=transit_rows,
+                                               app_version=APP_VERSION,
                                                model_version="MODFLOW 6 / MODPATH 7")
             report_paths.set(paths)
             ui.modal_show(_report_modal(res, paths))
@@ -2652,6 +2741,420 @@ def server(input, output, session):
     @render.download(filename="assessment_results.json")
     def dl_report_json():
         yield _report_bytes("json")
+
+    # ------------------------------------------------------------------
+    # Gradient sensitivity (revision §10): sequential scenario execution + aggregation
+    # ------------------------------------------------------------------
+    sens_result = reactive.value(None)      # {"manifest": dict, "generator": str} after a run
+    _sens_proc: dict = {}
+    sens_log_lines: list = []
+    sens_log_tick = reactive.value(0)
+
+    @reactive.extended_task
+    async def sens_task(payload: dict) -> dict:
+        def _work():
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            p = ctx.Process(target=sens_run.child_run, args=(payload, q), daemon=True)
+            _sens_proc["p"] = p
+            p.start()
+            result = error = None
+            scen_recs = []
+            while True:
+                try:
+                    kind, data = q.get(timeout=0.3)
+                    if kind == "log":
+                        sens_log_lines.append(data)
+                    elif kind == "scenario":
+                        scen_recs.append(data)
+                    elif kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    if not p.is_alive():
+                        break
+            while True:
+                try:
+                    kind, data = q.get_nowait()
+                    if kind == "scenario":
+                        scen_recs.append(data)
+                    elif kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    break
+            p.join(timeout=5)
+            cancelled = _sens_proc.pop("cancelled", False)
+            _sens_proc["p"] = None
+            if cancelled:
+                return {"cancelled": True, "scenarios": scen_recs}
+            if error is not None:
+                return {"error": error, "scenarios": scen_recs}
+            return result or {"scenarios": scen_recs}
+        return await anyio.to_thread.run_sync(_work)
+
+    def _scenario_metrics(stats: dict, hz_dir) -> dict:
+        """Complete metric/HFCI dict for ONE scenario (§10.4 alternatives keep metrics only)."""
+        from hype_app import hfci as hfci_mod
+        from hype_app import metrics as metrics_mod
+        classes = (stats or {}).get("classes") or {}
+        hyp = classes.get("hyporheic") or {}
+        porosity = float(_safe("porosity", 0.3))
+        out: dict = {"volume_m3": hyp.get("volume_m3"), "footprint_m2": hyp.get("footprint_m2")}
+        if hyp.get("volume_m3") is not None:
+            out["pore_storage_m3"] = float(hyp["volume_m3"]) * porosity
+        exchange, tt, tw, censored, _rows = _flux_metrics(stats, hz_dir)
+        snap_d = input_snapshot() or {}
+        q_cms = (snap_d.get("streamflow") or {}).get("value_cms")
+        if q_cms is None:
+            f = _safe("ras_flow", None)
+            q_cms = float(f) * CFS_TO_CMS if f else None
+        reach_len = _reach_length_m()
+        exc_raw = None
+        if exchange is not None and q_cms:
+            conn = metrics_mod.connectivity(
+                streamflow=q_cms, returning_hyporheic=exchange.returning_hyporheic,
+                total_downwelling=exchange.total_downwelling,
+                losing=exchange.losing_to_sides, unresolved=exchange.unresolved,
+                reach_length_m=reach_len)
+            if conn is not None:
+                exc_raw = conn.excursions_per_mile
+                out["excursions_per_mile"] = round(conn.excursions_per_mile, 6)
+                out["returning_cms"] = round(exchange.returning_hyporheic, 8)
+        storage_raw = None
+        if out.get("pore_storage_m3") is not None and hyp.get("footprint_m2"):
+            storage_raw = out["pore_storage_m3"] / float(hyp["footprint_m2"])
+        proc_raw = None
+        if tt is not None and tw is not None and len(tt):
+            proc_raw = hfci_mod.processing_driver(tt, tw)
+            out["rtd_median_days"] = round(metrics_mod.weighted_quantile(tt, tw, 0.5), 4)
+        h = hfci_mod.compute_hfci(exchange_raw=exc_raw, storage_raw=storage_raw,
+                                  processing_raw=proc_raw)
+        out["hfci"] = h.hfci
+        out["exchange_score"] = h.exchange.score
+        out["storage_score"] = h.storage.score
+        out["processing_score"] = h.processing.score
+        return {k: v for k, v in out.items() if v is not None}
+
+    def _sens_manifest_objects():
+        """Rebuild the manifest object from the stored sens_result dict (None when absent)."""
+        from hype_app.contracts import SensitivityScenarioManifest
+        sr = sens_result()
+        if not sr or not sr.get("manifest"):
+            return None
+        try:
+            return SensitivityScenarioManifest.model_validate(sr["manifest"])
+        except Exception:  # noqa: BLE001
+            return None
+
+    @reactive.effect
+    def _start_sens():
+        if not _clicked_dynamic("run_sens"):
+            return
+        build = _domain_build()
+        if not (build and dem_path() and _wse_path()):
+            ui.notification_show("Sensitivity needs the domain, terrain, and a water surface — "
+                                 "same inputs as the groundwater run.", type="warning", duration=6)
+            return
+        try:
+            gcfg = _gradient_config()
+        except ValueError as ge:
+            ui.notification_show(f"Fix the boundary gradients first: {ge}", type="warning",
+                                 duration=8)
+            return
+        if gcfg is None:
+            ui.notification_show("Sensitivity uses the structured/qualitative gradient modes — "
+                                 "switch the boundary condition off the legacy corner mode.",
+                                 type="warning", duration=8)
+            return
+        from hype_app import gradients as grad_mod
+        from hype_app import sensitivity as sens_mod
+        from hype_app.contracts import GeneratorType
+        gen = GeneratorType(str(_safe("sens_design", "linked")))
+        manifest = sens_mod.build_manifest(gcfg, gen)
+        scen_payloads = [{
+            "id": s.id, "label": s.label, "is_preferred": s.is_preferred,
+            "left_profile": grad_mod.serialize_profile(s.gradients.left_controls),
+            "right_profile": grad_mod.serialize_profile(s.gradients.right_controls)}
+            for s in manifest.scenarios]
+        try:
+            crs = proj_crs()
+            crs_id = crs.to_epsg() or crs.to_wkt()
+            use_kz = bool(_safe("use_kzones", False))
+            payload = {
+                "crs": crs_id, "domain": build["domain"], "left": build["left"],
+                "right": build["right"], "up": build["up"], "down": build["down"],
+                "dem": active_dem(), "params": params(), "work_dir": str(work_dir),
+                "wse_mode": "dem", "wse_path": _wse_path(),
+                "wse_relief_thresh": float(_safe("wse_relief", 0.2)),
+                "kzones": (kzone_feats() if use_kz else []),
+                "kzone_kh": float(_safe("kzone_kh", 50.0)),
+                "kzone_kv": float(_safe("kzone_kv", 5.0)),
+                "scenarios": scen_payloads,
+            }
+            if bool(_safe("use_soil_k", False)) and soil_snapshot():
+                from hype_app.soil_k import prepare_soil_k_payload
+                kv0 = float(_safe("kv", 1.0)) or 1.0
+                payload["soil_k"] = prepare_soil_k_payload(
+                    soil_snapshot(), policy=str(_safe("soil_policy", "dominant")),
+                    anisotropy_ratio=float(_safe("kh", 10.0)) / kv0,
+                    fallback_kh=float(_safe("kh", 10.0)), fallback_kv=kv0)
+            # resume (§10.3): skip scenarios already completed with an unchanged hash
+            prior = _sens_manifest_objects()
+            if prior is not None:
+                done = {s.canonical_hash: s.id for s in prior.scenarios
+                        if s.status.value == "completed"}
+                payload["skip_ids"] = [s.id for s in manifest.scenarios
+                                       if done.get(s.canonical_hash) == s.id]
+                by_hash = {s.canonical_hash: s for s in prior.scenarios
+                           if s.status.value == "completed"}
+                for s in manifest.scenarios:      # carry completed results into the new manifest
+                    old = by_hash.get(s.canonical_hash)
+                    if old is not None and old.id == s.id:
+                        s.status, s.metrics = old.status, old.metrics
+                        s.artifact_paths = old.artifact_paths
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Couldn't start sensitivity: {e}", type="error", duration=8)
+            return
+        sens_log_lines.clear()
+        sens_log_tick.set(0)
+        sens_result.set({"manifest": manifest.model_dump(mode="json"),
+                         "generator": manifest.generator.value, "running": True})
+        sens_task(payload)
+
+    @reactive.effect
+    def _sens_cancel():
+        if _clicked_dynamic("cancel_sens"):
+            p = _sens_proc.get("p")
+            if p is not None and p.is_alive():
+                _sens_proc["cancelled"] = True
+                p.kill()
+
+    @reactive.effect
+    def _sens_poll():
+        if sens_task.status() != "running":
+            return
+        reactive.invalidate_later(0.5)
+        sens_log_tick.set(len(sens_log_lines))
+
+    @reactive.effect
+    def _sens_done():
+        if sens_task.status() in ("initial", "running"):
+            return
+        try:
+            res = sens_task.result()
+        except Exception:  # noqa: BLE001
+            return
+        sr = sens_result()
+        if not sr or not sr.get("running"):
+            return
+        from hype_app.contracts import ScenarioStatus, SensitivityScenarioManifest
+        manifest = SensitivityScenarioManifest.model_validate(sr["manifest"])
+        recs = {r["id"]: r for r in (res.get("scenarios") or [])}
+        for s in manifest.scenarios:
+            rec = recs.get(s.id)
+            if rec is None:
+                continue
+            if rec.get("ok"):
+                s.status = ScenarioStatus.completed
+                try:
+                    s.metrics = _scenario_metrics(rec.get("stats") or {}, rec.get("hz_dir"))
+                except Exception as me:  # noqa: BLE001
+                    s.metrics = {}
+                    print(f"[sens] metrics failed for {s.id}: {me}")
+                s.artifact_paths = {"dir": rec.get("dir", "")}
+            else:
+                s.status = ScenarioStatus.failed
+                s.error = (rec.get("error") or "")[-800:]
+        manifest.cancelled = bool(res.get("cancelled"))
+        out = {"manifest": manifest.model_dump(mode="json"),
+               "generator": manifest.generator.value, "running": False}
+        sens_result.set(out)
+        try:
+            import json as _json
+            d = work_dir / "sensitivity"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "manifest.json").write_text(_json.dumps(out["manifest"], indent=2))
+        except Exception:  # noqa: BLE001
+            pass
+        if res.get("error"):
+            ui.notification_show("Sensitivity run failed — see the scenario log.",
+                                 type="error", duration=8)
+        elif res.get("cancelled"):
+            ui.notification_show("Sensitivity cancelled — completed scenarios are kept.",
+                                 duration=6)
+        else:
+            n_ok = sum(1 for s in manifest.scenarios if s.status.value == "completed")
+            ui.notification_show(f"Sensitivity complete — {n_ok}/{len(manifest.scenarios)} "
+                                 f"scenarios succeeded.", duration=6)
+
+    def _pane_sens():
+        running = sens_task.status() == "running"
+        parts = [
+            ui.div("Run the groundwater model over a set of gradient scenarios (lower / "
+                   "preferred / upper at each control). Alternatives keep complete metrics; "
+                   "only the main run keeps full display artifacts.", class_="hype-instr"),
+            ui.input_select("sens_design", "Scenario design",
+                            {"linked": "Linked lower / preferred / upper (3 scenarios)",
+                             "crossed": "Left × right crossed (9 scenarios)",
+                             "one_at_a_time": "One control at a time"},
+                            selected=str(_keep("sens_design", "linked"))),
+        ]
+        if running:
+            _ = sens_log_tick()
+            tail = "\n".join(sens_log_lines[-14:])
+            parts += [ui.div(ui.div(class_="hype-spinner"), ui.span("Running scenarios…"),
+                             class_="hype-busy"),
+                      ui.tags.pre(tail, class_="hype-log"),
+                      ui.div(ui.input_action_button("cancel_sens", "Cancel",
+                                                    class_="btn-sm btn-outline-danger"),
+                             class_="hype-actions")]
+            return ui.TagList(*parts)
+        parts.append(ui.div(ui.input_action_button("run_sens", "Run sensitivity scenarios",
+                                                   class_="btn-primary"),
+                            class_="hype-actions"))
+        manifest = _sens_manifest_objects()
+        if manifest is not None and not (sens_result() or {}).get("running"):
+            from hype_app import sensitivity as sens_mod
+            done, failed = manifest.successful(), manifest.failed()
+            parts.append(ui.div(
+                ui.tags.strong(f"{len(done)} succeeded · {len(failed)} failed · "
+                               f"design: {manifest.generator.value}"), class_="hype-instr"))
+            rows = []
+            for key, label in (("hfci", "HFCI (0–1)"),
+                               ("excursions_per_mile", "Excursions / mile"),
+                               ("volume_m3", "Hyporheic volume (m³)"),
+                               ("pore_storage_m3", "Pore storage (m³)"),
+                               ("rtd_median_days", "RTD median (days)")):
+                agg = sens_mod.aggregate_metric(manifest.scenarios, key, manifest.preferred_id)
+                if not agg:
+                    continue
+                rows.append(ui.tags.tr(
+                    ui.tags.td(label),
+                    ui.tags.td(report_mod.fmt(agg.get("preferred"))),
+                    ui.tags.td(f"{report_mod.fmt(agg['min'])} ({agg['min_scenario']})"),
+                    ui.tags.td(f"{report_mod.fmt(agg['max'])} ({agg['max_scenario']})"),
+                    ui.tags.td(report_mod.fmt(agg["range"]))))
+            if rows:
+                parts.append(ui.tags.table(
+                    ui.tags.thead(ui.tags.tr(ui.tags.th("Metric"), ui.tags.th("Preferred"),
+                                             ui.tags.th("Min"), ui.tags.th("Max"),
+                                             ui.tags.th("Range"))),
+                    ui.tags.tbody(*rows), class_="table table-sm hype-sens-table"))
+                dom = sens_mod.dominant_capacity_contributor(manifest.scenarios)
+                if dom:
+                    parts.append(ui.div(f"Dominant capacity contributor across scenarios: {dom}.",
+                                        class_="hype-instr"))
+            parts.append(ui.div("Ranges show sensitivity to the tested gradient assumptions — "
+                                "not confidence intervals. Untested: K/soils, streamflow, "
+                                "geometry, grid resolution, porosity.", class_="hype-warn"))
+            for s in failed:
+                parts.append(ui.div(f"{s.label}: failed", class_="hype-warn"))
+        return ui.TagList(*parts)
+
+    # ------------------------------------------------------------------
+    # Structured / qualitative gradients (revision §7): config + reference slope
+    # ------------------------------------------------------------------
+    def _reference_slope():
+        """ReferenceSlope with the §7.4 priority: modeled WSE raster → DEM drop → manual.
+        Returns None when nothing usable (flat/adverse) — the UI then requires manual input."""
+        from hype_app import gradients as grad_mod
+        build = _domain_build()
+        rr = ras_result()
+        if build and rr and rr.get("wse_tif") and Path(rr["wse_tif"]).is_file():
+            try:
+                s = ras_engine.default_friction_slope(rr["wse_tif"], build["up"], build["down"])
+                if s and s > 0:
+                    return grad_mod.ReferenceSlope(value=float(s), source="wse_raster",
+                                                   method="cap-line sample over reach distance")
+            except Exception:  # noqa: BLE001
+                pass
+        s = ras_slope_default()
+        if s and s > 0:
+            return grad_mod.ReferenceSlope(value=float(s), source="dem_drop",
+                                           method="cap-line sample over reach distance")
+        manual = _safe("g_ref_slope", None)
+        if manual and float(manual) > 0:
+            return grad_mod.ReferenceSlope(value=float(manual), source="manual")
+        return None
+
+    def _gradient_config():
+        """GradientBoundaryConfigV2 from the current UI (qualitative or structured modes).
+        Returns None in legacy corner mode; raises ValueError with a user-facing message."""
+        from hype_app import gradients as grad_mod
+        from hype_app.contracts import (GradientBoundaryConfigV2, GradientQualitative, Side)
+        bc = _safe("bc_mode", BC_QUAL)
+        if bc == BC_QUAL:
+            rs = _reference_slope()
+            if rs is None:
+                raise ValueError("No usable reference slope (flat or adverse reach) — enter a "
+                                 "manual reference slope or use structured controls.")
+            left = GradientQualitative(_safe("g_qual_left", "neutral"))
+            right = GradientQualitative(_safe("g_qual_right", "neutral"))
+            cfg = GradientBoundaryConfigV2.from_qualitative(
+                left=left, right=right, reference_slope=rs)
+            # sensitivity bounds = one category step either way (§10.1 qualitative default)
+            def _with_bounds(controls, cat):
+                from hype_app.contracts import QUALITATIVE_MULTIPLIER as QM
+                lo_cat, hi_cat = grad_mod.qualitative_neighbors(cat)
+                lo, hi = sorted((QM[lo_cat] * rs.value, QM[hi_cat] * rs.value))
+                return [c.model_copy(update={"lower": lo, "upper": hi}) for c in controls]
+            return cfg.model_copy(update={
+                "left_controls": _with_bounds(cfg.left_controls, left),
+                "right_controls": _with_bounds(cfg.right_controls, right)})
+        if bc == BC_PROFILE:
+            left = grad_mod.parse_control_lines(
+                _safe("g_left_ctl", "0, 0.005\n1, 0.005"), Side.left)
+            right = grad_mod.parse_control_lines(
+                _safe("g_right_ctl", "0, 0.005\n1, 0.005"), Side.right)
+            return GradientBoundaryConfigV2(mode="quantitative",
+                                            left_controls=left, right_controls=right)
+        return None                                   # legacy corner mode
+
+    @render.ui
+    def gradient_qual_preview():
+        try:
+            _ = input.g_qual_left(), input.g_qual_right()   # subscribe
+        except Exception:  # noqa: BLE001
+            pass
+        rs = _reference_slope()
+        if rs is None:
+            return ui.TagList(
+                ui.div("No usable reference slope from the water surface or DEM — enter one:",
+                       class_="hype-warn"),
+                ui.input_numeric("g_ref_slope", "Reference slope (m/m)",
+                                 value=_keep("g_ref_slope", 0.005), min=0.0, step=0.001))
+        try:
+            cfg = _gradient_config()
+            gl = cfg.left_controls[0].preferred
+            gr = cfg.right_controls[0].preferred
+            return ui.div(f"Reference slope {rs.value:.5f} m/m ({rs.source}) → left gradient "
+                          f"{gl:+.5f}, right {gr:+.5f} m/m.", class_="hype-instr")
+        except Exception as e:  # noqa: BLE001
+            return ui.div(str(e), class_="hype-warn")
+
+    @render.ui
+    def gradient_ctl_check():
+        from hype_app import gradients as grad_mod
+        try:
+            _ = input.g_left_ctl(), input.g_right_ctl()     # subscribe
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cfg = _gradient_config()
+        except ValueError as e:
+            return ui.div(str(e), class_="hype-warn")
+        if cfg is None:
+            return None
+        warns = grad_mod.validate_config(cfg)
+        n = len(cfg.left_controls) + len(cfg.right_controls)
+        bits = [ui.div(f"{n} controls parsed — heads anchor at each control "
+                       "(head = WSE + gradient × distance) and interpolate between.",
+                       class_="hype-instr")]
+        bits += [ui.div(w.message, class_="hype-warn") for w in warns]
+        return ui.TagList(*bits)
 
     @reactive.effect
     async def _start_surface():
@@ -3070,6 +3573,12 @@ def server(input, output, session):
             ui.notification_show("No water surface yet — draw the wetted extent, run the Surface "
                                  "model, or upload a WSE raster.", type="warning", duration=6)
             return
+        try:
+            gradients_cfg = _gradient_config()   # None in legacy corner mode
+        except ValueError as ge:
+            ui.notification_show(f"Fix the boundary gradients first: {ge}",
+                                 type="warning", duration=8)
+            return
         _wse_used["path"] = wse             # for the Results "Water surface (raster)" overlay
         try:
             crs = proj_crs()
@@ -3086,6 +3595,19 @@ def server(input, output, session):
                 "kzone_kh": float(_safe("kzone_kh", 50.0)),
                 "kzone_kv": float(_safe("kzone_kv", 5.0)),
             }
+            # NRCS-derived K (§6): only when fetched AND explicitly enabled with a confirmed
+            # aggregation policy. Reduced to a picklable per-mukey payload here; the child
+            # builds the per-cell arrays after the grid exists.
+            if bool(_safe("use_soil_k", False)) and soil_snapshot():
+                from hype_app.soil_k import prepare_soil_k_payload
+                kv0 = float(_safe("kv", 1.0)) or 1.0
+                payload["soil_k"] = prepare_soil_k_payload(
+                    soil_snapshot(), policy=str(_safe("soil_policy", "dominant")),
+                    anisotropy_ratio=float(_safe("kh", 10.0)) / kv0,
+                    fallback_kh=float(_safe("kh", 10.0)), fallback_kv=kv0)
+                if payload["soil_k"] is None:
+                    ui.notification_show("NRCS soils have no usable conductivity data — "
+                                         "running with uniform K.", type="warning", duration=6)
             # Freeze the run inputs (§4.2): from here on the report/download read this snapshot,
             # not live UI. Guarded so a snapshot problem can never abort the actual run.
             try:
@@ -3113,6 +3635,12 @@ def server(input, output, session):
                         model_origin_elev=payload["params"].get("model_origin_elev")),
                     use_kzones=use_kz, kzone_count=len(payload["kzones"]),
                     kzone_kh=payload["kzone_kh"], kzone_kv=payload["kzone_kv"],
+                    gradients_config=gradients_cfg,
+                    soil_snapshot_id=("nrcs" if payload.get("soil_k") else None),
+                    soil_aggregation_policy=(str(_safe("soil_policy", "dominant"))
+                                             if payload.get("soil_k") else None),
+                    anisotropy_ratio=(payload["soil_k"]["anisotropy_ratio"]
+                                      if payload.get("soil_k") else None),
                     app_version=APP_VERSION)
                 snap_dict = snap.model_dump(mode="json")
                 input_snapshot.set(snap_dict)
@@ -4021,7 +4549,13 @@ def server(input, output, session):
     # without erasing the children's own state.
     _check_state: dict = {}
     _CHECK_DEFAULTS = {"base.imagery": False,     # topo is the startup basemap
-                       "base.hydro": False}       # NHD hydrography overlay: opt-in, off by default
+                       "base.hydro": False,       # NHD hydrography overlay: opt-in, off by default
+                       # Results defaults (revision §8.1): after delineation only the HYPORHEIC
+                       # paths + volume show; losing/gaining/throughflow are opt-in.
+                       "gw.res.paths.los": False, "gw.res.paths.gain": False,
+                       "gw.res.paths.thru": False,
+                       "gw.res.hz.los": False, "gw.res.hz.gain": False,
+                       "gw.res.hz.thru": False}
 
     def _node_checked(nid) -> bool:
         return bool(_check_state.get(nid, _CHECK_DEFAULTS.get(nid, True)))
@@ -4347,6 +4881,8 @@ def server(input, output, session):
             hidden.add("gw.run")               # the run row appears once a run first starts
         if run_result() is None:
             hidden.add("gw.res.hz")            # the Zone group appears after a GW run
+            if _task_state(sens_task) == "initial" and sens_result() is None:
+                hidden.add("gw.sens")          # sensitivity surfaces once a run/manifest exists
         if hz_result() is None:                # Flow-paths + Volumes populate on delineation
             hidden.update(("gw.res.paths", "gw.res.hz.vols"))   # children drop with their parent
         dimmed = {nid for nid in ui_tree.NODE_LAYERS
@@ -4799,7 +5335,8 @@ def server(input, output, session):
         # session, and Windows can't delete files a live child still holds open.
         _terminate_child()
         _kill_ras_proc()
-        for h, k in ((_mesh_proc, "proc"), (_mesh3d_proc, "p"), (_hz_proc, "p")):
+        for h, k in ((_mesh_proc, "proc"), (_mesh3d_proc, "p"), (_hz_proc, "p"),
+                     (_sens_proc, "p"), (_soil_proc, "p")):
             p = h.get(k)
             if p is not None:
                 try:
@@ -4816,6 +5353,10 @@ def server(input, output, session):
         log_lines.clear(); log_tick.set(0); step_v.set(0)
         hz_result.set(None); hz_gdf.set(None); hz_sel_pids.set(())
         hz_log_lines.clear(); hz_log_tick.set(0); hz_step_v.set(0)
+        input_snapshot.set(None); flow_lookup.set(None); flow_source.set(None)
+        soil_snapshot.set(None); soil_overrides.set([])
+        results_model.set(None); report_paths.set(None)
+        sens_result.set(None); sens_log_lines.clear(); sens_log_tick.set(0)
         _drop_ras_artifacts(); ras_log_lines.clear(); ras_log_tick.set(0)
         wse_mode_v.set("model")
         _wse_used.clear()
@@ -5013,6 +5554,8 @@ def server(input, output, session):
                 "flow_lookup": flow_lookup(), "flow_source": flow_source(),
                 "soil_snapshot": soil_snapshot(), "soil_overrides": soil_overrides(),
                 "results_model": results_model(),
+                "sens_result": ({k: v for k, v in (sens_result() or {}).items()
+                                 if k != "running"} or None),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
                 "hz_result": _tokenize_paths(hz_result()),
@@ -5065,7 +5608,8 @@ def server(input, output, session):
 
     def _busy_tasks():
         return [t for t in (snap_task, reach_task, dem_task, delineate_task, carve_task,
-                            wse_task, ras_task, mesh_prev_task, mesh_task, run_task, hz_task)
+                            wse_task, ras_task, mesh_prev_task, mesh_task, run_task, hz_task,
+                            sens_task, soil_task, usgs_flow_task)
                 if _task_state(t) == "running"]
 
     @reactive.effect
@@ -5190,6 +5734,7 @@ def server(input, output, session):
         soil_snapshot.set(_soil)
         soil_overrides.set(st.get("soil_overrides") or [])
         results_model.set(st.get("results_model"))
+        sens_result.set(st.get("sens_result"))
         if _soil and _HAS_MAP:
             _show_soils_layer(_soil)
         rn = st.get("run_result")
@@ -5544,8 +6089,35 @@ def server(input, output, session):
                     _hub_row(sw_ok, "Water surface", sw_detail, "sw"),
                     class_="hype-legend"),
                 ui.input_select("bc_mode", "Boundary condition",
-                                {BC_CORNER: "4 corner gradients", BC_PROFILE: "Spatially varying"},
-                                selected=str(_keep("bc_mode", BC_CORNER))),
+                                {BC_QUAL: "Qualitative (per side)",
+                                 BC_PROFILE: "Structured controls (spatially varying)",
+                                 BC_CORNER: "4 corner gradients (legacy)"},
+                                selected=str(_keep("bc_mode", BC_QUAL))),
+                ui.div("Sign convention: positive = floodplain head above the stream water "
+                       "surface (gaining tendency); negative = below (losing). Units m/m.",
+                       class_="hype-instr"),
+                ui.panel_conditional(
+                    f"input.bc_mode === '{BC_QUAL}'",
+                    ui.div(
+                        ui.input_select("g_qual_left", "Left floodplain", _QUAL_CHOICES,
+                                        selected=str(_keep("g_qual_left", "neutral"))),
+                        ui.input_select("g_qual_right", "Right floodplain", _QUAL_CHOICES,
+                                        selected=str(_keep("g_qual_right", "neutral"))),
+                        class_="hype-field-row"),
+                    ui.output_ui("gradient_qual_preview")),
+                ui.panel_conditional(
+                    f"input.bc_mode === '{BC_PROFILE}'",
+                    ui.input_text_area(
+                        "g_left_ctl", "Left controls",
+                        value=_keep("g_left_ctl", "0, 0.005\n1, 0.005"), rows=3),
+                    ui.input_text_area(
+                        "g_right_ctl", "Right controls",
+                        value=_keep("g_right_ctl", "0, 0.005\n1, 0.005"), rows=3),
+                    ui.div("One control per line: 'station, gradient[, lower, upper]'. Station "
+                           "runs 0 (upstream) to 1 (downstream) and must include 0 and 1; the "
+                           "optional lower/upper bounds feed the sensitivity scenarios.",
+                           class_="hype-instr"),
+                    ui.output_ui("gradient_ctl_check")),
                 ui.panel_conditional(
                     f"input.bc_mode === '{BC_CORNER}'",
                     ui.div(
@@ -5557,15 +6129,9 @@ def server(input, output, session):
                                          value=_keep("g_dl", 0.005), step=0.001),
                         ui.input_numeric("g_dr", "Downstream-right gradient",
                                          value=_keep("g_dr", 0.005), step=0.001),
-                        class_="hype-field-row")),
-                ui.panel_conditional(
-                    f"input.bc_mode === '{BC_PROFILE}'",
-                    ui.input_text("g_left_profile", "Left profile",
-                                  value=_keep("g_left_profile", "0,0.005 0.5,0.005 1,0.005")),
-                    ui.input_text("g_right_profile", "Right profile",
-                                  value=_keep("g_right_profile", "0,0.005 0.5,0.005 1,0.005")),
-                    ui.div("Format: 'fraction,gradient …' along each boundary (must include 0 "
-                           "and 1).", class_="hype-instr")),
+                        class_="hype-field-row"),
+                    ui.div("Legacy method: heads interpolate linearly between the two corner "
+                           "anchors of each side.", class_="hype-instr")),
                 ui.accordion(
                     ui.accordion_panel(
                         "Particle tracking",
@@ -5892,7 +6458,7 @@ def server(input, output, session):
         "sw": _pane_sw, "sw.mesh": _pane_sw, "sw.wetted": _pane_wetted,
         "sw.wse": _pane_sw_raster("wse"), "sw.depth": _pane_sw_raster("depth"),
         "gw": _pane_gw, "gw.k": _pane_k, "gw.soils": _pane_soils,
-        "gw.mesh": _pane_mesh, "gw.run": _pane_run,
+        "gw.mesh": _pane_mesh, "gw.run": _pane_run, "gw.sens": _pane_sens,
         "gw.res": _pane_results, "gw.res.head": _pane_head, "gw.res.paths": _pane_paths,
         "gw.res.hz": _pane_hz, "gw.res.hz.vols": _pane_vols,
         "gw.res.paths.hyp": _pane_hz_paths("hyporheic"),

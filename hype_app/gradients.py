@@ -18,7 +18,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .contracts import GradientBoundaryConfigV2, GradientControl, ReferenceSlope, Side
+from .contracts import (
+    GradientBoundaryConfigV2,
+    GradientControl,
+    GradientQualitative,
+    ReferenceSlope,
+    Side,
+)
 from .provenance import HypeWarning, Severity
 
 
@@ -121,6 +127,70 @@ def validate_config(config: GradientBoundaryConfigV2) -> list[HypeWarning]:
     return warnings
 
 
+def parse_control_lines(text: str, side: Side) -> list[GradientControl]:
+    """Parse the pane's control-table text into GradientControls (one control per line).
+
+    Line format: ``station, preferred [, lower, upper]`` — commas or whitespace separated.
+    Also accepts the legacy single-line ``"f,g f,g …"`` profile string (§7.7), so old
+    project values paste straight in. Stations 0 and 1 are enforced by the contract.
+    """
+    if text is None or not str(text).strip():
+        raise ValueError("No gradient controls given.")
+    raw_lines = [ln.strip() for ln in str(text).splitlines() if ln.strip()]
+    if len(raw_lines) == 1 and raw_lines[0].count(",") >= 2 and " " in raw_lines[0]:
+        # legacy one-liner "f,g f,g ..." -> one control per pair
+        raw_lines = [p.strip() for p in raw_lines[0].split() if p.strip()]
+
+    controls: list[GradientControl] = []
+    for ln in raw_lines:
+        parts = [p for p in ln.replace(",", " ").split() if p]
+        if len(parts) not in (2, 3, 4):
+            raise ValueError(f"Bad control line '{ln}' — use 'station, preferred[, lower, upper]'.")
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError as e:
+            raise ValueError(f"Non-numeric value in control line '{ln}'.") from e
+        station, preferred = nums[0], nums[1]
+        lower = nums[2] if len(nums) >= 3 else None
+        upper = nums[3] if len(nums) == 4 else None
+        if len(nums) == 3:                    # single third number = symmetric +/- variation
+            lower, upper = preferred - abs(nums[2]), preferred + abs(nums[2])
+        controls.append(GradientControl(
+            id=f"{side.value}-{station:g}", side=side, station=station,
+            preferred=preferred, lower=lower, upper=upper, source="manual"))
+    return controls
+
+
+def serialize_profile(controls: list[GradientControl], *, which: str = "preferred") -> str:
+    """Controls -> the engine's ``"station,gradient …"`` profile string.
+
+    The engine's spatially-varying path already implements the §7.5 head-anchor method
+    (anchor head per fraction, arc-length interpolation), so structured controls feed it
+    losslessly — `which` picks the preferred/lower/upper scenario per control.
+    """
+    def _g(c: GradientControl) -> float:
+        if which == "lower" and c.lower is not None:
+            return c.lower
+        if which == "upper" and c.upper is not None:
+            return c.upper
+        return c.preferred
+    ordered = sorted(controls, key=lambda c: c.station)
+    return " ".join(f"{c.station:g},{_g(c):g}" for c in ordered)
+
+
+# Qualitative sensitivity bounds: one category step down/up (§10.1 default for qualitative mode).
+_QUAL_ORDER = [GradientQualitative.strongly_losing, GradientQualitative.slightly_losing,
+               GradientQualitative.neutral, GradientQualitative.slightly_gaining,
+               GradientQualitative.strongly_gaining]
+
+
+def qualitative_neighbors(cat: GradientQualitative) -> tuple[GradientQualitative,
+                                                             GradientQualitative]:
+    """(one step toward losing, one step toward gaining), clamped at the scale ends."""
+    i = _QUAL_ORDER.index(cat)
+    return _QUAL_ORDER[max(0, i - 1)], _QUAL_ORDER[min(len(_QUAL_ORDER) - 1, i + 1)]
+
+
 def config_from_legacy_corners(corner_gradients: dict, *, side: Side) -> list[GradientControl]:
     """Upgrade a legacy 4-corner config to structured controls for one side (§7.7 upgrade preview).
 
@@ -141,4 +211,5 @@ def config_from_legacy_corners(corner_gradients: dict, *, side: Side) -> list[Gr
 __all__ = [
     "anchor_head", "ControlGeometry", "interpolate_to_stations", "realized_side_heads",
     "reference_slope_from_samples", "validate_config", "config_from_legacy_corners",
+    "parse_control_lines", "serialize_profile", "qualitative_neighbors",
 ]

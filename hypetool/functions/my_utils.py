@@ -1216,12 +1216,25 @@ def build_gwf_model(
     strt = np.full((cfg.nlay, cfg.nrow, cfg.ncol), strt_val, dtype=float)
     flopy.mf6.ModflowGwfic(gwf, strt=strt)
 
-    # NPF
-    k_array, k33_array = _kh_arrays_from_polygon(cfg, gwf, idomain)
+    # NPF — K precedence (HYPE revision §6.8): manual K-zone polygons override the
+    # soil-derived base (cfg.cell_k_builder, set by the app when NRCS soils drive K),
+    # which overrides the global uniform cfg.kh/cfg.kv fallback.
+    base_k = base_k33 = None
+    _builder = getattr(cfg, "cell_k_builder", None)
+    if callable(_builder):
+        try:
+            base_k, base_k33 = _builder(cfg, gwf, idomain)
+        except Exception as _e:  # noqa: BLE001 — a soil-K failure must not sink the run
+            print(f"[WARN] soil-derived K builder failed; using uniform K: {_e}")
+            base_k = base_k33 = None
+    k_array, k33_array = _kh_arrays_from_polygon(cfg, gwf, idomain,
+                                                 base=(base_k, base_k33))
     if k_array is None:
-        k_array = np.full((cfg.nlay, cfg.nrow, cfg.ncol), float(cfg.kh), dtype=float)
+        k_array = base_k if base_k is not None else \
+            np.full((cfg.nlay, cfg.nrow, cfg.ncol), float(cfg.kh), dtype=float)
     if k33_array is None:
-        k33_array = np.full((cfg.nlay, cfg.nrow, cfg.ncol), float(cfg.kv), dtype=float)
+        k33_array = base_k33 if base_k33 is not None else \
+            np.full((cfg.nlay, cfg.nrow, cfg.ncol), float(cfg.kv), dtype=float)
     flopy.mf6.ModflowGwfnpf(
         gwf,
         icelltype=2,
@@ -1326,7 +1339,8 @@ def build_gwf_model(
     return sim, gwf
 
 
-def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray,
+                            base: tuple | None = None) -> tuple[np.ndarray | None, np.ndarray | None]:
     """
     Construct 3D arrays for KH (and optionally KV) from a polygon shapefile.
 
@@ -1338,8 +1352,12 @@ def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray) -> tuple[np.ndarray |
         largest area overlap (dominant polygon).
       - If TOP_ELEV/BOT_ELEV are present, only apply values to layers whose
         [layer_top, layer_bot] interval intersects [BOT_ELEV, TOP_ELEV].
-      - Cells with no polygon coverage use defaults cfg.kh / cfg.kv.
+      - Cells with no polygon coverage use defaults cfg.kh / cfg.kv — or, when
+        `base` (k, k33) arrays are given (soil-derived K), those values: the manual
+        zones OVERLAY the base per the §6.8 precedence.
     """
+    base_k = base[0] if base else None
+    base_k33 = base[1] if base else None
     shp_path = getattr(cfg, "kh_polygon_shapefile", None)
     if shp_path is None:
         gdf_poly = getattr(cfg, "kh_polygon_gdf", None)
@@ -1350,7 +1368,7 @@ def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray) -> tuple[np.ndarray |
         gdf_poly = gpd.read_file(shp_path)
 
     if gdf_poly is None or gdf_poly.empty:
-        return None, None
+        return (base_k, base_k33) if base_k is not None else (None, None)
 
     # Reproject to model grid CRS
     try:
@@ -1383,7 +1401,7 @@ def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray) -> tuple[np.ndarray |
 
     if not has_kh:
         print("[WARN] KH polygon shapefile missing 'KH' attribute; using uniform KH.")
-        return None, None
+        return (base_k, base_k33) if base_k is not None else (None, None)
 
     dis = gwf.get_package("DIS")
     nlay, nrow, ncol = idomain.shape
@@ -1408,14 +1426,18 @@ def _kh_arrays_from_polygon(cfg, gwf, idomain: np.ndarray) -> tuple[np.ndarray |
 
     inter = gpd.overlay(g_cells, gdf_poly, how="intersection")
     if inter is None or inter.empty:
-        return None, None
+        return (base_k, base_k33) if base_k is not None else (None, None)
 
     inter["_area"] = inter.geometry.area
     inter_sorted = inter.sort_values(["row", "col", "_area"], ascending=[True, True, False])
     inter_dominant = inter_sorted.drop_duplicates(subset=["row", "col"], keep="first")
 
-    k = np.full((nlay, nrow, ncol), float(cfg.kh), dtype=float)
-    k33 = np.full((nlay, nrow, ncol), float(cfg.kv), dtype=float)
+    if base_k is not None and base_k33 is not None:
+        k = np.asarray(base_k, dtype=float).copy()          # soil-derived base (§6.8)
+        k33 = np.asarray(base_k33, dtype=float).copy()
+    else:
+        k = np.full((nlay, nrow, ncol), float(cfg.kh), dtype=float)
+        k33 = np.full((nlay, nrow, ncol), float(cfg.kv), dtype=float)
 
     top2d = np.asarray(dis.top.array, dtype=float)
     bot3d = np.asarray(dis.botm.array, dtype=float)  # shape (nlay, nrow, ncol)

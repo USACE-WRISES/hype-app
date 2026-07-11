@@ -97,3 +97,52 @@ class TestQualitativeAndValidation:
         assert [c.station for c in controls] == [0.0, 1.0]
         assert controls[0].preferred == 0.01 and controls[1].preferred == 0.02
         assert all(c.source == "legacy_upgrade" for c in controls)
+
+
+class TestControlLinesAndSerialization:
+    def test_parse_multiline_with_bounds(self):
+        from hype_app.gradients import parse_control_lines
+        ctls = parse_control_lines("0, 0.01, 0.0, 0.02\n0.5, 0.015\n1, 0.02, 0.01, 0.03",
+                                   Side.left)
+        assert [c.station for c in ctls] == [0.0, 0.5, 1.0]
+        assert ctls[0].lower == 0.0 and ctls[0].upper == 0.02
+        assert ctls[1].lower is None and ctls[1].upper is None
+        assert ctls[2].preferred == 0.02
+
+    def test_parse_symmetric_third_number(self):
+        from hype_app.gradients import parse_control_lines
+        ctls = parse_control_lines("0, 0.01, 0.005\n1, 0.01, 0.005", Side.right)
+        assert ctls[0].lower == pytest.approx(0.005) and ctls[0].upper == pytest.approx(0.015)
+
+    def test_parse_legacy_one_liner(self):
+        from hype_app.gradients import parse_control_lines
+        ctls = parse_control_lines("0,0.005 0.5,0.007 1,0.009", Side.left)
+        assert [c.station for c in ctls] == [0.0, 0.5, 1.0]
+        assert [c.preferred for c in ctls] == [0.005, 0.007, 0.009]
+
+    def test_parse_bad_line_raises(self):
+        from hype_app.gradients import parse_control_lines
+        with pytest.raises(ValueError):
+            parse_control_lines("0 0.01 0.0 0.02 99", Side.left)
+        with pytest.raises(ValueError):
+            parse_control_lines("0, abc\n1, 0.01", Side.left)
+
+    def test_serialize_profile_roundtrips_through_engine_parser(self):
+        """The serialized string must parse cleanly by the ENGINE's profile parser — the
+        lossless structured-controls -> engine bridge."""
+        from hype_app.gradients import parse_control_lines, serialize_profile
+        from hypetool.functions.my_utils import parse_fraction_gradient_profile
+        ctls = parse_control_lines("0, 0.01, 0.0, 0.02\n0.5, -0.015\n1, 0.02", Side.left)
+        s = serialize_profile(ctls)
+        assert parse_fraction_gradient_profile(s) == [(0.0, 0.01), (0.5, -0.015), (1.0, 0.02)]
+        s_lo = serialize_profile(ctls, which="lower")
+        assert parse_fraction_gradient_profile(s_lo)[0] == (0.0, 0.0)     # lower bound used
+        assert parse_fraction_gradient_profile(s_lo)[1] == (0.5, -0.015)  # falls back preferred
+
+    def test_qualitative_neighbors_clamped(self):
+        from hype_app.contracts import GradientQualitative as Q
+        from hype_app.gradients import qualitative_neighbors
+        lo, hi = qualitative_neighbors(Q.neutral)
+        assert lo == Q.slightly_losing and hi == Q.slightly_gaining
+        lo, hi = qualitative_neighbors(Q.strongly_gaining)
+        assert lo == Q.slightly_gaining and hi == Q.strongly_gaining   # clamped at the end
