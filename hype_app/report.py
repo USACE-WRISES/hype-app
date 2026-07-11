@@ -188,6 +188,51 @@ def report_references(results: AssessmentResultsV2) -> list[dict]:
     return deduped
 
 
+def render_rtd_figure(transit_days, weights) -> bytes | None:
+    """Weighted residence-time distribution figure (§8.5): flux-weighted empirical CDF + a
+    log-time histogram, as PNG bytes. Returns None when there's nothing to plot. Uses the
+    headless Agg backend so it is safe in the pip-only Connect-Cloud environment."""
+    import numpy as np
+    t = np.asarray(transit_days, dtype=float)
+    w = (np.ones_like(t) if weights is None else np.asarray(weights, dtype=float))
+    ok = np.isfinite(t) & (t > 0) & np.isfinite(w) & (w > 0)
+    t, w = t[ok], w[ok]
+    if t.size < 2:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:  # noqa: BLE001 — figures are best-effort (§11.5)
+        return None
+
+    order = np.argsort(t)
+    ts, ws = t[order], w[order]
+    cdf = np.cumsum(ws) / ws.sum()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.4, 2.9))
+    ax1.step(ts, cdf, where="post", color="#2c7bb6", lw=1.6)
+    ax1.set_xscale("log")
+    ax1.set_xlabel("Transit time (days, log)")
+    ax1.set_ylabel("Flux-weighted CDF")
+    ax1.set_ylim(0, 1)
+    ax1.grid(True, which="both", ls=":", lw=0.4, alpha=0.6)
+    for hrs, lab in ((1 / 24, "1 h"), (1.0, "1 d")):
+        if ts.min() <= hrs <= ts.max():
+            ax1.axvline(hrs, color="#d73027", lw=0.8, ls="--")
+            ax1.text(hrs, 0.02, lab, fontsize=6, color="#d73027", rotation=90, va="bottom")
+    bins = np.logspace(np.log10(ts.min()), np.log10(ts.max()), 24)
+    ax2.hist(ts, bins=bins, weights=ws, color="#2c7bb6", alpha=0.85)
+    ax2.set_xscale("log")
+    ax2.set_xlabel("Transit time (days, log)")
+    ax2.set_ylabel("Flux weight")
+    ax2.grid(True, which="both", ls=":", lw=0.4, alpha=0.6)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
 def results_to_json(results: AssessmentResultsV2) -> str:
     return results.model_dump_json(indent=2)
 
@@ -266,6 +311,13 @@ _HTML_TEMPLATE = """<!doctype html>
 </table>
 {% endif %}
 
+{% if rtd_png_b64 %}
+<h2 style="page-break-before:auto">Residence-time distribution</h2>
+<img src="data:image/png;base64,{{ rtd_png_b64 }}" alt="Weighted residence-time distribution"
+     style="max-width:100%;height:auto"/>
+<p class="muted">Flux-weighted transit times of stream water returning to the channel.</p>
+{% endif %}
+
 {% if sensitivity_rows %}
 <h2>6 · Gradient sensitivity</h2>
 <p class="muted">Ranges show sensitivity to the tested gradient assumptions — not confidence intervals.</p>
@@ -287,7 +339,7 @@ _HTML_TEMPLATE = """<!doctype html>
 
 
 def render_html(results: AssessmentResultsV2, *, app_version=None,
-                model_version=None) -> str:
+                model_version=None, rtd_png: bytes | None = None) -> str:
     env = Environment(autoescape=select_autoescape(["html", "xml"]))
     env.filters["fmt"] = fmt
     template = env.from_string(_HTML_TEMPLATE)
@@ -301,23 +353,25 @@ def render_html(results: AssessmentResultsV2, *, app_version=None,
     from types import SimpleNamespace
     site = site or SimpleNamespace(site_name=None, analyst=None, organization=None,
                                    assessment_date=None, reach_length_m=None, notes=None)
+    import base64
     return template.render(results=results, site=site, grouped=grouped, fmt=fmt,
                            input_rows=input_rows(results), data_sources=data_source_rows(results),
                            sensitivity_rows=sensitivity_rows(results),
                            references=report_references(results),
+                           rtd_png_b64=(base64.b64encode(rtd_png).decode() if rtd_png else None),
                            generated_at=(results.created_at.isoformat() if results.created_at else "—"),
                            method_version=REPORT_METHOD_VERSION,
                            app_version=app_version, model_version=model_version)
 
 
 def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
-               model_version=None) -> str:
+               model_version=None, rtd_png: bytes | None = None) -> str:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import inch
     from reportlab.platypus import (
-        Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
+        Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
 
     styles = getSampleStyleSheet()
     small = styles["BodyText"].clone("small", fontSize=8, leading=10)
@@ -372,6 +426,15 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
         story.append(_table(["Group", "Input", "Value", "Unit"],
                             [[r["section"], r["name"], r["value"], r["unit"]] for r in irows],
                             [1.2 * inch, 2.4 * inch, 1.8 * inch, 0.9 * inch]))
+
+    if rtd_png:
+        story.append(Spacer(1, 0.16 * inch))
+        story.append(Paragraph("Residence-time distribution", styles["Heading2"]))
+        img = Image(io.BytesIO(rtd_png))
+        img._restrictSize(6.9 * inch, 2.9 * inch)
+        story.append(img)
+        story.append(Paragraph("Flux-weighted transit times of stream water returning to the "
+                               "channel.", small))
 
     drows = data_source_rows(results)
     if drows:
@@ -438,26 +501,43 @@ def generate_report(results: AssessmentResultsV2, out_dir, *, transit_rows=None,
     """Write every format into out_dir; return {format: path}. Retryable without a model run."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    # Weighted RTD figure (§8.5) from the per-particle transit rows — shared by HTML + PDF.
+    rtd_png = None
+    rows = transit_rows or []
+    ret = [r for r in rows if r.get("endpoint_class") == "returning"]
+    if len(ret) >= 2:
+        try:
+            rtd_png = render_rtd_figure([r["transit_time_days"] for r in ret],
+                                        [r["flow_weight"] for r in ret])
+        except Exception:  # noqa: BLE001 — figures are best-effort
+            rtd_png = None
+    if rtd_png:
+        (out / "rtd_distribution.png").write_bytes(rtd_png)
+
     paths = {
         "json": str(out / "assessment_results.json"),
         "html": str(out / "site_report.html"),
         "csv_metrics": write_site_metrics_csv(results, out / "site_metrics.csv"),
-        "csv_transit": write_transit_times_csv(transit_rows or [],
-                                               out / "hyporheic_transit_times.csv"),
+        "csv_transit": write_transit_times_csv(rows, out / "hyporheic_transit_times.csv"),
     }
     Path(paths["json"]).write_text(results_to_json(results), encoding="utf-8")
     Path(paths["html"]).write_text(
-        render_html(results, app_version=app_version, model_version=model_version),
+        render_html(results, app_version=app_version, model_version=model_version,
+                    rtd_png=rtd_png),
         encoding="utf-8")
     try:
         paths["pdf"] = render_pdf(results, out / "site_report.pdf",
-                                  app_version=app_version, model_version=model_version)
+                                  app_version=app_version, model_version=model_version,
+                                  rtd_png=rtd_png)
     except Exception as e:  # noqa: BLE001 — PDF is best-effort; other formats still land
         paths["pdf_error"] = str(e)
     return paths
 
 
 __all__ = [
-    "fmt", "metric_rows", "results_to_json", "write_site_metrics_csv", "write_transit_times_csv",
-    "render_html", "render_pdf", "generate_report", "REPORT_METHOD_VERSION",
+    "fmt", "metric_rows", "input_rows", "data_source_rows", "sensitivity_rows",
+    "report_references", "render_rtd_figure", "results_to_json", "write_site_metrics_csv",
+    "write_transit_times_csv", "render_html", "render_pdf", "generate_report",
+    "REPORT_METHOD_VERSION",
 ]

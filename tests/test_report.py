@@ -90,6 +90,29 @@ def test_html_self_contained_and_escaped(results):
     assert "<style>" in html            # inline CSS
 
 
+def test_rtd_figure_renders_and_embeds():
+    """§8.5: a weighted RTD figure (ECDF + log histogram) is produced from returning transit
+    rows and embedded in the HTML as a data URI; too-few points yields no figure (no crash)."""
+    import numpy as np
+
+    from hype_app.report import render_rtd_figure
+    png = render_rtd_figure(np.geomspace(0.1, 100, 200), np.ones(200))
+    assert png and png[:8] == b"\x89PNG\r\n\x1a\n"      # real PNG magic bytes
+    assert render_rtd_figure([1.0], [1.0]) is None       # <2 points -> no figure
+    assert render_rtd_figure([], None) is None
+
+
+def test_generate_report_embeds_rtd_figure(results, tmp_path):
+    from hype_app.report import generate_report
+    rows = [{"particle_id": i, "source_cell": i, "flow_weight": 1.0,
+             "endpoint_class": "returning", "transit_time_days": 0.1 * (i + 1),
+             "termination": 2} for i in range(30)]
+    paths = generate_report(results, tmp_path, transit_rows=rows)
+    assert (tmp_path / "rtd_distribution.png").exists()
+    assert "data:image/png;base64," in (tmp_path / "site_report.html").read_text()
+    assert "pdf_error" not in paths
+
+
 def test_report_covers_all_spec_sections(results):
     """§11.3: the report must document inputs, data sources/provenance, software, and
     references — not just the metric tables."""

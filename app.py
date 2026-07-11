@@ -2732,7 +2732,17 @@ def server(input, output, session):
             reach_length_m=_reach_length_m())
 
     def _report_modal(res, paths):
-        html = report_mod.render_html(res, app_version=APP_VERSION)
+        # Prefer the generated HTML file — it already embeds the RTD figure — so the modal
+        # preview matches the download byte-for-byte. Fall back to a fresh render.
+        html = None
+        hp = (paths or {}).get("html")
+        if hp and Path(hp).is_file():
+            try:
+                html = Path(hp).read_text(encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                html = None
+        if html is None:
+            html = report_mod.render_html(res, app_version=APP_VERSION)
         return ui.modal(
             ui.div(
                 ui.download_button("dl_report_html", "HTML", class_="btn-sm btn-outline-primary"),
