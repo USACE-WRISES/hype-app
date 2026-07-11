@@ -39,6 +39,7 @@ from shiny import App, reactive, render, ui  # noqa: E402
 from hype_app import (bieger, bundle, carve, delineate, dem, estimate, geocode, geometry,  # noqa: E402
                       hydro, hz_results, mesh, ras_results, results, scene, snapshot, ui_tree)
 from hype_app import hz_run  # noqa: E402
+from hype_app import soil_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
 
@@ -80,6 +81,8 @@ RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}     # Right FPL
 UP_STYLE = {"color": "#f08c00", "weight": 3, "opacity": 0.95}        # Upstream boundary (orange)
 DOWN_STYLE = {"color": "#9b59b6", "weight": 3, "opacity": 0.95}      # Downstream boundary (purple)
 KZONE_STYLE = {"color": "#7b3fa0", "weight": 2, "opacity": 0.95, "fill": False}
+SOILS_STYLE = {"color": "#8a6d3b", "weight": 1, "opacity": 0.9,        # NRCS SSURGO polygons (tan)
+               "fillColor": "#d2b48c", "fillOpacity": 0.22}
 NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable NHD flowlines (bold)
 REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
@@ -313,6 +316,10 @@ def server(input, output, session):
     _dem_shade_sig: dict = {}              # last-rendered (path, hs, stretch) — skip no-op renders
     run_result = reactive.value(None)
     input_snapshot = reactive.value(None)   # frozen AssessmentInputSnapshot dict for the active run
+    flow_lookup = reactive.value(None)      # last USGS FlowLookupSnapshot (dict) from the flow modal
+    flow_source = reactive.value(None)      # {"source","candidate_id","inserted_cfs"} provenance
+    soil_snapshot = reactive.value(None)    # NRCS SoilDataSnapshot (dict) from the soils fetch
+    soil_overrides = reactive.value([])     # list[SoilOverride dict] applied by the analyst
     fp_stats = reactive.value(None)         # per-particle flow-path metrics DataFrame (Results)
     fp_gdf = reactive.value(None)           # 4326 pathlines gdf — the drawn = selectable set
     sel_pids = reactive.value(())           # selected flow-path particleids (tuple)
@@ -966,6 +973,8 @@ def server(input, output, session):
                 _mirror_show(nm, feats[slot], style)
             _render_boundary_labels(feats, None)
             _load_into_drawcontrol(kz)
+            with reactive.isolate():               # keep the SSURGO review layer on the K/soils step
+                _show_soils_layer(soil_snapshot())
         elif step == STEP_BOUNDARIES:
             pass                                   # _sync_bnd_slot owns the Boundaries display
         else:
@@ -2189,6 +2198,377 @@ def server(input, output, session):
         """Last user-set value of a pane input (or `default` before any) — remount-proof."""
         return _kept.get(iid, default)
 
+    # ------------------------------------------------------------------
+    # USGS StreamStats / NSS flow lookup (revision §5): modal fetch + insert
+    # ------------------------------------------------------------------
+    _usgs_cancel = {"ev": None}
+
+    @reactive.extended_task
+    async def usgs_flow_task(region: str, lat: float, lon: float, want_national: bool) -> dict:
+        import threading as _threading
+        ev = _threading.Event()
+        _usgs_cancel["ev"] = ev
+
+        def _work():
+            from hype_app.services.streamstats import StreamStatsClient
+            client = StreamStatsClient(cache_dir=str(work_dir / "data_sources" / "usgs"))
+            try:
+                snap = client.lookup_flow(region, lat, lon, want_national=want_national,
+                                          cancel=ev.is_set)
+                return snap.model_dump(mode="json")
+            finally:
+                client.close()
+        return await anyio.to_thread.run_sync(_work)
+
+    def _usgs_outlet_latlon():
+        """(lat, lon) to seed the outlet marker: the oriented reach's downstream end (§5.1)."""
+        try:
+            coords = ((reach_feat() or {}).get("geometry") or {}).get("coordinates") or []
+            if coords:
+                lon, lat = coords[-1][0], coords[-1][1]   # GeoJSON lon,lat; last vertex = downstream
+                return float(lat), float(lon)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _usgs_modal():
+        from hype_app.services.streamstats import suggest_region
+        lat0, lon0 = (_usgs_outlet_latlon() or (43.686, -72.237))
+        region0 = _keep("usgs_region", "") or (suggest_region(lat0, lon0) or "")
+        return ui.modal(
+            ui.p("Look up regional peak-flow statistics from USGS StreamStats for the reach "
+                 "outlet, then insert one as the streamflow. National estimates are queried only "
+                 "when no regional discharge is usable, or on request.", class_="hype-instr"),
+            ui.row(
+                ui.column(4, ui.input_numeric("usgs_lat", "Outlet latitude",
+                                              value=round(lat0, 6), step=0.0001)),
+                ui.column(4, ui.input_numeric("usgs_lon", "Outlet longitude",
+                                              value=round(lon0, 6), step=0.0001)),
+                ui.column(4, ui.input_text("usgs_region", "Region", value=region0,
+                                           placeholder="2-letter state, e.g. NH")),
+            ),
+            ui.input_checkbox("usgs_national",
+                              "Also request national estimates for comparison", value=False),
+            ui.div(ui.input_action_button("usgs_fetch", "Fetch", class_="btn-primary btn-sm"),
+                   ui.input_action_button("usgs_cancel", "Cancel fetch",
+                                          class_="btn-outline-secondary btn-sm"),
+                   class_="hype-actions"),
+            ui.output_ui("usgs_status"),
+            ui.output_ui("usgs_candidates"),
+            title="Get USGS Flow", size="xl", easy_close=False,
+            footer=ui.TagList(
+                ui.input_action_button("usgs_insert", "Insert selected flow",
+                                       class_="btn-success btn-sm"),
+                ui.modal_button("Close")),
+        )
+
+    @reactive.effect
+    def _usgs_open():
+        if _clicked_dynamic("get_usgs_flow"):
+            ui.modal_show(_usgs_modal())
+
+    @reactive.effect
+    def _usgs_fetch():
+        if not _clicked_dynamic("usgs_fetch"):
+            return
+        try:
+            lat, lon = float(input.usgs_lat()), float(input.usgs_lon())
+            region = (input.usgs_region() or "").strip().upper()
+        except Exception:  # noqa: BLE001
+            ui.notification_show("Enter a valid latitude, longitude and region.", type="warning")
+            return
+        if not region.isalpha() or len(region) != 2:
+            ui.notification_show("Enter the 2-letter state/region code (e.g. NH).", type="warning")
+            return
+        _kept["usgs_region"] = region
+        flow_lookup.set(None)                 # clear prior result while the new lookup runs
+        usgs_flow_task(region, lat, lon, bool(input.usgs_national()))
+
+    @reactive.effect
+    def _usgs_cancel_click():
+        if _clicked_dynamic("usgs_cancel"):
+            ev = _usgs_cancel.get("ev")
+            if ev is not None:
+                ev.set()
+
+    @reactive.effect
+    def _usgs_done():
+        if usgs_flow_task.status() in ("initial", "running"):
+            return
+        if usgs_flow_task.status() == "error":
+            ui.notification_show("USGS lookup failed — check the point/region and try again.",
+                                 type="error", duration=8)
+            return
+        try:
+            flow_lookup.set(usgs_flow_task.result())
+        except Exception:  # noqa: BLE001
+            return
+
+    @render.ui
+    def usgs_status():
+        if usgs_flow_task.status() == "running":
+            return ui.div(ui.tags.strong("Contacting USGS StreamStats…"), ui.br(),
+                          "Watershed delineation can take ~30 s.", class_="hype-instr")
+        fl = flow_lookup()
+        if not fl:
+            return None
+        bits = []
+        if fl.get("selected_region"):
+            bits.append(ui.span(f"Region: {fl['selected_region']}   "))
+        if fl.get("snap_distance_m") is not None:
+            bits.append(ui.span(f"Snap distance: {fl['snap_distance_m']:.0f} m"))
+        warns = [ui.tags.li(w.get("message", "")) for w in (fl.get("warnings") or [])]
+        return ui.div(ui.div(*bits, class_="hype-instr"),
+                      ui.tags.ul(*warns, class_="hype-flow-warn") if warns else None)
+
+    @render.ui
+    def usgs_candidates():
+        fl = flow_lookup()
+        if not fl:
+            return None
+        cands = fl.get("candidates") or []
+        if not cands:
+            return ui.div("No flow statistics returned for this point.", class_="hype-instr")
+        choices = {}
+        for c in cands:
+            if not c.get("insertable"):
+                continue
+            label = f"{c.get('description') or c.get('statistic_code') or c['id']} — " \
+                    f"{c.get('value_cfs'):.1f} cfs"
+            if c.get("is_national"):
+                label += "  [national]"
+            if c.get("is_extrapolated"):
+                label += "  [extrapolated]"
+            choices[c["id"]] = label
+        rows = []
+        for c in cands:
+            cfs, cms, recur = c.get("value_cfs"), c.get("value_cms"), c.get("recurrence_years")
+            flags = [f for f, on in (("national", c.get("is_national")),
+                                     ("extrapolated", c.get("is_extrapolated")),
+                                     ("not insertable", not c.get("insertable"))) if on]
+            rows.append(ui.tags.tr(
+                ui.tags.td(c.get("description") or c.get("statistic_code") or c["id"]),
+                ui.tags.td(f"{cfs:.1f}" if isinstance(cfs, (int, float)) else "—"),
+                ui.tags.td(f"{cms:.3f}" if isinstance(cms, (int, float)) else "—"),
+                ui.tags.td(f"{recur:g}-yr" if isinstance(recur, (int, float)) else "—"),
+                ui.tags.td(c.get("regression_region") or "—"),
+                ui.tags.td(", ".join(flags) or "ok")))
+        table = ui.tags.table(
+            ui.tags.thead(ui.tags.tr(
+                ui.tags.th("Statistic"), ui.tags.th("cfs"), ui.tags.th("m³/s"),
+                ui.tags.th("Recurrence"), ui.tags.th("Region"), ui.tags.th("Status"))),
+            ui.tags.tbody(*rows), class_="table table-sm hype-flow-table")
+        picker = (ui.input_radio_buttons("usgs_pick", "Select a statistic to insert", choices)
+                  if choices else ui.div("No insertable discharge — see warnings above.",
+                                         class_="hype-instr"))
+        return ui.TagList(picker, table)
+
+    @reactive.effect
+    def _usgs_insert():
+        if not _clicked_dynamic("usgs_insert"):
+            return
+        fl = flow_lookup()
+        if not fl:
+            ui.notification_show("Fetch flow statistics first.", type="warning")
+            return
+        try:
+            pick = input.usgs_pick()
+        except Exception:  # noqa: BLE001
+            pick = None
+        cand = next((c for c in (fl.get("candidates") or []) if c.get("id") == pick), None)
+        if not cand or not isinstance(cand.get("value_cfs"), (int, float)):
+            ui.notification_show("Select an insertable discharge statistic.", type="warning")
+            return
+        cfs = round(float(cand["value_cfs"]), 2)
+        ui.update_numeric("ras_flow", value=cfs)
+        _kept["ras_flow"] = cfs
+        fl = dict(fl); fl["selected_candidate_id"] = pick
+        flow_lookup.set(fl)
+        flow_source.set({"source": "USGS StreamStats", "candidate_id": pick, "inserted_cfs": cfs})
+        try:
+            import json as _json
+            d = work_dir / "data_sources" / "usgs"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "flow_lookup.json").write_text(_json.dumps(fl, indent=2), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        ui.modal_remove()
+        ui.notification_show(f"Inserted {cfs:g} cfs from USGS StreamStats.", duration=6)
+
+    @render.ui
+    def flow_source_note():
+        fs = flow_source()
+        if not fs:
+            return None
+        try:
+            cur = float(input.ras_flow())
+        except Exception:  # noqa: BLE001
+            cur = None
+        edited = cur is not None and abs(cur - float(fs.get("inserted_cfs", cur))) > 1e-6
+        return ui.div(f"Source: {fs['source']}" + (" (edited since insert)" if edited else ""),
+                      class_="hype-instr hype-flow-source")
+
+    # ------------------------------------------------------------------
+    # NRCS soils fetch + review (revision §6.1–6.3): SSURGO layer + attributes
+    # ------------------------------------------------------------------
+    _soil_proc: dict = {}
+
+    @reactive.extended_task
+    async def soil_task(payload: dict) -> dict:
+        def _work():
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            p = ctx.Process(target=soil_run.child_run, args=(payload, q), daemon=True)
+            _soil_proc["p"] = p
+            p.start()
+            result = error = None
+            while True:
+                try:
+                    kind, data = q.get(timeout=0.3)
+                    if kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    if not p.is_alive():
+                        break
+            while True:                           # drain anything queued right before exit
+                try:
+                    kind, data = q.get_nowait()
+                    if kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    break
+            p.join(timeout=5)
+            _soil_proc["p"] = None
+            if error is not None:
+                return {"error": error}
+            return result or {"error": "The soils fetch stopped unexpectedly."}
+        return await anyio.to_thread.run_sync(_work)
+
+    def _show_soils_layer(snap):
+        """Draw the clipped SSURGO polygons as the 'soils' decor layer (§6.3)."""
+        try:
+            polys = (snap or {}).get("polygons") or []
+            feats = [{"type": "Feature", "geometry": p["geometry"],
+                      "properties": {"mukey": p.get("mukey")}}
+                     for p in polys if p.get("geometry")]
+            _decor_show("soils", {"type": "FeatureCollection", "features": feats} if feats else None,
+                        SOILS_STYLE)
+        except Exception as e:  # noqa: BLE001
+            print(f"[soils] layer draw failed: {e}")
+
+    @reactive.effect
+    def _start_soil():
+        if not _clicked_dynamic("fetch_soils"):
+            return
+        dom = domain_feat()
+        if not dom:
+            ui.notification_show("Generate the domain boundaries first.", type="warning")
+            return
+        try:
+            crs = proj_crs()
+            epsg = crs.to_epsg() if crs else None
+            kv = float(_safe("kv", 1.0))
+            aniso = (float(_safe("kh", 10.0)) / kv) if kv else None
+            payload = {
+                "domain_geojson": dom.get("geometry") or dom,
+                "working_crs_epsg": int(epsg) if epsg else None,
+                "anisotropy_ratio": aniso,
+                "cache_dir": str(work_dir / "data_sources" / "nrcs"),
+            }
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Couldn't start soils fetch: {e}", type="error")
+            return
+        soil_snapshot.set(None)
+        soil_task(payload)
+
+    @reactive.effect
+    def _soil_done():
+        if soil_task.status() in ("initial", "running"):
+            return
+        if soil_task.status() == "error":
+            ui.notification_show("NRCS soils fetch failed.", type="error", duration=8)
+            return
+        try:
+            res = soil_task.result()
+        except Exception:  # noqa: BLE001
+            return
+        if isinstance(res, dict) and res.get("error"):
+            ui.notification_show("NRCS soils fetch failed — the domain may lie outside SSURGO "
+                                 "coverage.", type="error", duration=8)
+            return
+        soil_snapshot.set(res)
+        _show_soils_layer(res)
+        ui.notification_show(f"Fetched {len(res.get('polygons') or [])} NRCS soil polygons.",
+                             duration=5)
+
+    def _pane_soils():
+        snap = soil_snapshot()                    # subscribing read: re-render when a fetch lands
+        header = ui.TagList(
+            ui.p("Fetch SSURGO soils from NRCS Soil Data Access for the model domain, then review "
+                 "map units, components, horizons and representative Ksat. Reviewing here does not "
+                 "change the model K — that happens in the conductivity derivation.",
+                 class_="hype-instr"),
+            ui.input_action_button("fetch_soils", "Fetch NRCS soils",
+                                   class_="btn-outline-primary btn-sm"))
+        if soil_task.status() == "running":
+            return ui.TagList(header, ui.div("Querying NRCS Soil Data Access…",
+                                             class_="hype-instr"))
+        if not snap:
+            return ui.TagList(header, ui.div("No soils fetched yet.", class_="hype-instr"))
+        polys, mus = snap.get("polygons") or [], snap.get("map_units") or []
+        cols = snap.get("source_columns_used") or {}
+        cov = ui.div(ui.tags.strong(f"{len(polys)} polygons · {len(mus)} map units"), ui.br(),
+                     "Columns used: " + (", ".join(f"{k}={v}" for k, v in cols.items()) or "—"),
+                     class_="hype-instr")
+        choices = {mu["mukey"]: f"{mu.get('musym') or mu['mukey']} — {mu.get('name') or ''}"
+                   for mu in mus}
+        selector = ui.input_select("soil_mukey", "Map unit", choices) if choices else None
+        return ui.TagList(header, cov, selector, ui.output_ui("soil_detail"))
+
+    @render.ui
+    def soil_detail():
+        snap = soil_snapshot()
+        if not snap:
+            return None
+        mus = {mu["mukey"]: mu for mu in (snap.get("map_units") or [])}
+        try:
+            mukey = input.soil_mukey()
+        except Exception:  # noqa: BLE001
+            mukey = None
+        mu = mus.get(mukey) or next(iter(mus.values()), None)
+        if not mu:
+            return None
+        blocks = []
+        for c in mu.get("components", []):
+            hrows = []
+            for h in c.get("horizons", []):
+                ksat = h.get("ksat_um_s")
+                kv = f"{ksat * 0.0864:.3f}" if isinstance(ksat, (int, float)) else "—"  # um/s→m/day
+                hrows.append(ui.tags.tr(
+                    ui.tags.td(h.get("name") or "—"),
+                    ui.tags.td(f"{h.get('top_cm')}–{h.get('bottom_cm')} cm"),
+                    ui.tags.td(f"{ksat:.2f}" if isinstance(ksat, (int, float)) else "—"),
+                    ui.tags.td(kv), ui.tags.td(h.get("texture") or "—")))
+            table = ui.tags.table(
+                ui.tags.thead(ui.tags.tr(
+                    ui.tags.th("Horizon"), ui.tags.th("Depth"), ui.tags.th("Ksat µm/s"),
+                    ui.tags.th("KV m/day"), ui.tags.th("Texture"))),
+                ui.tags.tbody(*hrows), class_="table table-sm hype-soil-table")
+            bedrock = next((r for r in c.get("restrictions", []) if r.get("is_bedrock")), None)
+            blocks.append(ui.div(
+                ui.tags.strong(f"{c.get('name') or c.get('cokey')} — "
+                               f"{c.get('comppct_r') or '?'}%"
+                               + (" · major" if c.get("major") else "")),
+                table,
+                ui.div(f"Bedrock: {bedrock.get('kind')} at {bedrock.get('top_cm')} cm",
+                       class_="hype-instr") if bedrock else None,
+                class_="hype-soil-comp"))
+        return ui.div(*blocks)
+
     @reactive.effect
     async def _start_surface():
         if not _clicked_dynamic("run_surface"):
@@ -2628,9 +3008,19 @@ def server(input, output, session):
                 import uuid
                 epsg = crs.to_epsg()
                 ras_cfs = _safe("ras_flow", None)
+                fs = flow_source()
+                if fs:
+                    src = fs.get("source", "USGS StreamStats")
+                    edited = (ras_cfs is not None
+                              and abs(float(ras_cfs) - float(fs.get("inserted_cfs", ras_cfs))) > 1e-6)
+                    flow_id, user_mod = fs.get("candidate_id"), edited
+                else:
+                    src, flow_id, user_mod = "manual", None, True
                 snap = snapshot.build_input_snapshot(
                     assessment_id=uuid.uuid4().hex[:12], params=payload["params"],
                     streamflow_cfs=(None if ras_cfs is None else float(ras_cfs)),
+                    streamflow_source=src, streamflow_user_modified=user_mod,
+                    flow_lookup_id=flow_id,
                     reach_geojson=reach_feat(), domain_geojson=domain_feat(),
                     boundary_geojson={"upstream": up_feat(), "left": left_feat(),
                                       "right": right_feat(), "downstream": down_feat()},
@@ -4536,6 +4926,8 @@ def server(input, output, session):
                 "ras_opacity": ras_opacity_v(),
                 "run_result": _tokenize_paths(run_result()),
                 "input_snapshot": input_snapshot(),
+                "flow_lookup": flow_lookup(), "flow_source": flow_source(),
+                "soil_snapshot": soil_snapshot(), "soil_overrides": soil_overrides(),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
                 "hz_result": _tokenize_paths(hz_result()),
@@ -4707,6 +5099,13 @@ def server(input, output, session):
         # frozen run snapshot: prefer config/assessment_input.json, fall back to the state copy
         # (None for v1 projects — the legacy adapter).
         input_snapshot.set(payload.get("assessment_input") or st.get("input_snapshot"))
+        flow_lookup.set(st.get("flow_lookup"))
+        flow_source.set(st.get("flow_source"))
+        _soil = st.get("soil_snapshot")
+        soil_snapshot.set(_soil)
+        soil_overrides.set(st.get("soil_overrides") or [])
+        if _soil and _HAS_MAP:
+            _show_soils_layer(_soil)
         rn = st.get("run_result")
         if rn:
             run_result.set(rn)
@@ -4872,6 +5271,15 @@ def server(input, output, session):
                 wse_mode0 = wse_mode_v()      # here would re-render this pane on every radio change
                 slope0 = ras_slope_default()
             return ui.TagList(
+                # Canonical streamflow — always available (used by the RAS model AND, later, the
+                # hyporheic connectivity metric) regardless of how the water surface is set (§5.1).
+                ui.div(
+                    ui.input_numeric("ras_flow", "Streamflow (cfs)", value=_keep("ras_flow", 100.0),
+                                     min=0.1, step=10.0),
+                    ui.input_action_button("get_usgs_flow", "Get USGS Flow",
+                                           class_="btn-outline-primary btn-sm"),
+                    ui.output_ui("flow_source_note"),
+                    class_="hype-flow-input"),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
                     {"model": "Modeled — HEC-RAS 2D (below)",
@@ -4892,10 +5300,8 @@ def server(input, output, session):
                 ui.panel_conditional(
                     "input.wse_mode === 'model'",
                     ui.div("Runs a HEC-RAS 2D model over the domain (steady inflow → "
-                           "normal-depth outflow); its water surface becomes the top boundary.",
-                           class_="hype-instr"),
-                    ui.input_numeric("ras_flow", "Flow (cfs)", value=_keep("ras_flow", 100.0),
-                                     min=0.1, step=10.0),
+                           "normal-depth outflow) using the streamflow above; its water surface "
+                           "becomes the top boundary.", class_="hype-instr"),
                     ui.input_numeric("ras_slope", "Normal-depth friction slope",
                                      value=_keep("ras_slope",
                                                  round(slope0, 5) if slope0 else 0.001),
@@ -5395,7 +5801,8 @@ def server(input, output, session):
         "bnd.down": _pane_bnd_side("down", "Downstream", DOWN_STYLE["color"]),
         "sw": _pane_sw, "sw.mesh": _pane_sw, "sw.wetted": _pane_wetted,
         "sw.wse": _pane_sw_raster("wse"), "sw.depth": _pane_sw_raster("depth"),
-        "gw": _pane_gw, "gw.k": _pane_k, "gw.mesh": _pane_mesh, "gw.run": _pane_run,
+        "gw": _pane_gw, "gw.k": _pane_k, "gw.soils": _pane_soils,
+        "gw.mesh": _pane_mesh, "gw.run": _pane_run,
         "gw.res": _pane_results, "gw.res.head": _pane_head, "gw.res.paths": _pane_paths,
         "gw.res.hz": _pane_hz, "gw.res.hz.vols": _pane_vols,
         "gw.res.paths.hyp": _pane_hz_paths("hyporheic"),
@@ -5434,6 +5841,8 @@ def server(input, output, session):
                "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.k": (lambda: _domain_build() is not None,
                  "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
+        "gw.soils": (lambda: _domain_build() is not None,
+                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.mesh": (lambda: _domain_build() is not None,
                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.res": (lambda: run_result() is not None,

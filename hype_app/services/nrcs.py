@@ -190,20 +190,18 @@ class NRCSClient:
         gdf = gpd.GeoDataFrame({"mupolygonkey": keys, "mukey": mukeys_of},
                                geometry=geoms, crs="EPSG:4326")
         domain = gpd.GeoSeries([domain_geom_4326], crs="EPSG:4326")
-        if working_crs_epsg:
-            gdf = gdf.to_crs(epsg=working_crs_epsg)
-            domain = domain.to_crs(epsg=working_crs_epsg)
+        # Clip in 4326 so stored geometry is map-ready; area comes from a projected reprojection.
         clipped = gpd.clip(gdf, domain.iloc[0])
+        clipped = clipped[clipped.geometry.notna() & ~clipped.geometry.is_empty]
+        areas = (clipped.geometry.to_crs(epsg=working_crs_epsg).area
+                 if working_crs_epsg and len(clipped) else None)
         polygons: list[SoilPolygon] = []
         mukeys: set[str] = set()
-        for _, row in clipped.iterrows():
-            g = row.geometry
-            if g is None or g.is_empty:
-                continue
+        for idx, row in clipped.iterrows():
             polygons.append(SoilPolygon(
                 mupolygonkey=row["mupolygonkey"], mukey=row["mukey"],
-                geometry=g.__geo_interface__,
-                area_m2=(float(g.area) if working_crs_epsg else None)))
+                geometry=row.geometry.__geo_interface__,          # EPSG:4326, map-ready
+                area_m2=(float(areas.loc[idx]) if areas is not None else None)))
             mukeys.add(row["mukey"])
         return polygons, mukeys
 

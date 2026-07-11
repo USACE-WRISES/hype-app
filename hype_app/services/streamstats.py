@@ -31,6 +31,24 @@ METHOD_VERSION = "streamstats-nss/1.0"
 _AEP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*percent\s+AEP", re.IGNORECASE)
 
 
+def suggest_region(lat: float, lon: float, *, timeout: float = 8.0) -> str | None:
+    """Best-effort 2-letter StreamStats region (US state) for a point via the FCC area API.
+
+    Used only to PREFILL the modal's region field; the user can override (§5.1). Returns None on
+    any failure — never raises, never blocks the workflow.
+    """
+    import httpx
+    try:
+        r = httpx.get("https://geo.fcc.gov/api/census/area",
+                      params={"lat": lat, "lon": lon, "format": "json"},
+                      timeout=timeout, follow_redirects=True)
+        res = (r.json().get("results") or [{}])[0]
+        code = res.get("state_code")
+        return code.upper() if code else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _validate_list(data) -> None:
     if not isinstance(data, list):
         raise PayloadError("Expected a JSON array from NSS.")
