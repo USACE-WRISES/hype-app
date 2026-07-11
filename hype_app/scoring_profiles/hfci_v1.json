@@ -1,0 +1,53 @@
+{
+  "schema_version": "hfci-scoring-profile/1.0",
+  "profile_id": "hfci-v1",
+  "version": "1.0.0",
+  "validation_label": "Literature-derived HFCI v1 - validation ongoing",
+  "applicable_domain": "Wadeable to small alluvial stream reaches with a single-thread channel and unconsolidated floodplain sediment. Outside this domain, treat scores as indicative only.",
+  "rounding_rule": "half_up",
+  "storage_denominators": ["ras_inundation_area", "bankfull_width_times_length"],
+  "exchange": {
+    "driver": "excursions_per_mile",
+    "raw_unit": "1/mile",
+    "knots_x": [0.0, 1.0, 5.0, 20.0],
+    "knots_y": [0.0, 5.0, 10.0, 15.0],
+    "supported_range": [0.0, 20.0],
+    "notes": "Monotone increasing in hyporheic connectivity (returning flux per stream mile). Knots are an order-of-magnitude ladder anchored on the Harvey et al. (2019) connectivity framing; values above 20/mi are flagged as extrapolation.",
+    "citations": [
+      {"title": "How hydrologic connectivity regulates water quality in river corridors", "authors": "Harvey et al.", "year": 2019, "url": "https://pubs.usgs.gov/publication/70205454"}
+    ]
+  },
+  "storage": {
+    "driver": "equivalent_storage_depth",
+    "raw_unit": "m",
+    "knots_x": [0.0, 0.01, 0.1, 0.5],
+    "knots_y": [0.0, 5.0, 10.0, 15.0],
+    "supported_range": [0.0, 0.5],
+    "notes": "Mobile pore-water storage divided by the reference plan area, i.e. an equivalent storage depth (m). Knots reflect the transition from negligible to substantial transient storage; values above 0.5 m are flagged.",
+    "citations": [
+      {"title": "Hyporheic hydraulic geometry", "authors": "Poole et al.", "year": 2022, "url": "https://doi.org/10.1371/journal.pone.0262080"}
+    ]
+  },
+  "processing": {
+    "driver": "flux_weighted_opportunity",
+    "raw_unit": "dimensionless",
+    "knots_x": [0.0, 0.25, 0.5, 1.0],
+    "knots_y": [0.0, 5.0, 10.0, 15.0],
+    "supported_range": [0.0, 1.0],
+    "notes": "Flux-weighted expected value of a continuous residence-time opportunity curve (0 at/below 1 h, a smooth log-time increase between 1 h and 1 day, plateau at/above 1 day). Not a universal nutrient-removal threshold.",
+    "citations": [
+      {"title": "How hydrologic connectivity regulates water quality in river corridors", "authors": "Harvey et al.", "year": 2019, "url": "https://pubs.usgs.gov/publication/70205454"}
+    ]
+  },
+  "classes": [
+    {"name": "Low", "min_score": 0, "max_score": 5, "color": "#d73027"},
+    {"name": "Moderate", "min_score": 6, "max_score": 10, "color": "#fdbf11"},
+    {"name": "High", "min_score": 11, "max_score": 15, "color": "#2c7bb6"}
+  ],
+  "citations": [
+    {"title": "How hydrologic connectivity regulates water quality in river corridors", "authors": "Harvey et al.", "year": 2019, "url": "https://pubs.usgs.gov/publication/70205454"},
+    {"title": "Hyporheic hydraulic geometry", "authors": "Poole et al.", "year": 2022, "url": "https://doi.org/10.1371/journal.pone.0262080"}
+  ],
+  "evidence_notes": "v1 knots are a documented starting point pending calibration against reference/restored sites, field exchange/RTD constraints, and grid/particle convergence. New evidence creates a new profile version; existing reports are not recomputed.",
+  "change_log": ["1.0.0 — initial literature-derived profile"]
+}

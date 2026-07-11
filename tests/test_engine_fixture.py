@@ -58,6 +58,19 @@ def test_chd_mass_balance_and_per_cell_flow(built):
     assert nodes[-1] - nodes[0] == ncol - 1
 
 
+def test_read_chd_downwelling(built):
+    """Phase 5 §8.3: read CHD_RIVER downwelling inflow keyed by node membership."""
+    from hype_app.metrics import read_chd_downwelling
+    ws, meta = built
+    q = meta["expected_q_m3_per_day"]
+    # CHD_RIVER cell is node 0 (col 0), injecting +q into the aquifer (downwelling here).
+    downwelling = read_chd_downwelling(Path(ws) / f"{GWF_NAME}.cbb", river_nodes={0})
+    assert downwelling.get(0) == pytest.approx(q, abs=1e-6)
+    # the downgradient CHD_SIDES node removes water (q<0) -> not counted as downwelling
+    assert read_chd_downwelling(Path(ws) / f"{GWF_NAME}.cbb",
+                                river_nodes={meta["ncol"] - 1}) == {}
+
+
 def test_forward_particle_exits_downgradient(built):
     from flopy.utils import EndpointFile
 

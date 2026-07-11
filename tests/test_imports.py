@@ -39,6 +39,8 @@ HYPE_APP_MODULES = [
     "hype_app.soil_profile",
     "hype_app.gradients",
     "hype_app.soil_run",
+    "hype_app.metrics",
+    "hype_app.hfci",
 ]
 
 HYPETOOL_MODULES = [
