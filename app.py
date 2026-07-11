@@ -37,7 +37,7 @@ import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
 from hype_app import (bieger, bundle, carve, delineate, dem, estimate, geocode, geometry,  # noqa: E402
-                      hydro, hz_results, mesh, ras_results, results, scene, ui_tree)
+                      hydro, hz_results, mesh, ras_results, results, scene, snapshot, ui_tree)
 from hype_app import hz_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
@@ -312,6 +312,7 @@ def server(input, output, session):
     dem_lohi_v = reactive.value(None)      # effective (vmin, vmax) of the rendered overlay (legend)
     _dem_shade_sig: dict = {}              # last-rendered (path, hs, stretch) — skip no-op renders
     run_result = reactive.value(None)
+    input_snapshot = reactive.value(None)   # frozen AssessmentInputSnapshot dict for the active run
     fp_stats = reactive.value(None)         # per-particle flow-path metrics DataFrame (Results)
     fp_gdf = reactive.value(None)           # 4326 pathlines gdf — the drawn = selectable set
     sel_pids = reactive.value(())           # selected flow-path particleids (tuple)
@@ -2621,6 +2622,30 @@ def server(input, output, session):
                 "kzone_kh": float(_safe("kzone_kh", 50.0)),
                 "kzone_kv": float(_safe("kzone_kv", 5.0)),
             }
+            # Freeze the run inputs (§4.2): from here on the report/download read this snapshot,
+            # not live UI. Guarded so a snapshot problem can never abort the actual run.
+            try:
+                import uuid
+                epsg = crs.to_epsg()
+                ras_cfs = _safe("ras_flow", None)
+                snap = snapshot.build_input_snapshot(
+                    assessment_id=uuid.uuid4().hex[:12], params=payload["params"],
+                    streamflow_cfs=(None if ras_cfs is None else float(ras_cfs)),
+                    reach_geojson=reach_feat(), domain_geojson=domain_feat(),
+                    boundary_geojson={"upstream": up_feat(), "left": left_feat(),
+                                      "right": right_feat(), "downstream": down_feat()},
+                    terrain=snapshot.TerrainSource(
+                        wse_mode=wse_mode_v(), crs_epsg=(int(epsg) if epsg else None),
+                        model_origin_elev=payload["params"].get("model_origin_elev")),
+                    use_kzones=use_kz, kzone_count=len(payload["kzones"]),
+                    kzone_kh=payload["kzone_kh"], kzone_kv=payload["kzone_kv"],
+                    app_version=APP_VERSION)
+                snap_dict = snap.model_dump(mode="json")
+                input_snapshot.set(snap_dict)
+                payload["input_snapshot"] = snap_dict
+            except Exception as se:  # noqa: BLE001
+                print(f"[snapshot] could not freeze input snapshot: {type(se).__name__}: {se}")
+                input_snapshot.set(None)
         except Exception as e:  # noqa: BLE001
             ui.notification_show(f"Could not start the run: {type(e).__name__}: {e}",
                                  type="error", duration=8)
@@ -4510,6 +4535,7 @@ def server(input, output, session):
                 "ras_result": _tokenize_paths(ras_result()),
                 "ras_opacity": ras_opacity_v(),
                 "run_result": _tokenize_paths(run_result()),
+                "input_snapshot": input_snapshot(),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
                 "hz_result": _tokenize_paths(hz_result()),
@@ -4528,7 +4554,8 @@ def server(input, output, session):
                    "right": right_feat(), "downstream": down_feat(), "domain": domain_feat(),
                    "wse_extent": wse_extent_feat(), "k_zones": kzone_feats()}
         path = bundle.zip_workspace(work_dir, vectors=vectors, params=params(),
-                                    run_config=_run_config(), state=_project_state())
+                                    run_config=_run_config(), state=_project_state(),
+                                    assessment_input=input_snapshot())
         try:
             with open(path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):   # 1 MiB — flat egress memory
@@ -4677,6 +4704,9 @@ def server(input, output, session):
         # groundwater run + results (display prefs first — the builders read them)
         head_opacity_v.set(float(st.get("head_opacity") or 0.85))
         hd_contours_v.set(bool(st.get("head_contours", True)))
+        # frozen run snapshot: prefer config/assessment_input.json, fall back to the state copy
+        # (None for v1 projects — the legacy adapter).
+        input_snapshot.set(payload.get("assessment_input") or st.get("input_snapshot"))
         rn = st.get("run_result")
         if rn:
             run_result.set(rn)

@@ -20,7 +20,10 @@ from pathlib import Path
 
 ROOT = "hype_workspace"
 
-FORMAT_VERSION = 1        # bump when the archive layout or state.json schema changes
+FORMAT_VERSION = 2        # bump when the archive layout or state.json schema changes
+#   v1 -> v2 (HYPE revision): adds config/assessment_input.json (frozen run snapshot) +
+#   config/scoring_profile.json, and the data_sources/{usgs,nrcs}/, sensitivity/, and
+#   6_Site_Report/ trees. v1 archives still open (their new pieces are simply absent).
 
 
 class ProjectError(ValueError):
@@ -118,8 +121,12 @@ def _readme(run_config: dict | None, seen: set) -> str:
         "                       and the water-surface input rasters.",
         "  5_Groundwater/       model/gwf_workspace (MODFLOW 6) + model/mp7_workspace (MODPATH 7),",
         "                       GW inputs, and Results/ (head, pathlines, hyporheic_zone).",
+        "  6_Site_Report/       Generated site summary report (HTML/PDF/CSV/JSON), when produced.",
+        "  data_sources/        Recorded USGS StreamStats/NSS and NRCS SDA responses, when fetched.",
+        "  sensitivity/         Gradient-sensitivity scenario outputs, when run.",
         "  config/              params.json (engine inputs) + run_config.json (CRS/origin/modes)",
-        "                       + state.json (session state - lets HYPE reopen this archive).",
+        "                       + state.json (session state - lets HYPE reopen this archive)",
+        "                       + assessment_input.json (frozen run snapshot) + scoring_profile.json.",
         "",
         "Reopen this archive any time with Open in the HYPE header to pick up where you left off.",
         "",
@@ -133,17 +140,21 @@ def _readme(run_config: dict | None, seen: set) -> str:
 
 
 def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
-                  run_config: dict | None = None, state: dict | None = None) -> str:
+                  run_config: dict | None = None, state: dict | None = None,
+                  assessment_input: dict | None = None,
+                  scoring_profile: dict | None = None) -> str:
     """Build the organized workspace archive on disk; return the temp-file path.
 
     The archive is built to a temp file (not io.BytesIO) so peak memory stays flat even when the
     RAS Results HDF + dozens of head rasters run to hundreds of MB; the caller streams the file to
     the browser in chunks, then unlinks it.
 
-    vectors    : name -> GeoJSON Feature dict | list[Feature] | None  (None/[] = skip that stage)
-    params     : the app's params() dict  -> config/params.json
-    run_config : reproducibility metadata -> config/run_config.json
-    state      : session-state manifest   -> config/state.json (what restore_workspace reads)
+    vectors          : name -> GeoJSON Feature dict | list[Feature] | None  (None/[] = skip stage)
+    params           : the app's params() dict        -> config/params.json
+    run_config       : reproducibility metadata        -> config/run_config.json
+    state            : session-state manifest          -> config/state.json (restore reads this)
+    assessment_input : frozen AssessmentInputSnapshot  -> config/assessment_input.json  (v2)
+    scoring_profile  : HFCI scoring profile            -> config/scoring_profile.json   (v2)
     """
     root = Path(work_dir)
     seen: set = set()
@@ -182,6 +193,12 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
             _add_tree(zf, root / "summary" / "hz",
                       _arc("5_Groundwater", "Results", "hyporheic_zone"), seen)
 
+            # v2 trees — recorded external data, sensitivity outputs, and the site report.
+            # Each skips silently when its source dir doesn't exist yet (feature not run).
+            _add_tree(zf, root / "data_sources", _arc("data_sources"), seen)
+            _add_tree(zf, root / "sensitivity", _arc("sensitivity"), seen)
+            _add_tree(zf, root / "report", _arc("6_Site_Report"), seen)
+
             # config/ + README (writestr => arcname is a str with '/', always portable)
             if params is not None:
                 zf.writestr(f"{ROOT}/config/params.json",
@@ -192,6 +209,12 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
             if state is not None:
                 zf.writestr(f"{ROOT}/config/state.json",
                             json.dumps(state, indent=2, default=str))
+            if assessment_input is not None:
+                zf.writestr(f"{ROOT}/config/assessment_input.json",
+                            json.dumps(assessment_input, indent=2, default=str))
+            if scoring_profile is not None:
+                zf.writestr(f"{ROOT}/config/scoring_profile.json",
+                            json.dumps(scoring_profile, indent=2, default=str))
             zf.writestr(f"{ROOT}/README.txt", _readme(run_config, seen))
         return tmp
     except BaseException:
@@ -233,6 +256,10 @@ _RESTORE_TREES = (
     ("5_Groundwater/Results/head/",           "summary/head/"),
     ("5_Groundwater/Results/pathlines/",      "summary/"),
     ("5_Groundwater/Results/hyporheic_zone/", "summary/hz/"),
+    # v2 trees
+    ("data_sources/",                         "data_sources/"),
+    ("sensitivity/",                          "sensitivity/"),
+    ("6_Site_Report/",                        "report/"),
 )
 
 
@@ -251,8 +278,10 @@ def restore_workspace(zip_path, work_dir) -> dict:
     """Extract a HYPE project archive back into a session workspace.
 
     Returns {"state": dict, "vectors": {name: Feature | [Feature]}, "params": dict|None,
-    "run_config": dict|None, "extracted": int}. Raises ProjectError with a user-facing
-    message when the file isn't a reopenable HYPE project.
+    "run_config": dict|None, "assessment_input": dict|None, "scoring_profile": dict|None,
+    "extracted": int}. `assessment_input`/`scoring_profile` are None for v1 archives (the legacy
+    adapter — their pieces simply weren't saved). Raises ProjectError with a user-facing message
+    when the file isn't a reopenable HYPE project.
     """
     root = Path(work_dir).resolve()
     try:
@@ -303,9 +332,14 @@ def restore_workspace(zip_path, work_dir) -> dict:
             done.add(target_rel)
             extracted += 1
 
-        params = _json(f"{ROOT}/config/params.json") if f"{ROOT}/config/params.json" in names else None
-        run_config = (_json(f"{ROOT}/config/run_config.json")
-                      if f"{ROOT}/config/run_config.json" in names else None)
+        def _opt(arc: str):
+            return _json(arc) if arc in names else None
+
+        params = _opt(f"{ROOT}/config/params.json")
+        run_config = _opt(f"{ROOT}/config/run_config.json")
+        assessment_input = _opt(f"{ROOT}/config/assessment_input.json")   # None on v1 (legacy adapter)
+        scoring_profile = _opt(f"{ROOT}/config/scoring_profile.json")
 
     return {"state": state, "vectors": vectors, "params": params,
-            "run_config": run_config, "extracted": extracted}
+            "run_config": run_config, "assessment_input": assessment_input,
+            "scoring_profile": scoring_profile, "extracted": extracted}
