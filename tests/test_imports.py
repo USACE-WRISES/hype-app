@@ -36,6 +36,9 @@ HYPE_APP_MODULES = [
     "hype_app.services.http",
     "hype_app.services.streamstats",
     "hype_app.services.nrcs",
+    "hype_app.soil_profile",
+    "hype_app.gradients",
+    "hype_app.soil_run",
 ]
 
 HYPETOOL_MODULES = [
