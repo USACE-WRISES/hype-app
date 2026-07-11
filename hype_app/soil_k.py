@@ -130,13 +130,15 @@ def make_cell_k_builder(soil_payload: dict):
         except Exception:  # noqa: BLE001
             pass
 
+        active_cols = (np.asarray(idomain) == 1).any(axis=0)     # (nrow, ncol) active footprint
         covered_cells = 0
         for _, rec in dominant.iterrows():
             r, c = int(rec["row"]), int(rec["col"])
             comps = profiles.get(str(rec["mukey"]))
             if not comps:
                 continue
-            covered_cells += 1
+            if active_cols[r, c]:
+                covered_cells += 1
             ground = float(top2d[r, c])
             for lay in range(nlay):
                 lay_top = ground if lay == 0 else float(bot3d[lay - 1, r, c])
@@ -169,12 +171,13 @@ def make_cell_k_builder(soil_payload: dict):
                 cov.add(KOrigin.derived, vol * (1.0 - fb_frac_c))
 
         # uncovered cells simply keep the fallback-filled arrays
+        n_active = int(active_cols.sum()) or 1
         report = {
             "policy": soil_payload["policy"],
             "anisotropy_ratio": aniso,
             "cells_covered": int(covered_cells),
-            "cells_total": int(nrow * ncol),
-            "domain_area_covered_pct": round(100.0 * covered_cells / (nrow * ncol), 2),
+            "cells_active": n_active,                 # active-domain footprint, not the grid box
+            "domain_area_covered_pct": round(100.0 * covered_cells / n_active, 2),
             "volume_pct_by_origin": cov.as_percentages(),
         }
         try:

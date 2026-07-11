@@ -42,6 +42,7 @@ from hype_app import (assess, bieger, bundle, carve, delineate, dem, estimate, g
 from hype_app import hz_run  # noqa: E402
 from hype_app import sens_run  # noqa: E402
 from hype_app import soil_run  # noqa: E402
+from hype_app import usgs_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
 
@@ -2196,7 +2197,8 @@ def server(input, output, session):
     _KEEP_IDS = ("address", "manual_da", "dem_res", "fp_mult", "bc_mode",
                  "g_ul", "g_ur", "g_dl", "g_dr", "g_left_profile", "g_right_profile",
                  "g_qual_left", "g_qual_right", "g_ref_slope", "g_left_ctl", "g_right_ctl",
-                 "usgs_region", "soil_policy", "use_soil_k",
+                 "usgs_region", "usgs_lat", "usgs_lon", "usgs_national",
+                 "soil_policy", "use_soil_k", "sens_design",
                  "ras_flow", "ras_slope", "ras_n", "ras_cell", "ras_hours", "ras_dt",
                  "ras_out_min", "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
                  "cell_size", "gw_mod_depth", "z", "pt_per_cell", "pt_min_mult",
@@ -2224,23 +2226,49 @@ def server(input, output, session):
     # ------------------------------------------------------------------
     # USGS StreamStats / NSS flow lookup (revision §5): modal fetch + insert
     # ------------------------------------------------------------------
-    _usgs_cancel = {"ev": None}
+    # Spawn-child (NOT to_thread): running the sync httpx chain on an in-process worker
+    # wedged the session's flush pipeline in live testing — see hype_app/usgs_run.py.
+    _usgs_proc: dict = {}
 
     @reactive.extended_task
-    async def usgs_flow_task(region: str, lat: float, lon: float, want_national: bool) -> dict:
-        import threading as _threading
-        ev = _threading.Event()
-        _usgs_cancel["ev"] = ev
-
+    async def usgs_flow_task(payload: dict) -> dict:
         def _work():
-            from hype_app.services.streamstats import StreamStatsClient
-            client = StreamStatsClient(cache_dir=str(work_dir / "data_sources" / "usgs"))
-            try:
-                snap = client.lookup_flow(region, lat, lon, want_national=want_national,
-                                          cancel=ev.is_set)
-                return snap.model_dump(mode="json")
-            finally:
-                client.close()
+            ctx = mp.get_context("spawn")
+            q = ctx.Queue()
+            p = ctx.Process(target=usgs_run.child_run, args=(payload, q), daemon=True)
+            _usgs_proc["p"] = p
+            p.start()
+            result = error = None
+            while True:
+                try:
+                    kind, data = q.get(timeout=0.3)
+                    if kind == "log":
+                        print(f"[usgs] {data}")
+                    elif kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    if not p.is_alive():
+                        break
+            while True:
+                try:
+                    kind, data = q.get_nowait()
+                    if kind == "result":
+                        result = data
+                    elif kind == "error":
+                        error = data
+                except _queue.Empty:
+                    break
+            p.join(timeout=5)
+            cancelled = _usgs_proc.pop("cancelled", False)
+            _usgs_proc["p"] = None
+            if cancelled:
+                return {"cancelled": True}
+            if error is not None:
+                print(f"[usgs] lookup failed:\n{error}")
+                return {"error": error.strip().splitlines()[-1] if error.strip() else "failed"}
+            return result or {"error": "The USGS lookup stopped unexpectedly."}
         return await anyio.to_thread.run_sync(_work)
 
     def _usgs_outlet_latlon():
@@ -2254,65 +2282,148 @@ def server(input, output, session):
             pass
         return None
 
-    def _usgs_modal():
-        from hype_app.services.streamstats import suggest_region
+    def _evt_btn(evt_id, label, cls):
+        """Event-nonce button for panes that re-render themselves. input_action_button counters
+        RESET to 0 on every pane rebind, and a rebind landing in the same server batch as the
+        click's increment swallows the click (observed live on the flow panel). A nonce'd
+        setInputValue with priority:'event' survives rebinds — the tree.js pattern."""
+        return ui.tags.button(
+            label, type="button", class_=f"btn {cls}",
+            onclick=f"Shiny.setInputValue('{evt_id}', Date.now() + Math.random(), "
+                    "{priority: 'event'})")
+
+    # The lookup UI renders INLINE in the Water-surface pane (never in a modal): outputs
+    # inside ui.modal wedge this app's session flush — panes are the proven dynamic surface.
+    usgs_panel_open = reactive.value(False)
+
+    def _usgs_section():
+        """The flow-lookup section of the Water-surface pane (§5.1). Plain TagList — the pane
+        itself re-renders on task-status / flow_lookup changes, so no nested outputs."""
+        if not usgs_panel_open():
+            return None
         lat0, lon0 = (_usgs_outlet_latlon() or (43.686, -72.237))
-        region0 = _keep("usgs_region", "") or (suggest_region(lat0, lon0) or "")
-        return ui.modal(
-            ui.p("Look up regional peak-flow statistics from USGS StreamStats for the reach "
-                 "outlet, then insert one as the streamflow. National estimates are queried only "
-                 "when no regional discharge is usable, or on request.", class_="hype-instr"),
-            ui.row(
-                ui.column(4, ui.input_numeric("usgs_lat", "Outlet latitude",
-                                              value=round(lat0, 6), step=0.0001)),
-                ui.column(4, ui.input_numeric("usgs_lon", "Outlet longitude",
-                                              value=round(lon0, 6), step=0.0001)),
-                ui.column(4, ui.input_text("usgs_region", "Region", value=region0,
-                                           placeholder="2-letter state, e.g. NH")),
-            ),
+        head = ui.TagList(
+            ui.tags.hr(),
+            ui.p("USGS StreamStats — regional peak-flow statistics for the reach outlet. "
+                 "National estimates are queried only when no regional discharge is usable, "
+                 "or on request.", class_="hype-instr"),
+            ui.div(
+                ui.input_numeric("usgs_lat", "Outlet latitude",
+                                 value=_keep("usgs_lat", round(lat0, 6)), step=0.0001),
+                ui.input_numeric("usgs_lon", "Outlet longitude",
+                                 value=_keep("usgs_lon", round(lon0, 6)), step=0.0001),
+                ui.input_text("usgs_region", "Region (blank = auto)",
+                              value=_keep("usgs_region", "")),
+                class_="hype-field-row"),
             ui.input_checkbox("usgs_national",
-                              "Also request national estimates for comparison", value=False),
-            ui.div(ui.input_action_button("usgs_fetch", "Fetch", class_="btn-primary btn-sm"),
-                   ui.input_action_button("usgs_cancel", "Cancel fetch",
-                                          class_="btn-outline-secondary btn-sm"),
-                   class_="hype-actions"),
-            ui.output_ui("usgs_status"),
-            ui.output_ui("usgs_candidates"),
-            title="Get USGS Flow", size="xl", easy_close=False,
-            footer=ui.TagList(
-                ui.input_action_button("usgs_insert", "Insert selected flow",
-                                       class_="btn-success btn-sm"),
-                ui.modal_button("Close")),
-        )
+                              "Also request national estimates for comparison",
+                              value=bool(_keep("usgs_national", False))))
+        if usgs_flow_task.status() == "running":
+            return ui.TagList(head,
+                              ui.div(ui.div(class_="hype-spinner"),
+                                     ui.span("Contacting USGS StreamStats… watershed "
+                                             "delineation can take ~30 s."), class_="hype-busy"),
+                              ui.div(_evt_btn("usgs_cancel_evt", "Cancel fetch",
+                                              "btn-sm btn-outline-danger"),
+                                     class_="hype-actions"))
+        body = [ui.div(_evt_btn("usgs_fetch_evt", "Fetch statistics", "btn-primary btn-sm"),
+                       _evt_btn("usgs_close_evt", "Hide", "btn-sm btn-outline-secondary"),
+                       class_="hype-actions")]
+        fl = flow_lookup()
+        if fl:
+            bits = []
+            if fl.get("selected_region"):
+                bits.append(f"Region {fl['selected_region']}")
+            if fl.get("basin_characteristics", {}).get("DRNAREA") is not None:
+                bits.append(f"drainage area {fl['basin_characteristics']['DRNAREA']:g} mi²")
+            if bits:
+                body.append(ui.div(" · ".join(bits), class_="hype-instr"))
+            warns = [w.get("message", "") for w in (fl.get("warnings") or [])]
+            for w in warns[:4]:
+                body.append(ui.div(w, class_="hype-warn"))
+            cands = fl.get("candidates") or []
+            choices = {}
+            rows = []
+            for c in cands:
+                cfs, cms = c.get("value_cfs"), c.get("value_cms")
+                recur = c.get("recurrence_years")
+                flags = [f for f, on in (("national", c.get("is_national")),
+                                         ("extrapolated", c.get("is_extrapolated")),
+                                         ("not insertable", not c.get("insertable"))) if on]
+                if c.get("insertable"):
+                    label = f"{c.get('description') or c['id']} — {cfs:.1f} cfs"
+                    if flags:
+                        label += f"  [{', '.join(flags)}]"
+                    choices[c["id"]] = label
+                rows.append(ui.tags.tr(
+                    ui.tags.td(c.get("description") or c.get("statistic_code") or c["id"]),
+                    ui.tags.td(f"{cfs:.1f}" if isinstance(cfs, (int, float)) else "—"),
+                    ui.tags.td(f"{cms:.3f}" if isinstance(cms, (int, float)) else "—"),
+                    ui.tags.td(f"{recur:g}-yr" if isinstance(recur, (int, float)) else "—"),
+                    ui.tags.td(", ".join(flags) or "ok")))
+            if not cands:
+                body.append(ui.div("No flow statistics returned for this point.",
+                                   class_="hype-instr"))
+            if choices:
+                body.append(ui.input_radio_buttons("usgs_pick", "Select a statistic to insert",
+                                                   choices))
+                body.append(ui.div(_evt_btn("usgs_insert_evt", "Insert selected flow",
+                                            "btn-success btn-sm"),
+                                   class_="hype-actions"))
+            elif cands:
+                body.append(ui.div("No insertable discharge — see the warnings above.",
+                                   class_="hype-instr"))
+            if rows:
+                body.append(ui.tags.table(
+                    ui.tags.thead(ui.tags.tr(
+                        ui.tags.th("Statistic"), ui.tags.th("cfs"), ui.tags.th("m³/s"),
+                        ui.tags.th("Recurrence"), ui.tags.th("Status"))),
+                    ui.tags.tbody(*rows), class_="table table-sm hype-flow-table"))
+        return ui.TagList(head, *body)
 
     @reactive.effect
     def _usgs_open():
         if _clicked_dynamic("get_usgs_flow"):
-            ui.modal_show(_usgs_modal())
+            usgs_panel_open.set(True)
 
     @reactive.effect
+    @reactive.event(input.usgs_close_evt)
+    def _usgs_close():
+        usgs_panel_open.set(False)
+
+    @reactive.effect
+    @reactive.event(input.usgs_fetch_evt)
     def _usgs_fetch():
-        if not _clicked_dynamic("usgs_fetch"):
-            return
+        print("[usgs] fetch clicked")
         try:
             lat, lon = float(input.usgs_lat()), float(input.usgs_lon())
             region = (input.usgs_region() or "").strip().upper()
         except Exception:  # noqa: BLE001
-            ui.notification_show("Enter a valid latitude, longitude and region.", type="warning")
+            ui.notification_show("Enter a valid latitude and longitude.", type="warning")
             return
-        if not region.isalpha() or len(region) != 2:
-            ui.notification_show("Enter the 2-letter state/region code (e.g. NH).", type="warning")
+        if region and (not region.isalpha() or len(region) != 2):
+            ui.notification_show("Enter the 2-letter state/region code (e.g. NH), or leave it "
+                                 "blank to auto-detect.", type="warning")
             return
-        _kept["usgs_region"] = region
+        if region:
+            _kept["usgs_region"] = region
+        try:
+            want_nat = bool(input.usgs_national())
+        except Exception:  # noqa: BLE001
+            want_nat = False
         flow_lookup.set(None)                 # clear prior result while the new lookup runs
-        usgs_flow_task(region, lat, lon, bool(input.usgs_national()))
+        print("[usgs] invoking lookup task")
+        usgs_flow_task({"region": region, "lat": lat, "lon": lon, "want_national": want_nat,
+                        "cache_dir": str(work_dir / "data_sources" / "usgs")})
+        print("[usgs] task invoked (non-blocking)")
 
     @reactive.effect
+    @reactive.event(input.usgs_cancel_evt)
     def _usgs_cancel_click():
-        if _clicked_dynamic("usgs_cancel"):
-            ev = _usgs_cancel.get("ev")
-            if ev is not None:
-                ev.set()
+        p = _usgs_proc.get("p")
+        if p is not None and p.is_alive():
+            _usgs_proc["cancelled"] = True
+            p.kill()
 
     @reactive.effect
     def _usgs_done():
@@ -2323,73 +2434,19 @@ def server(input, output, session):
                                  type="error", duration=8)
             return
         try:
-            flow_lookup.set(usgs_flow_task.result())
+            res = usgs_flow_task.result()
         except Exception:  # noqa: BLE001
             return
-
-    @render.ui
-    def usgs_status():
-        if usgs_flow_task.status() == "running":
-            return ui.div(ui.tags.strong("Contacting USGS StreamStats…"), ui.br(),
-                          "Watershed delineation can take ~30 s.", class_="hype-instr")
-        fl = flow_lookup()
-        if not fl:
-            return None
-        bits = []
-        if fl.get("selected_region"):
-            bits.append(ui.span(f"Region: {fl['selected_region']}   "))
-        if fl.get("snap_distance_m") is not None:
-            bits.append(ui.span(f"Snap distance: {fl['snap_distance_m']:.0f} m"))
-        warns = [ui.tags.li(w.get("message", "")) for w in (fl.get("warnings") or [])]
-        return ui.div(ui.div(*bits, class_="hype-instr"),
-                      ui.tags.ul(*warns, class_="hype-flow-warn") if warns else None)
-
-    @render.ui
-    def usgs_candidates():
-        fl = flow_lookup()
-        if not fl:
-            return None
-        cands = fl.get("candidates") or []
-        if not cands:
-            return ui.div("No flow statistics returned for this point.", class_="hype-instr")
-        choices = {}
-        for c in cands:
-            if not c.get("insertable"):
-                continue
-            label = f"{c.get('description') or c.get('statistic_code') or c['id']} — " \
-                    f"{c.get('value_cfs'):.1f} cfs"
-            if c.get("is_national"):
-                label += "  [national]"
-            if c.get("is_extrapolated"):
-                label += "  [extrapolated]"
-            choices[c["id"]] = label
-        rows = []
-        for c in cands:
-            cfs, cms, recur = c.get("value_cfs"), c.get("value_cms"), c.get("recurrence_years")
-            flags = [f for f, on in (("national", c.get("is_national")),
-                                     ("extrapolated", c.get("is_extrapolated")),
-                                     ("not insertable", not c.get("insertable"))) if on]
-            rows.append(ui.tags.tr(
-                ui.tags.td(c.get("description") or c.get("statistic_code") or c["id"]),
-                ui.tags.td(f"{cfs:.1f}" if isinstance(cfs, (int, float)) else "—"),
-                ui.tags.td(f"{cms:.3f}" if isinstance(cms, (int, float)) else "—"),
-                ui.tags.td(f"{recur:g}-yr" if isinstance(recur, (int, float)) else "—"),
-                ui.tags.td(c.get("regression_region") or "—"),
-                ui.tags.td(", ".join(flags) or "ok")))
-        table = ui.tags.table(
-            ui.tags.thead(ui.tags.tr(
-                ui.tags.th("Statistic"), ui.tags.th("cfs"), ui.tags.th("m³/s"),
-                ui.tags.th("Recurrence"), ui.tags.th("Region"), ui.tags.th("Status"))),
-            ui.tags.tbody(*rows), class_="table table-sm hype-flow-table")
-        picker = (ui.input_radio_buttons("usgs_pick", "Select a statistic to insert", choices)
-                  if choices else ui.div("No insertable discharge — see warnings above.",
-                                         class_="hype-instr"))
-        return ui.TagList(picker, table)
+        if isinstance(res, dict) and res.get("cancelled"):
+            return
+        if isinstance(res, dict) and res.get("error"):
+            ui.notification_show(f"USGS lookup failed: {res['error']}", type="error", duration=8)
+            return
+        flow_lookup.set(res)
 
     @reactive.effect
+    @reactive.event(input.usgs_insert_evt)
     def _usgs_insert():
-        if not _clicked_dynamic("usgs_insert"):
-            return
         fl = flow_lookup()
         if not fl:
             ui.notification_show("Fetch flow statistics first.", type="warning")
@@ -2415,7 +2472,7 @@ def server(input, output, session):
             (d / "flow_lookup.json").write_text(_json.dumps(fl, indent=2), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
-        ui.modal_remove()
+        usgs_panel_open.set(False)
         ui.notification_show(f"Inserted {cfs:g} cfs from USGS StreamStats.", duration=6)
 
     @render.ui
@@ -2448,7 +2505,9 @@ def server(input, output, session):
             while True:
                 try:
                     kind, data = q.get(timeout=0.3)
-                    if kind == "result":
+                    if kind == "log":
+                        print(f"[soil] {data}")
+                    elif kind == "result":
                         result = data
                     elif kind == "error":
                         error = data
@@ -2467,6 +2526,7 @@ def server(input, output, session):
             p.join(timeout=5)
             _soil_proc["p"] = None
             if error is not None:
+                print(f"[soil] fetch failed:\n{error}")
                 return {"error": error}
             return result or {"error": "The soils fetch stopped unexpectedly."}
         return await anyio.to_thread.run_sync(_work)
@@ -2484,9 +2544,8 @@ def server(input, output, session):
             print(f"[soils] layer draw failed: {e}")
 
     @reactive.effect
+    @reactive.event(input.fetch_soils_evt)
     def _start_soil():
-        if not _clicked_dynamic("fetch_soils"):
-            return
         dom = domain_feat()
         if not dom:
             ui.notification_show("Generate the domain boundaries first.", type="warning")
@@ -2520,8 +2579,8 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return
         if isinstance(res, dict) and res.get("error"):
-            ui.notification_show("NRCS soils fetch failed — the domain may lie outside SSURGO "
-                                 "coverage.", type="error", duration=8)
+            tail = str(res["error"]).strip().splitlines()[-1][:160]
+            ui.notification_show(f"NRCS soils fetch failed: {tail}", type="error", duration=10)
             return
         soil_snapshot.set(res)
         _show_soils_layer(res)
@@ -2535,8 +2594,7 @@ def server(input, output, session):
                  "map units, components, horizons and representative Ksat. Reviewing here does not "
                  "change the model K — that happens in the conductivity derivation.",
                  class_="hype-instr"),
-            ui.input_action_button("fetch_soils", "Fetch NRCS soils",
-                                   class_="btn-outline-primary btn-sm"))
+            _evt_btn("fetch_soils_evt", "Fetch NRCS soils", "btn-outline-primary btn-sm"))
         if soil_task.status() == "running":
             return ui.TagList(header, ui.div("Querying NRCS Soil Data Access…",
                                              class_="hype-instr"))
@@ -2685,9 +2743,8 @@ def server(input, output, session):
         return exchange, transit_t, transit_w, censored, transit_rows
 
     @reactive.effect
+    @reactive.event(input.gen_report_evt)
     def _gen_report():
-        if not _clicked_dynamic("gen_report"):
-            return
         hz, snap_dict = hz_result(), input_snapshot()
         if not hz or not snap_dict:
             ui.notification_show("Delineate the hyporheic zone first (its stats feed the report).",
@@ -2850,9 +2907,8 @@ def server(input, output, session):
             return None
 
     @reactive.effect
+    @reactive.event(input.run_sens_evt)
     def _start_sens():
-        if not _clicked_dynamic("run_sens"):
-            return
         build = _domain_build()
         if not (build and dem_path() and _wse_path()):
             ui.notification_show("Sensitivity needs the domain, terrain, and a water surface — "
@@ -2925,12 +2981,12 @@ def server(input, output, session):
         sens_task(payload)
 
     @reactive.effect
+    @reactive.event(input.cancel_sens_evt)
     def _sens_cancel():
-        if _clicked_dynamic("cancel_sens"):
-            p = _sens_proc.get("p")
-            if p is not None and p.is_alive():
-                _sens_proc["cancelled"] = True
-                p.kill()
+        p = _sens_proc.get("p")
+        if p is not None and p.is_alive():
+            _sens_proc["cancelled"] = True
+            p.kill()
 
     @reactive.effect
     def _sens_poll():
@@ -3008,12 +3064,10 @@ def server(input, output, session):
             parts += [ui.div(ui.div(class_="hype-spinner"), ui.span("Running scenarios…"),
                              class_="hype-busy"),
                       ui.tags.pre(tail, class_="hype-log"),
-                      ui.div(ui.input_action_button("cancel_sens", "Cancel",
-                                                    class_="btn-sm btn-outline-danger"),
+                      ui.div(_evt_btn("cancel_sens_evt", "Cancel", "btn-sm btn-outline-danger"),
                              class_="hype-actions")]
             return ui.TagList(*parts)
-        parts.append(ui.div(ui.input_action_button("run_sens", "Run sensitivity scenarios",
-                                                   class_="btn-primary"),
+        parts.append(ui.div(_evt_btn("run_sens_evt", "Run sensitivity scenarios", "btn-primary"),
                             class_="hype-actions"))
         manifest = _sens_manifest_objects()
         if manifest is not None and not (sens_result() or {}).get("running"):
@@ -3986,9 +4040,11 @@ def server(input, output, session):
         # overlapping translucent shells would be unreadable). Fresh results also re-arm the
         # GROUP checks — an earlier group-uncheck must not leave the new delineation invisible
         # while the tree shows its leaves ticked.
+        # Results defaults (revision §8.1): fresh delineation shows ONLY the hyporheic paths
+        # + volume; losing/gaining/throughflow are opt-in via the tree.
         for cls in HZ_CLASSES:
             suf = ui_tree.HZ_CLASS_SUFFIX[cls]
-            _check_state[f"gw.res.paths.{suf}"] = True
+            _check_state[f"gw.res.paths.{suf}"] = (cls == "hyporheic")
             _check_state[f"gw.res.hz.{suf}"] = (cls == "hyporheic")
         for gid in ("gw.res.hz", "gw.res.paths", "gw.res.hz.vols"):
             _check_state[gid] = True
@@ -5336,7 +5392,7 @@ def server(input, output, session):
         _terminate_child()
         _kill_ras_proc()
         for h, k in ((_mesh_proc, "proc"), (_mesh3d_proc, "p"), (_hz_proc, "p"),
-                     (_sens_proc, "p"), (_soil_proc, "p")):
+                     (_sens_proc, "p"), (_soil_proc, "p"), (_usgs_proc, "p")):
             p = h.get(k)
             if p is not None:
                 try:
@@ -5911,6 +5967,7 @@ def server(input, output, session):
                                            class_="btn-outline-primary btn-sm"),
                     ui.output_ui("flow_source_note"),
                     class_="hype-flow-input"),
+                _usgs_section(),
                 ui.input_radio_buttons(
                     "wse_mode", "Water surface (top boundary)",
                     {"model": "Modeled — HEC-RAS 2D (below)",
@@ -6214,9 +6271,9 @@ def server(input, output, session):
                 parts.append(_next_hint("gw.res.hz", "Delineate the hyporheic zone →",
                                         primary=True))
             else:                          # hyporheic zone delineated -> the site report is available
-                parts.append(ui.div(ui.input_action_button(
-                    "gen_report", "Generate site report", class_="btn-primary btn-sm"),
-                    class_="hype-actions"))
+                parts.append(ui.div(_evt_btn("gen_report_evt", "Generate site report",
+                                             "btn-primary btn-sm"),
+                                    class_="hype-actions"))
             parts.append(ui.div("Results are in temporary storage — use ",
                                 ui.tags.b("Download project"),
                                 " in the header before you leave.", class_="hype-warn"))
