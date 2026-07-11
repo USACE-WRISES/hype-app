@@ -26,42 +26,35 @@ from types import SimpleNamespace
 import numpy as np
 
 
-def _grid_extent(domain_gdf_proj, cell_size: float, buffer_frac: float):
-    """Buffered domain bbox + cell count (mirrors hype_app.estimate.estimate_cells)."""
-    minx, miny, maxx, maxy = (float(v) for v in domain_gdf_proj.total_bounds)
-    dx, dy = (maxx - minx) * buffer_frac, (maxy - miny) * buffer_frac
-    minx, miny, maxx, maxy = minx - dx, miny - dy, maxx + dx, maxy + dy
-    ncol = max(1, math.ceil((maxx - minx) / cell_size))
-    nrow = max(1, math.ceil((maxy - miny) / cell_size))
-    return minx, miny, maxx, maxy, ncol, nrow
-
-
-def _reproject_dem_to_grid(dem_path, crs, minx, maxy, cell_size, nrow, ncol, out_tif):
-    """Reproject the DEM into the exact preview grid (proj_crs, north-up, `cell_size`) and write a
-    grid-aligned GeoTIFF at `out_tif`. Aligning the raster to `from_origin(minx, maxy, cell_size)`×
-    (nrow, ncol) makes the engine re-derive the identical grid, so `build_model_domain` reproduces the
-    same cells. Gaps → nodata (-9999) so the engine masks them exactly as it does a fetched DEM."""
+def _reproject_dem_like_run(dem_path, crs, cell_size, out_tif):
+    """Reproject the DEM to `crs` EXACTLY as the run does (``Settings.setup_terrain``:
+    ``calculate_default_transform`` over the full DEM, nearest resampling), writing `out_tif`. The
+    engine (`build_model_domain`) then derives a grid identical to the run's — same extent, alignment
+    and cell centres — instead of the old domain-bbox+buffer approximation. Returns
+    ``(xmin, ymax, ncol, nrow)`` of the grid the engine will build (ncol/nrow at `cell_size`) so the
+    caller can enforce the cell cap before per-layer arrays are allocated."""
     import rasterio
     from rasterio.crs import CRS as RioCRS
-    from rasterio.transform import from_origin
-    from rasterio.warp import Resampling, reproject
+    from rasterio.warp import Resampling, calculate_default_transform, reproject
 
-    dst_transform = from_origin(minx, maxy, float(cell_size), float(cell_size))
-    top = np.full((nrow, ncol), np.nan, dtype="float32")
+    dst_crs = RioCRS.from_user_input(crs)
     with rasterio.open(dem_path) as src:
-        band = src.read(1, masked=True).filled(np.nan).astype("float32")
-        reproject(source=band, destination=top,
-                  src_transform=src.transform, src_crs=src.crs,
-                  dst_transform=dst_transform, dst_crs=crs,
-                  src_nodata=src.nodata, dst_nodata=np.nan, resampling=Resampling.bilinear)
-    if not np.isfinite(top).any():
-        raise ValueError("DEM does not cover the domain grid.")
-    nodata = -9999.0
-    arr = np.where(np.isfinite(top), top, np.float32(nodata)).astype("float32")
-    meta = dict(driver="GTiff", height=nrow, width=ncol, count=1, dtype="float32",
-                crs=RioCRS.from_user_input(crs), transform=dst_transform, nodata=nodata)
-    with rasterio.open(out_tif, "w", **meta) as dst:
-        dst.write(arr, 1)
+        dst_transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds)
+        meta = src.meta.copy()
+        meta.update(crs=dst_crs, transform=dst_transform, width=width, height=height)
+        with rasterio.open(out_tif, "w", **meta) as dst:
+            reproject(source=rasterio.band(src, 1), destination=rasterio.band(dst, 1),
+                      src_transform=src.transform, src_crs=src.crs,
+                      dst_transform=dst_transform, dst_crs=dst_crs,
+                      resampling=Resampling.nearest)
+    xmin = float(dst_transform.c)
+    ymax = float(dst_transform.f)
+    xmax = xmin + width * float(dst_transform.a)
+    ymin = ymax + height * float(dst_transform.e)          # dst_transform.e < 0 (north-up)
+    ncol = max(1, int((xmax - xmin) / float(cell_size)))   # matches build_model_domain's int() grid
+    nrow = max(1, int((ymax - ymin) / float(cell_size)))
+    return xmin, ymax, ncol, nrow
 
 
 BOUNDARY_STYLE = {                     # matches the app's 2-D map colors (app.py *_STYLE)
@@ -81,9 +74,11 @@ def preview_cell_cap() -> int:
 
 
 def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
+                        origin: float | None = None,
                         sides: dict | None = None, want_basemap: bool = True,
                         max_cells: int = 40_000, max_layers: int = 30,
-                        buffer_frac: float = 0.12, log=print) -> dict:
+                        buffer_frac: float = 0.12, scene_z0: float | None = None,
+                        log=print) -> dict:
     """Domain Feature (4326) + DEM + (cell_size, depth, z) → JSON-safe geometry for vtk.js:
     ``{points, cells, cellLayer, cellElev, elevRange, nHex, nPoints, dims, previewDims, decimation,
     layerStride, nActiveFull, bounds, boundaries, basemap}``. ``cellElev`` colours the top layer by
@@ -97,48 +92,104 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
     cells, for on-mesh orientation labels. ``want_basemap`` fetches a USGS aerial image
     over the preview extent for the client to drape on the top surface.
     """
-    from shapely.ops import unary_union
+    from hypetool.functions.my_utils import build_model_domain, make_idomain
 
     from .geometry import single_feature_gdf
 
     dom = single_feature_gdf(domain_feat).to_crs(crs)
-    minx, miny, maxx, maxy, ncol0, nrow0 = _grid_extent(dom, float(cell_size), buffer_frac)
-
-    # hard safeguard BEFORE the engine allocates anything (a too-fine cell size here used
-    # to OOM the whole app process; the build now also runs in a child process, but there
-    # is no point burning a core on a grid the run itself would refuse)
-    nlay_est = max(1, math.ceil(float(depth) / float(z)))
-    cap = preview_cell_cap()
-    if ncol0 * nrow0 * nlay_est > cap:
-        need = float(cell_size) * math.sqrt(ncol0 * nrow0 * nlay_est / cap)
-        raise ValueError(
-            f"Grid would be {ncol0}×{nrow0}×{nlay_est} = {ncol0 * nrow0 * nlay_est:,} cells — "
-            f"over the {cap:,}-cell preview limit. Try a cell size of ~{need:.0f} m, a shallower "
-            f"model, or thicker layers.")
 
     tmpdir = tempfile.mkdtemp(prefix="hype_mesh_")
     try:
+        # Reproject the DEM EXACTLY as the run does so the engine derives a byte-identical grid.
         tmp_tif = os.path.join(tmpdir, "terrain_projcrs.tif")
-        _reproject_dem_to_grid(dem_path, crs, minx, maxy, float(cell_size), nrow0, ncol0, tmp_tif)
+        _gxmin, _gymax, gncol, gnrow = _reproject_dem_like_run(dem_path, crs, float(cell_size), tmp_tif)
 
-        # --- run the REAL engine discretization (flat bottom + uniform layers + terrain-following top) ---
-        from hypetool.functions.my_utils import build_model_domain
+        # hard safeguard BEFORE the engine allocates per-layer arrays (a too-fine cell size can OOM
+        # the process; no point burning a core on a grid the run itself would refuse)
+        nlay_est = max(1, math.ceil(float(depth) / float(z)))
+        cap = preview_cell_cap()
+        if gncol * gnrow * nlay_est > cap:
+            need = float(cell_size) * math.sqrt(gncol * gnrow * nlay_est / cap)
+            raise ValueError(
+                f"Grid would be {gncol}×{gnrow}×{nlay_est} = {gncol * gnrow * nlay_est:,} cells — "
+                f"over the {cap:,}-cell preview limit. Try a cell size of ~{need:.0f} m, a shallower "
+                f"model, or thicker layers.")
+
+        # --- run the REAL engine discretization (same code + origin as the run) ---
         cfg = SimpleNamespace(terrain_output_raster=tmp_tif,
                               cell_size_x=float(cell_size), cell_size_y=float(cell_size),
-                              gw_mod_depth=float(depth), z=float(z))
+                              gw_mod_depth=float(depth), z=float(z),
+                              model_origin_elev=(float(origin) if origin is not None else None))
         dm = build_model_domain(cfg)
+        # --- active cells: the SAME idomain the run builds (domain intersect + above-ground) ---
+        idomain, _grid_gdf = make_idomain(cfg, dom)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     tops, botm = dm["tops"], dm["botm"]                    # each a list of nlay (nrow, ncol) arrays
-    nlay, nrow, ncol = int(dm["nlay"]), int(dm["nrow"]), int(dm["ncol"])
-
-    # --- active cells: engine cell-centres inside the domain (exact to build_model_domain's grid) ---
-    dom_geom = unary_union(list(dom.geometry))
-    inside = np.asarray(dm["grid_points"].within(dom_geom)).reshape(nrow, ncol)
-    n_active2d = int(inside.sum())
-    if n_active2d == 0:
+    idomain = np.asarray(idomain)
+    inside = (idomain != 0).any(axis=0)
+    if not inside.any():
         raise ValueError("No grid cells fall inside the domain.")
+    log(f"[mesh] grid datum {float(dm['datum']):.2f} m"
+        + (f" (origin {float(origin):.2f} m)" if origin is not None else " (min-DEM)"))
+
+    return _emit_geometry(tops, botm, inside, idomain, float(cell_size),
+                          float(dm["xmin"]), float(dm["ymin"]), crs,
+                          sides=sides, want_basemap=want_basemap, max_cells=max_cells,
+                          max_layers=max_layers, scene_z0=scene_z0, log=log)
+
+
+def build_grid_geometry_from_run(gwf_ws, crs, *, sides: dict | None = None,
+                                 want_basemap: bool = True, max_cells: int = 40_000,
+                                 max_layers: int = 30, scene_z0: float | None = None,
+                                 log=print) -> dict:
+    """The SAME payload as :func:`build_grid_geometry`, but read from a COMPLETED run's binary
+    grid file instead of a pre-run estimate. The preview build derives its flat bed from
+    ``min(DEM)`` over its own buffered bbox, which can sit metres above the run's actual bed
+    (different raster crop / knobs) — so once a run exists, the 3-D "Model grid" must show the
+    run's real DIS or zone volumes (built from the run) hang below it."""
+    import warnings
+    from pathlib import Path
+
+    from flopy.mf6.utils import MfGrdFile
+
+    grb_path = next(Path(gwf_ws).glob("*.dis.grb"), None)
+    if grb_path is None:
+        raise ValueError(f"No .dis.grb binary grid file in {gwf_ws}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")                    # flopy shape-set deprecation noise
+        mg = MfGrdFile(str(grb_path), verbose=False).modelgrid
+        top2d = np.asarray(mg.top, dtype=float)
+        botm3d = np.asarray(mg.botm, dtype=float)
+        idom = np.asarray(mg.idomain).reshape(botm3d.shape)
+        delr = np.asarray(mg.delr, dtype=float)
+        x_anchor, y_anchor = float(mg.xoffset), float(mg.yoffset)
+    nlay = botm3d.shape[0]
+    # engine arrays are SOUTH-first (row 0 = southernmost) — exactly what _emit_geometry's
+    # local frame expects (cell [R, C] at (C·delr, R·delr) from the SW anchor)
+    tops = [top2d] + [botm3d[k] for k in range(nlay - 1)]
+    botm = [botm3d[k] for k in range(nlay)]
+    inside = (idom != 0).any(axis=0)
+    if not inside.any():
+        raise ValueError("The run's grid has no active cells.")
+    log(f"[mesh] rebuilding the 3-D grid from the run: {grb_path.name}")
+    return _emit_geometry(tops, botm, inside, idom, float(delr[0]), x_anchor, y_anchor, crs,
+                          sides=sides, want_basemap=want_basemap, max_cells=max_cells,
+                          max_layers=max_layers, scene_z0=scene_z0, log=log)
+
+
+def _emit_geometry(tops, botm, inside, idomain3d, cell_size: float, x_anchor: float, y_anchor: float,
+                   crs, *, sides, want_basemap, max_cells, max_layers, scene_z0, log) -> dict:
+    """tops/botm (lists of nlay (nrow, ncol) arrays, SOUTH-first rows) + active mask →
+    the decimated hexahedra payload for www/mesh3d.js (see build_grid_geometry docstring).
+
+    ``idomain3d`` (nlay, nrow, ncol) is the run's activity mask: cells switched off (above-ground
+    or outside the domain) are skipped per layer, so the preview draws the SAME active set the run
+    solves — including the terrain-clipped downstream columns."""
+    nlay = len(botm)
+    nrow, ncol = inside.shape
+    n_active2d = int(inside.sum())
 
     # --- decimate to the budget: layer stride lf, then row/col stride f ---
     lf = max(1, math.ceil(nlay / max_layers))
@@ -147,11 +198,19 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
     while f < max(nrow, ncol) and int(inside[::f, ::f].sum()) * nlay_d > max_cells:
         f += 1
     inside_d = inside[::f, ::f]
+    # per-preview-layer activity at the merge's TOP real layer (kt = s*lf), decimated to (nlay_d, …)
+    idom_d = np.asarray(idomain3d)[::lf, ::f, ::f] if idomain3d is not None else None
     nrow_d, ncol_d = inside_d.shape
     delr_d = float(cell_size) * f
 
     # --- emit blocky hexahedra: one flat top (tops[s]) + flat bottom (botm[s]) per cell, no interp ---
-    z_ref = float(np.nanmin(botm[nlay - 1]))               # flat model base (the deepest, uniform bottom)
+    # z datum: the shared scene z0 when the caller provides one (all 3D layers — terrain,
+    # drapes, flow paths — must use ONE datum or vertical exaggeration breaks alignment);
+    # else the flat model base, as before.
+    if scene_z0 is not None:
+        z_ref = float(scene_z0)
+    else:
+        z_ref = float(np.nanmin(botm[nlay - 1]))           # flat model base (the deepest, uniform bottom)
     tvals = np.asarray(tops[0])[inside]                    # real terrain elevations over active cells
     elev_lo, elev_hi = float(np.nanmin(tvals)), float(np.nanmax(tvals))
     if elev_hi - elev_lo < 1e-6:                           # flat terrain → give the legend a usable span
@@ -160,8 +219,11 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
     points: list = []
     cells: list = []
     cell_layer: list = []
-    cell_elev: list = []                                   # per-hex colour scalar: top layer = terrain elev, else sentinel
+    cell_top: list = []                                    # 1 = this column's shallowest DRAWN cell
+    cell_elev: list = []                                   # per-hex colour scalar: top cell = terrain elev, else sentinel
     zt_max = 0.0
+    top0_d = np.asarray(tops[0])[::f, ::f]                 # true terrain (ground) per decimated column
+    topped = np.zeros((nrow_d, ncol_d), dtype=bool)        # column already has its top cell emitted
     for s in range(nlay_d):
         kt = s * lf                                        # merged preview layer s spans real layers kt..kb
         kb = min((s + 1) * lf, nlay) - 1
@@ -172,6 +234,8 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
             for C in range(ncol_d):
                 if not inside_d[R, C]:
                     continue
+                if idom_d is not None and idom_d[s, R, C] == 0:   # above-ground / inactive → skip
+                    continue
                 zt = float(top_a[R, C]) - z_ref
                 zb = float(bot_a[R, C]) - z_ref
                 if zt - zb <= 1e-6:                        # skip zero-thickness cells (e.g. top layer at min-DEM)
@@ -181,8 +245,14 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
                 points.extend((x0, y0, zb, x1, y0, zb, x1, y1, zb, x0, y1, zb,     # bottom face 0..3
                                x0, y0, zt, x1, y0, zt, x1, y1, zt, x0, y1, zt))    # top face 4..7
                 cells.extend((b, b + 1, b + 2, b + 3, b + 4, b + 5, b + 6, b + 7))
+                # The visible TOP surface is each column's shallowest DRAWN cell — layer 0 upstream,
+                # but a deeper layer downstream where above-ground layer-0 cells are switched off.
+                # It carries the terrain colour and the aerial drape; deeper cells stay gray body.
+                is_top = not topped[R, C]
+                topped[R, C] = True
                 cell_layer.append(s)
-                cell_elev.append(float(top_a[R, C]) if s == 0 else sentinel)   # terrain colour on the top layer only
+                cell_top.append(1 if is_top else 0)
+                cell_elev.append(float(top0_d[R, C]) if is_top else sentinel)
                 if zt > zt_max:
                     zt_max = zt
 
@@ -191,9 +261,7 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
         f"{n_hex} hexes, {len(points) // 3} points")
 
     # Local-coordinate anchor: cell [R, C] sits at local (C·delr, R·delr) with row 0 = SOUTH
-    # (build_model_domain's grid_y runs ymin→ymax), i.e. local = (x − dm.xmin, y − dm.ymin).
-    x_anchor, y_anchor = float(dm["xmin"]), float(dm["ymin"])
-    top0_d = np.asarray(tops[0])[::f, ::f]
+    # (the engine's rows run ymin→ymax), i.e. local = (x − x_anchor, y − y_anchor). top0_d above.
     boundaries = _boundary_markers(sides, crs, x_anchor, y_anchor, delr_d, inside_d,
                                    top0_d, z_ref) if sides else []
     basemap = None
@@ -203,13 +271,15 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
 
     return {
         "points": points, "cells": cells, "cellLayer": cell_layer,
-        "cellElev": cell_elev, "elevRange": [elev_lo, elev_hi],
+        "cellTop": cell_top, "cellElev": cell_elev, "elevRange": [elev_lo, elev_hi],
         "nHex": n_hex, "nPoints": len(points) // 3,
         "dims": {"nlay": nlay, "nrow": nrow, "ncol": ncol},
         "previewDims": {"nlay": nlay_d, "nrow": nrow_d, "ncol": ncol_d},
         "decimation": f, "layerStride": lf, "nActiveFull": n_active2d * nlay,
         "bounds": [0.0, float(ncol_d * delr_d), 0.0, float(nrow_d * delr_d), 0.0, float(zt_max)],
         "boundaries": boundaries, "basemap": basemap,
+        "origin": [x_anchor, y_anchor],    # local-frame anchor in the model CRS (scene align)
+        "z0": z_ref,                       # the z datum geometry is relative to
     }
 
 
@@ -308,12 +378,22 @@ def child_build(payload: dict, q) -> None:
     puts ('log', line)… then ('result', geometry) or ('error', message) on `q`. Top-level and
     picklable for the 'spawn' start method."""
     try:
-        g = build_grid_geometry(
-            payload["domain"], payload["dem"], payload["crs"],
-            float(payload["cell_size"]), float(payload["depth"]), float(payload["z"]),
-            sides=payload.get("sides"), want_basemap=payload.get("want_basemap", True),
-            log=lambda m: q.put(("log", str(m))),
-        )
+        z0 = payload.get("scene_z0")
+        z0 = float(z0) if z0 is not None else None
+        log = lambda m: q.put(("log", str(m)))  # noqa: E731
+        if payload.get("run_ws"):               # completed run → the REAL grid, not the estimate
+            g = build_grid_geometry_from_run(
+                payload["run_ws"], payload["crs"], sides=payload.get("sides"),
+                want_basemap=payload.get("want_basemap", True), scene_z0=z0, log=log)
+        else:
+            _origin = payload.get("origin")
+            g = build_grid_geometry(
+                payload["domain"], payload["dem"], payload["crs"],
+                float(payload["cell_size"]), float(payload["depth"]), float(payload["z"]),
+                origin=(float(_origin) if _origin is not None else None),
+                sides=payload.get("sides"), want_basemap=payload.get("want_basemap", True),
+                scene_z0=z0, log=log,
+            )
         q.put(("result", g))
     except Exception as e:  # noqa: BLE001
         q.put(("error", str(e)))

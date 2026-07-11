@@ -19,3 +19,11 @@ cache/
 # 400+ MB of installed software; the app bundles only what it needs (hype_app/data/ras_template,
 # bin/ras2025)
 /reference/
+# per-developer Claude Code settings (permissions allowlist); launch.json stays shared
+.claude/settings.local.json
+# test + coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

@@ -74,6 +74,11 @@ class Settings(BaseModel):
     gw_offset: PositiveFloat = 0.5
     porosity: PositiveFloat = Field(0.3, le=0.6)
 
+    # Particle tracking
+    particles_per_cell: PositiveInt = 1     # per wetted stream cell: 1, 4 (2×2) or 9 (3×3)
+    min_path_mult: float = Field(3.0, ge=0.0)   # hyporheic filter: min horizontal path length,
+    #                                             as a multiple of the mean cell size
+
     # Stress period / time stepping
     nper: PositiveInt = 1
     nstp: PositiveInt = 1
@@ -98,6 +103,7 @@ class Settings(BaseModel):
     raster_bounds_box: Optional[Any] = None
     transform: Optional[Any] = None
     bed_elevation: Optional[Any] = None
+    model_origin_elev: Optional[float] = None   # user grid origin (upstream streambed elev); None = min(DEM)
     raster_width: Optional[float] = None
     raster_height: Optional[float] = None
     ncol: Optional[int] = None

@@ -34,6 +34,42 @@ def _normal(line, s, ds=5.0):
     return line.interpolate(s0), (dy / n, -dx / n)
 
 
+def _tangent(line, s, ds=5.0):
+    """Downstream-pointing unit tangent at station `s` (same centred difference as `_normal`).
+    Returns (point, (tx, ty))."""
+    L = line.length
+    s0 = max(0.0, min(float(s), L))
+    a = line.interpolate(max(0.0, s0 - ds))
+    b = line.interpolate(min(L, s0 + ds))
+    dx, dy = b.x - a.x, b.y - a.y
+    n = (dx * dx + dy * dy) ** 0.5 or 1.0
+    return line.interpolate(s0), (dx / n, dy / n)
+
+
+def _clamp_to_end_planes(pts, line, L):
+    """Pin edge points into the band between the upstream (s=0) and downstream (s=L) end
+    cross-sections. On a bend near a reach end, the interpolated perpendiculars fan past the end
+    transect and the domain balloons upstream/downstream of it; any point with an along-reach
+    component beyond an end plane is projected back onto that plane (its lateral offset is kept).
+    Points ON the end transects have a zero along-tangent component, so the caps themselves are
+    unchanged."""
+    p0, (tx0, ty0) = _tangent(line, 0.0)
+    pL, (txL, tyL) = _tangent(line, L)
+    out = []
+    for (x, y) in pts:
+        d0 = (x - p0.x) * tx0 + (y - p0.y) * ty0
+        if d0 < 0.0:                       # upstream of the upstream transect
+            x, y = x - d0 * tx0, y - d0 * ty0
+        dL = (x - pL.x) * txL + (y - pL.y) * tyL
+        if dL > 0.0:                       # downstream of the downstream transect
+            x, y = x - dL * txL, y - dL * tyL
+            d0 = (x - p0.x) * tx0 + (y - p0.y) * ty0   # re-check plane 1 (crossing planes)
+            if d0 < 0.0:
+                x, y = x - d0 * tx0, y - d0 * ty0
+        out.append((x, y))
+    return out
+
+
 def _edge_offsets(dem, line, s, *, half, n_samp, rel_height, depth_bf, chan_half):
     """At station `s`: sample the DEM across the perpendicular transect and return the signed
     offsets ``(lo, ro)`` along the unit normal (``lo <= 0`` left, ``ro >= 0`` right) where the
@@ -208,6 +244,63 @@ def _sides_from_ring(domain, up_left, up_right, dn_left, dn_right):
         return None
 
 
+# A vertex is pruned only if its removal grows the floodplain by MORE than this (m²) — a floor above
+# float64 shoelace noise on Albers-metre coordinates (|x·y| ~ 1e13, so per-area error ~0.1-0.2 m²), so
+# genuinely near-collinear vertices aren't churned in/out by rounding (and the result no longer depends
+# on shoelace-vs-GEOS rounding). A real inward dent gains orders of magnitude more than this.
+_FPL_AREA_EPS_M2 = 1.0
+
+
+def _floodplain_area(side_coords, reach_coords) -> float:
+    """Area (m², projected CRS) of the floodplain polygon bounded by one side line and the
+    centerline: down the side line (upstream→downstream), back up the reversed centerline, then
+    close. The two implicit closing edges (side-DS→reach-DS and reach-US→side-US) are the left/right
+    halves of the downstream/upstream boundary caps. Returns 0.0 for a degenerate ring — including a
+    self-crossing one, whose shoelace area is smaller, so such chords are never chosen below.
+
+    Deliberately a pure-Python shoelace, NOT shapely: the greedy prune calls this O(n²) times per
+    side, and keeping it off the GEOS/shapely path both speeds it up and avoids piling native
+    allocations onto the numpy2.5+shapely2.1 GC hazard ([[hype-app-shiny-map-gotchas]])."""
+    ring = list(side_coords) + list(reversed(list(reach_coords)))
+    n = len(ring)
+    if n < 3:
+        return 0.0
+    total = 0.0
+    x1, y1 = ring[-1]
+    for x2, y2 in ring:
+        total += x1 * y2 - x2 * y1
+        x1, y1 = x2, y2
+    return abs(total) * 0.5
+
+
+def _maximize_floodplain(side_line, reach_line):
+    """Prune STRICTLY CONCAVE vertices from a floodplain boundary line — the "drop inward dents, keep
+    every outward bulge" pass applied on auto-generation. A vertex is removed only when its removal
+    STRICTLY grows the floodplain area between the side line and the centerline (i.e. it is an inward
+    dent, lying on the channel side of the chord between its neighbours). A convex/outward vertex
+    shrinks the area, so it is always kept — the line never sacrifices a bulge to shortcut a nearby
+    dent. Repeated to a fixpoint, since removing one dent can leave a neighbour concave; each pass
+    that removes nothing means no interior vertex is concave. Endpoints — the domain corners shared
+    with the up/down caps — are never touched, so the derived domain still closes on them. Returns a
+    LineString (the input unchanged when it has < 3 vertices)."""
+    from shapely.geometry import LineString
+    P = [tuple(c[:2]) for c in side_line.coords]
+    if len(P) < 3:
+        return side_line
+    reach = [tuple(c[:2]) for c in reach_line.coords]
+    changed = True
+    while changed and len(P) > 2:
+        changed = False
+        k = 1
+        while k < len(P) - 1:                     # endpoints P[0]/P[-1] are pinned
+            if _floodplain_area(P[:k] + P[k + 1:], reach) > _floodplain_area(P, reach) + _FPL_AREA_EPS_M2:
+                del P[k]                           # strictly concave dent → drop it; re-test new P[k]
+                changed = True
+            else:
+                k += 1                             # convex / collinear → keep it, advance
+    return LineString(P)
+
+
 def _line_coords(reach_geojson) -> list:
     """Pull the first LineString's coordinates from a FeatureCollection / Feature / geometry."""
     g = reach_geojson
@@ -256,11 +349,10 @@ def _nverts(geom):
     return 0
 
 
-def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
-                   x_mult=2.0, n_domain=10, log=print) -> dict:
-    """Build {domain, left, right, wse_extent} GeoJSON Features (EPSG:4326) + meta."""
+def _prep(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None):
+    """Shared setup for the delineators: projected+resampled reach line, its length, the Albers
+    DEM, and the Bieger-sized transect parameters."""
     import geopandas as gpd
-    import numpy as np
     import rioxarray  # noqa: F401 — .rio accessor
     from shapely.geometry import LineString
 
@@ -283,6 +375,36 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
     chan_half = min(half, max(4.0 * w_bf, 100.0))       # channel window for the thalweg anchor
 
     dem = rioxarray.open_rasterio(dem_path, masked=True).squeeze().rio.reproject(CRS_ALBERS)
+    return line, L, dem, bf, depth_bf, w_bf, half, n_samp, chan_half
+
+
+def _wse_ribbon(dem, line, L, *, depth_bf, half, n_samp, chan_half):
+    """The wetted-extent polygon: the two-XS interpolation at the bankfull-channel threshold,
+    clamped to the end transects. Returns a Polygon (Albers) or None."""
+    import numpy as np
+    n_wse = max(20, min(80, int(L / 15.0)))
+    wsides = _interp_sides(dem, line, L, list(np.linspace(0.0, L, n_wse)), rel_height=1.0,
+                           depth_bf=depth_bf, half=half, n_samp=n_samp, chan_half=chan_half)
+    if wsides is None or len(wsides[0]) < 3:
+        return None
+    wse = _simplify(_ribbon(_clamp_to_end_planes(wsides[0], line, L),
+                            _clamp_to_end_planes(wsides[1], line, L)))
+    if wse is None or wse.is_empty or wse.area <= 0:
+        return None
+    return wse
+
+
+def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
+                   x_mult=2.0, n_domain=10, want_wse=True, log=print) -> dict:
+    """Build {domain, left, right, wse_extent} GeoJSON Features (EPSG:4326) + meta.
+    ``want_wse=False`` skips the wetted-extent derivation entirely (the app only consumes it when
+    the water-surface mode is "Wetted extent"; the modeled/uploaded modes bring their own)."""
+    import geopandas as gpd
+    import numpy as np
+    from shapely.geometry import LineString
+
+    line, L, dem, bf, depth_bf, w_bf, half, n_samp, chan_half = _prep(
+        reach_geojson, dem_path, da_sqkm=da_sqkm, lat=lat, lon=lon)
 
     # --- domain + boundaries: measure floodplain offsets at the two end cross-sections only,
     #     then interpolate the left/right widths along the reach (perpendicular at each station). ---
@@ -292,7 +414,10 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
                           depth_bf=depth_bf, half=half, n_samp=n_samp, chan_half=chan_half)
     if sides is None or len(sides[0]) < 3:
         raise ValueError("Could not sample valid cross-sections at the reach ends (DEM gaps?).")
-    dleft, dright = sides
+    # Clamp the fan-out at bends: no station's edge points may land upstream of the upstream
+    # transect or downstream of the downstream one (the domain used to balloon past the caps).
+    dleft = _clamp_to_end_planes(sides[0], line, L)
+    dright = _clamp_to_end_planes(sides[1], line, L)
     domain = _simplify(_ribbon(dleft, dright))
     if domain is None or domain.is_empty or domain.area <= 0:
         raise ValueError("Delineated domain is degenerate; try a different reach or X.")
@@ -308,15 +433,18 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
         up_cap = LineString([dleft[0], dright[0]])
         down_cap = LineString([dleft[-1], dright[-1]])
 
-    # --- wetted extent: same two-XS interpolation at the bankfull-channel threshold ---
-    n_wse = max(20, min(80, int(L / 15.0)))
-    wsides = _interp_sides(dem, line, L, list(np.linspace(0.0, L, n_wse)), rel_height=1.0,
-                           depth_bf=depth_bf, half=half, n_samp=n_samp, chan_half=chan_half)
-    wse = None
-    if wsides is not None and len(wsides[0]) >= 3:
-        wse = _simplify(_ribbon(wsides[0], wsides[1]))
-        if wse is None or wse.is_empty or wse.area <= 0:
-            wse = None
+    # Prune inward "dents" from each floodplain line: greedily drop any vertex whose removal grows
+    # the floodplain area between that line and the centerline (keeping genuine outward bulges). The
+    # domain, derived from the four sides downstream (app: geometry.assemble_domain_from_sides),
+    # follows automatically; the shared corner endpoints are pinned, so it still closes on them.
+    n_l0, n_r0 = _nverts(left_line), _nverts(right_line)
+    left_line = _maximize_floodplain(left_line, line)
+    right_line = _maximize_floodplain(right_line, line)
+    fpl_dropped = (n_l0 - _nverts(left_line)) + (n_r0 - _nverts(right_line))
+
+    # --- wetted extent (only when the app will actually use it) ---
+    wse = (_wse_ribbon(dem, line, L, depth_bf=depth_bf, half=half, n_samp=n_samp,
+                       chan_half=chan_half) if want_wse else None)
 
     def to4326(geom):
         return gpd.GeoSeries([geom], crs=CRS_ALBERS).to_crs(4326).iloc[0]
@@ -358,8 +486,39 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
         },
     }
     log(f"Delineated: {len(dleft)} domain XS, reach {L:.0f} m, "
-        f"bankfull depth {depth_bf:.2f} m ({bf['division_name']}), X={x_mult}.")
+        f"bankfull depth {depth_bf:.2f} m ({bf['division_name']}), X={x_mult}; "
+        f"floodplain simplification dropped {fpl_dropped} inward vertex(es).")
     return out
+
+
+def auto_wse_extent(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None, log=print):
+    """Derive ONLY the wetted-extent polygon (EPSG:4326 Feature, or None) — used when the user
+    switches the water-surface mode to "Wetted extent" after boundaries were generated without
+    one (auto_delineate ran with want_wse=False)."""
+    import geopandas as gpd
+
+    line, L, dem, _bf, depth_bf, _w_bf, half, n_samp, chan_half = _prep(
+        reach_geojson, dem_path, da_sqkm=da_sqkm, lat=lat, lon=lon)
+    wse = _wse_ribbon(dem, line, L, depth_bf=depth_bf, half=half, n_samp=n_samp,
+                      chan_half=chan_half)
+    if wse is None:
+        return None
+
+    def to4326_poly(geom):
+        g = gpd.GeoSeries([geom], crs=CRS_ALBERS).to_crs(4326).iloc[0]
+        if not g.is_valid:
+            try:
+                from shapely import make_valid
+                g = make_valid(g)
+            except Exception:  # noqa: BLE001
+                g = g.buffer(0)
+        polys = [p for part in (g.geoms if hasattr(g, "geoms") else [g])
+                 for p in (part.geoms if part.geom_type == "MultiPolygon" else [part])
+                 if p.geom_type == "Polygon"]
+        return max(polys, key=lambda p: p.area) if polys else g
+
+    log(f"Derived wetted extent: {_nverts(wse)} vertices over {L:.0f} m.")
+    return _feat(to4326_poly(wse))
 
 
 def cross_section_lines(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
@@ -367,32 +526,106 @@ def cross_section_lines(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
     """The domain cross-section transects as a GeoJSON FeatureCollection (for display)."""
     import geopandas as gpd
     import numpy as np
-    import rioxarray  # noqa: F401
     from shapely.geometry import LineString
 
-    from . import bieger
-
-    coords = _line_coords(reach_geojson)
-    if len(coords) < 2:
+    try:
+        line, L, dem, _bf, depth_bf, _w_bf, half, n_samp, chan_half = _prep(
+            reach_geojson, dem_path, da_sqkm=da_sqkm, lat=lat, lon=lon)
+    except ValueError:
         return None
-    line = gpd.GeoSeries([LineString(coords)], crs=4326).to_crs(CRS_ALBERS).iloc[0]
-    L = float(line.length)
-    bf = bieger.bankfull_geometry(da_sqkm, lat, lon)
-    depth_bf = max(float(bf["depth_m"]), 0.05)
-    w_bf = max(float(bf["width_m"]), 1.0)
-    half = min(max(8.0 * w_bf, 250.0), 800.0)
-    n_samp = int(2 * half / 5.0) + 1
-    chan_half = min(half, max(4.0 * w_bf, 100.0))
-    dem = rioxarray.open_rasterio(dem_path, masked=True).squeeze().rio.reproject(CRS_ALBERS)
     sides = _interp_sides(dem, line, L, list(np.linspace(0.0, L, max(3, int(n)))),
                           rel_height=float(x_mult), depth_bf=depth_bf, half=half,
                           n_samp=n_samp, chan_half=chan_half)
     if sides is None:
         return None
-    dleft, dright = sides
+    dleft = _clamp_to_end_planes(sides[0], line, L)     # same band as the generated domain
+    dright = _clamp_to_end_planes(sides[1], line, L)
     segs = [LineString([dleft[i], dright[i]]) for i in range(len(dleft))]
     if not segs:
         return None
     gj = gpd.GeoSeries(segs, crs=CRS_ALBERS).to_crs(4326)
     return {"type": "FeatureCollection",
             "features": [_feat(g) for g in gj.geometry]}
+
+
+def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[float]:
+    """Minimum finite DEM elevation sampled along a LineString Feature (EPSG:4326).
+
+    Used to pick the streambed (thalweg) elevation where a boundary cap crosses the channel: sample
+    the (carved) terrain along the upstream/downstream boundary line and take the min. Returns None
+    when the geometry is empty or nothing valid samples.
+    """
+    import numpy as np
+    import rasterio
+    from pyproj import Transformer
+    from shapely.geometry import shape
+
+    try:
+        line = shape(feat_4326["geometry"])
+    except Exception:  # noqa: BLE001
+        return None
+    if line.is_empty or line.length == 0:
+        return None
+    with rasterio.open(dem_path) as src:
+        tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        fracs = np.linspace(0.0, 1.0, max(2, int(n)))
+        pts = [line.interpolate(float(f), normalized=True) for f in fracs]
+        xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
+        vals = np.array([v[0] for v in src.sample(np.column_stack([xs, ys]))], dtype="float64")
+        nod = src.nodata
+    if nod is not None:
+        vals = np.where(vals == nod, np.nan, vals)
+    vals = vals[np.isfinite(vals)]
+    if not vals.size:
+        return None
+    return float(np.min(vals))
+
+
+def orient_reach_downstream(feat_4326, dem_path, *, frac: float = 0.1,
+                            n: int = 40) -> tuple[dict, bool]:
+    """Return (feature, flipped) with the reach LineString running upstream → downstream.
+
+    The whole pipeline assumes upstream-first: `_normal` puts the RIGHT bank at `ro >= 0` of
+    downstream travel, so a backwards line silently swaps the Left/Right floodplain. Auto NHD
+    traces are upstream-first by construction; a MANUAL draw can run either way — so compare
+    the mean DEM elevation over the first vs last `frac` of the line and reverse the
+    coordinates when it was drawn uphill. On any sampling problem the feature is returned
+    unchanged (never block the pipeline on this check).
+    """
+    import numpy as np
+    import rasterio
+    from pyproj import Transformer
+    from shapely.geometry import shape
+
+    try:
+        line = shape(feat_4326["geometry"])
+        coords = list(feat_4326["geometry"]["coordinates"])
+    except Exception:  # noqa: BLE001
+        return feat_4326, False
+    if line.is_empty or line.length == 0 or len(coords) < 2:
+        return feat_4326, False
+
+    def _mean_elev(src, tr, fracs):
+        pts = [line.interpolate(float(f), normalized=True) for f in fracs]
+        xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
+        vals = np.array([v[0] for v in src.sample(np.column_stack([xs, ys]))], dtype="float64")
+        if src.nodata is not None:
+            vals = np.where(vals == src.nodata, np.nan, vals)
+        vals = vals[np.isfinite(vals)]
+        return float(np.mean(vals)) if vals.size else None
+
+    try:
+        with rasterio.open(dem_path) as src:
+            tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+            k = max(2, int(n))
+            head = _mean_elev(src, tr, np.linspace(0.0, frac, k))
+            tail = _mean_elev(src, tr, np.linspace(1.0 - frac, 1.0, k))
+    except Exception:  # noqa: BLE001
+        return feat_4326, False
+    if head is None or tail is None or head >= tail - 0.05:
+        return feat_4326, False        # already downhill (or flat/ambiguous) — keep as drawn
+    flipped = {"type": "Feature",
+               "properties": dict(feat_4326.get("properties") or {}),
+               "geometry": {"type": "LineString",
+                            "coordinates": [list(c) for c in reversed(coords)]}}
+    return flipped, True

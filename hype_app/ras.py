@@ -138,6 +138,9 @@ def ras_available() -> bool:
     if override:
         p = Path(override)
         return (p / "ras.exe").exists() if p.is_dir() else p.exists()
+    if sys.platform.startswith("win"):
+        return False    # the bundled runtime's dotnet host is a linux-x64 ELF — Windows
+    #                     needs HYPE_RAS_BIN pointing at a HEC-RAS 2025 install
     return (ras_bundle_dir() / "app" / "ras.dll").exists()
 
 

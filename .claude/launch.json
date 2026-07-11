@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "hype-app",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "shiny", "run", "--port", "8322", "app.py"],
+      "port": 8322,
+      "env": {
+        "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app_fable\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
+        "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow"
+      }
+    }
+  ]
+}

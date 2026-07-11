@@ -23,6 +23,7 @@
   var PICK_TEXT = "Click to select a point on a stream.";
   var state = { picking: false, arm: false, canEdit: false, autoEdit: false,
                 step: null, slot: null, slotName: "", armShape: "line" };
+  window.__hypeReachState = state;   // read by tree.js: map clicks never deselect while picking
   var tip = null, bar = null, doneTimer = null;
 
   // ---- DOM helpers (all scoped to the map wrapper) ----
@@ -148,7 +149,9 @@
   function showBar(mode, name) {
     var b = ensureBar();
     b.querySelector(".hype-edit-label").textContent = (mode === "draw" ? "Drawing " : "Editing ") + name;
-    b.querySelector('[data-k="clear"]').style.display = mode === "draw" ? "none" : "";
+    // Reach edit has no "redraw" (auto re-picks; the props pane owns Clear) → Done only.
+    var hideClear = mode === "draw" || state.step === "reach";
+    b.querySelector('[data-k="clear"]').style.display = hideClear ? "none" : "";
     b.querySelector('[data-k="done"]').textContent = mode === "draw" ? "Cancel" : "Done";
     b.style.display = "flex";
   }
@@ -159,9 +162,10 @@
     if (!state.picking) hideTip();
     if (state.arm) arm(0); else cancelDraw();
     if (!state.canEdit && !state.autoEdit && isEditing()) click(saveLink());  // commit before leaving
-    var onBnd = state.step === "boundaries" && !!state.slot;
-    if (onBnd && state.autoEdit) showBar("edit", state.slotName || "boundary");
-    else if (onBnd && state.arm) showBar("draw", state.slotName || "boundary");
+    // The reach centerline uses the same select→edit flow as boundaries now (slot "reach").
+    var onEditable = (state.step === "boundaries" || state.step === "reach") && !!state.slot;
+    if (onEditable && state.autoEdit) showBar("edit", state.slotName || "boundary");
+    else if (onEditable && state.arm) showBar("draw", state.slotName || "boundary");
     else hideBar();
   }
 

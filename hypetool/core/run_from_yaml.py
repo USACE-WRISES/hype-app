@@ -980,11 +980,20 @@ def _run_pipeline(cfg: Settings,
         cfg.ncol
     )
 
-    # Use only the first layer cells
-    left_cells_0  = [c for c in left_cells  if c[0] == 0]
-    right_cells_0 = [c for c in right_cells if c[0] == 0]
-    up_cells_0    = [c for c in up_cells    if c[0] == 0]
-    down_cells_0  = [c for c in down_cells  if c[0] == 0]
+    # One representative cell per boundary column — the TOP ACTIVE layer (not necessarily layer 0,
+    # which above-ground deactivation can switch off along the sunken downstream channel). The head
+    # is interpolated on these representatives, then copied to every active layer of the column.
+    def _top_per_column(cells):
+        best: dict[tuple[int, int], tuple[int, int, int]] = {}
+        for (k, r, c) in cells:
+            if (r, c) not in best or k < best[(r, c)][0]:
+                best[(r, c)] = (int(k), int(r), int(c))
+        return list(best.values())
+
+    left_cells_0  = _top_per_column(left_cells)
+    right_cells_0 = _top_per_column(right_cells)
+    up_cells_0    = _top_per_column(up_cells)
+    down_cells_0  = _top_per_column(down_cells)
 
     # --- Robust endpoints + lines for each side
     l_first_pt, l_last_pt, left_line   = myu.endpoints_and_line(pre["left_boundary"])
@@ -1074,6 +1083,7 @@ def _run_pipeline(cfg: Settings,
         ) if down_cells_0 else []
 
     # -------- Step 5: River stage cells (unchanged) --------
+    log("  Sampling water surface onto the model grid …")
     out_csv = Path(cfg.output_directory) / "model" / "grid_points_elevation.csv"
     df_gp = myu.sample_surface_elevations_to_grid_points(cfg.cropped_water_surface_raster, grid_points, out_csv)
 
@@ -1086,7 +1096,8 @@ def _run_pipeline(cfg: Settings,
     chd_data, n_unique, n_dupes = myu.compile_chd_data(
         river_cells, left_cells_0,  gw_left, right_cells_0, gw_right,
         up_cells_0, gw_up, down_cells_0, gw_down,
-        nlay=int(cfg.nlay), copy_boundary_heads_to_all_layers=True
+        nlay=int(cfg.nlay), copy_boundary_heads_to_all_layers=True, idomain=idomain,
+        botm=cfg.botm, log=log
     )
     log(f"CHD cells prepared: {len(chd_data)} (unique={n_unique}, dupes={n_dupes})")
 
@@ -1119,7 +1130,8 @@ def _run_pipeline(cfg: Settings,
         export_shp_wgs84=False,
         export_kml=False, export_kmz=False, export_gpkg=False,
         export_results_txt=True,
-        include_pngs_in_return=True, export_pngs=True, plots_dpi=150
+        include_pngs_in_return=True, export_pngs=True, plots_dpi=150,
+        min_path_mult=float(getattr(cfg, "min_path_mult", 3.0) or 0.0),
     )
 
     # --- NEW: Echo the publication-ready stats to the toolbox/console ---

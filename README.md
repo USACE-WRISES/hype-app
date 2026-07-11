@@ -12,16 +12,25 @@ core + FloPy) on **Posit Connect Cloud** (Linux). Modeled on the EASI app.
 
 ## What it does
 
-1. **Draw** the groundwater-domain polygon, then the **left** and **right** floodplain
-   boundary lines on a USGS basemap (optional extra polygons become **K-zones**).
-2. **Fetch** the USGS 3DEP terrain DEM for the area.
-3. **Choose the water surface:** the full DEM, a **channel-only** mask (detects the
-   hydro-flattened flat channel; tunable threshold), or an **uploaded** WSE raster.
-4. **Configure** grid + hydraulic parameters (a live **green/amber/red grid guardrail**
-   keeps runs in bounds) — including **4-corner** or **spatially-varying** gradient
-   boundary conditions and optional K-zone conductivities.
-5. **Run** MODFLOW 6 + MODPATH 7 on the bundled Linux binaries, watch the live log, then
-   view **pathlines + particle points** on the map and **download** a results bundle.
+Six stages, shown as the numbered stage bar under the header:
+
+1. **Reach** — Auto: click the upstream and downstream points on a highlighted NHD stream
+   (the reach traces itself). Or Manual: draw the centerline from upstream to downstream
+   and enter the drainage area (a backwards draw is auto-corrected from the terrain).
+2. **Terrain** — the USGS 3DEP DEM downloads **automatically** once the reach is set;
+   re-fetch at another resolution or carve a trapezoidal channel under Terrain.
+3. **Boundaries** — the four domain sides generate **automatically** from bankfull
+   geometry (floodplain width × bankfull depth); edit any side by clicking its line.
+4. **Water surface** — run the bundled **HEC-RAS 2025 2D** model, use the auto/drawn
+   wetted extent, or upload a WSE raster.
+5. **Groundwater** — one run hub: subsurface properties (K, porosity, optional K-zones),
+   the model grid (live green/amber/red guardrail), **4-corner** or **spatially-varying**
+   gradient boundary conditions, then **Run groundwater model** (MODFLOW 6 + MODPATH 7 on
+   the bundled Linux binaries, live log).
+6. **Results** — hydraulic head layers, **hyporheic-zone delineation** (particle
+   classification into hyporheic / losing / gaining / throughflow, with flow paths and
+   zone volumes in 2D + 3D), per-path statistics, and **Download project** (a zip of the
+   whole session, organized by stage).
 
 ## Layout
 

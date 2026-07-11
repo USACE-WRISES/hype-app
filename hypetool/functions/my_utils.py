@@ -147,8 +147,19 @@ def build_model_domain(cfg) -> dict:
     top = interpolate_na(np.ma.masked_invalid(top))
 
     nlay = int(cfg.gw_mod_depth / cfg.z)
+    # Vertical datum for the flat layer stack. Default = bed_elevation = min(DEM), which makes the
+    # top layer a wedge from the global-minimum terrain up to the ground. When the caller supplies a
+    # model origin (the upstream streambed elevation), anchor the stack one layer below it so the top
+    # cell is exactly z thick where terrain == origin (top layer = [origin - z, terrain]); deeper
+    # layers step down flat to origin - depth. bed_elevation is left unchanged (it still drives the
+    # starting heads and the particle-endpoint classification downstream — geometry only here).
+    _origin = getattr(cfg, "model_origin_elev", None)
+    if _origin is not None and np.isfinite(float(_origin)):
+        datum = float(_origin) - float(cfg.z)
+    else:
+        datum = bed_elevation
     tops = [top]
-    botm = [np.full_like(top, bed_elevation)]
+    botm = [np.full_like(top, datum)]
     for _ in range(1, nlay):
         next_top = botm[-1]
         next_bot = next_top - cfg.z
@@ -160,6 +171,7 @@ def build_model_domain(cfg) -> dict:
     cfg.raster_crs = raster_crs
     cfg.raster_bounds_box = raster_bounds_box
     cfg.bed_elevation = bed_elevation
+    cfg.model_grid_datum = datum
     cfg.ncol = ncol
     cfg.nrow = nrow
     cfg.nlay = nlay
@@ -172,7 +184,7 @@ def build_model_domain(cfg) -> dict:
     cfg.xorigin, cfg.yorigin = xmin, ymin
 
     return dict(
-        bed_elevation=bed_elevation, ncol=ncol, nrow=nrow, nlay=nlay,
+        bed_elevation=bed_elevation, datum=datum, ncol=ncol, nrow=nrow, nlay=nlay,
         top=top, tops=tops, botm=botm, grid_x=grid_x, grid_y=grid_y, grid_points=grid_points,
         xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, raster_crs=raster_crs
     )
@@ -181,6 +193,12 @@ def build_model_domain(cfg) -> dict:
 # ----------------------------
 # Step 4 – Model boundaries & idomain
 # ----------------------------
+# Minimum active-cell thickness (m): a cell whose bottom sits within this of the terrain top (or
+# above it) is treated as above-ground and switched off in idomain. Guards against zero/negative-
+# thickness cells when the model origin sits above the (lower) downstream terrain.
+_MIN_CELL_THICK_M = 0.01
+
+
 def define_floodplain_boundaries(left_boundary: gpd.GeoDataFrame, right_boundary: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     left_start = left_boundary.geometry.iloc[0].coords[0]
     left_end = left_boundary.geometry.iloc[-1].coords[-1]
@@ -218,26 +236,62 @@ def make_idomain(cfg, ground_water_domain: gpd.GeoDataFrame) -> tuple[np.ndarray
         r, c = divmod(idx, ncol)
         if ok:
             idomain[:, r, c] = 1
+
+    # Deactivate above-ground cells: with a model origin above the global-minimum terrain, the flat
+    # layer stack can rise above the lower (downstream) terrain. MODFLOW needs positive-thickness
+    # active cells, so any cell whose BOTTOM is at/above the terrain top is switched off. Layers stay
+    # perfectly flat; downstream columns simply keep fewer active layers. No-op for the legacy
+    # min(DEM) datum (every botm then sits at or below the terrain).
+    top_attr = getattr(cfg, "top", None)
+    botm = getattr(cfg, "botm", None)
+    if top_attr is not None and botm is not None:
+        top2d = np.asarray(top_attr, dtype=float)
+        if top2d.shape == (nrow, ncol):
+            for k in range(nlay):
+                above = np.asarray(botm[k], dtype=float) >= (top2d - _MIN_CELL_THICK_M)
+                idomain[k][above] = 0
     return idomain, grid_gdf
 
 
 # ----------------------------
 # Step 5 – Boundary conditions
 # ----------------------------
+def top_active_layer(idomain: np.ndarray) -> np.ndarray:
+    """(nrow, ncol) int: the shallowest ACTIVE layer index per column, or -1 if the whole column
+    is inactive. With terrain-following tops + above-ground deactivation, the ground surface /
+    streambed at a column can sit below layer 0, so stream cells, boundary cells and particle
+    seeding must key off THIS layer rather than a hard-coded 0."""
+    idm = np.asarray(idomain)
+    nlay = idm.shape[0]
+    top = np.full(idm.shape[1:], -1, dtype=int)
+    for k in range(nlay - 1, -1, -1):          # bottom-up so the shallowest active layer wins
+        top[np.asarray(idm[k]) == 1] = k
+    return top
+
+
 def identify_boundary_cells(idomain: np.ndarray) -> list[tuple[int, int, int]]:
-    """Find cells on the edge of the active domain (first layer based)."""
+    """Active cells on the edge of the model DOMAIN (every active layer of each perimeter column).
+
+    Uses the 2-D domain footprint (any active layer), NOT layer 0 — with above-ground deactivation
+    layer 0 no longer spans the domain, so a layer-0 perimeter would miss the sunken (downstream)
+    channel edge. Only ACTIVE cells are returned so no CHD lands in an inactive cell. For the legacy
+    min(DEM) datum every layer is active inside the domain, so this reduces to the old behavior."""
+    idm = np.asarray(idomain)
+    nlay, nrow, ncol = idm.shape
+    foot = (idm != 0).any(axis=0)
     boundary = set()
-    nlay, nrow, ncol = idomain.shape
     for r in range(nrow):
         for c in range(ncol):
-            if idomain[0, r, c] == 1:
-                if (
-                    (r > 0 and idomain[0, r - 1, c] == 0) or
-                    (r < nrow - 1 and idomain[0, r + 1, c] == 0) or
-                    (c > 0 and idomain[0, r, c - 1] == 0) or
-                    (c < ncol - 1 and idomain[0, r, c + 1] == 0)
-                ):
-                    for k in range(nlay):
+            if not foot[r, c]:
+                continue
+            if (
+                (r > 0 and not foot[r - 1, c]) or
+                (r < nrow - 1 and not foot[r + 1, c]) or
+                (c > 0 and not foot[r, c - 1]) or
+                (c < ncol - 1 and not foot[r, c + 1])
+            ):
+                for k in range(nlay):
+                    if idm[k, r, c] == 1:
                         boundary.add((k, r, c))
     return list(boundary)
 
@@ -436,6 +490,12 @@ def compute_boundary_heads_from_profile(
 
 #     return chd_data, len(unique), len(dupes)
 
+# A specified CHD head must never sit below a cell's bottom (MF6 aborts on `head < bottom`).
+# When placing a side-boundary head down a column we require the head to clear the cell bottom by
+# this margin — comfortably above float32 elevation granularity (~2e-5 near 200 m) yet physically
+# negligible (1 mm), so a borderline float doesn't slip through and trip MF6.
+_CHD_MIN_HEAD_ABOVE_BOT = 1e-3
+
 def compile_chd_data(
     river_cells: list[tuple[int, int, int, float]],
     left_cells_0: list[tuple[int, int, int]], left_heads: list[float],
@@ -445,20 +505,35 @@ def compile_chd_data(
     *,
     nlay: int = 1,
     copy_boundary_heads_to_all_layers: bool = True,
+    idomain: np.ndarray | None = None,
+    botm: "np.ndarray | list | None" = None,
+    log=None,
 ) -> tuple[list[list[float]], int, int]:
     """
     Build CHD stress period data as a *flat list* of [k, j, i, head] rows.
-    - River cells are included on the *top* layer only (k as provided, usually 0).
-    - Side boundaries (left/right/up/down) can be copied to all layers when
-      `copy_boundary_heads_to_all_layers=True`.
+    - River cells are included at the k provided (each column's top ACTIVE layer).
+    - Side boundaries (left/right/up/down) are copied down the column when
+      `copy_boundary_heads_to_all_layers=True`. When `idomain` is given, the head is written to
+      only the ACTIVE layers of each column (so no CHD lands in an inactive above-ground cell,
+      which MF6 rejects); without it, the legacy all-layers behavior is kept.
+    - When `botm` (the (nlay, nrow, ncol) layer-bottom elevations) is given, a side-boundary head
+      is written only to layers whose cell BOTTOM is at/below it. MF6 aborts on `head < bottom`,
+      and with a high flat datum (model origin at the upstream streambed) the upper active layers
+      of a downstream column can sit above the declining boundary head — those cells are skipped.
+      Physically this imposes the head only on the saturated part of the column. Pass `log` to get
+      a one-line summary of how many upper cells / whole columns were dropped for being above head.
 
     IMPORTANT (Option B):
     - We do *not* set IFACE here. In `build_gwf_model(...)` we split the CHD
       into two packages and set IFACE=6 **only** for the river package.
     """
+    idm = np.asarray(idomain) if idomain is not None else None
+    botm3 = np.asarray(botm) if botm is not None else None
     chd_data: list[list[float]] = []
     unique: set[tuple[int, int, int]] = set()
     dupes: set[tuple[int, int, int]] = set()
+    n_above_head = 0   # side cells skipped: cell bottom above the specified head
+    n_dry_cols = 0     # boundary columns left with no CHD (head below the whole active column)
 
     # 1) River (top layer only)
     for (k, j, i, head) in river_cells:
@@ -470,14 +545,37 @@ def compile_chd_data(
             dupes.add(key)
 
     # 2) Side boundaries
+    def _base_layers(j, i):
+        # active-layer set for a column BEFORE the bottom filter (idomain when available, else the
+        # legacy all-layers / top-only rule). Kept identical to the pre-botm behavior.
+        if idm is not None:
+            return [k for k in range(nlay) if idm[k, j, i] == 1]     # only real (active) cells
+        if copy_boundary_heads_to_all_layers and nlay and nlay > 1:
+            return list(range(nlay))
+        return [0]
+
     def _add_boundary(cells0, heads0):
+        nonlocal n_above_head, n_dry_cols
         for idx, (_k0, j, i) in enumerate(cells0):
             head_val = float(heads0[idx])
-            ks = range(nlay) if (copy_boundary_heads_to_all_layers and nlay and nlay > 1) else (0,)
-            for k in ks:
-                key = (int(k), int(j), int(i))
+            j, i = int(j), int(i)
+            base = _base_layers(j, i)
+            if botm3 is not None:
+                # never place a specified head below a cell bottom (MF6 aborts on head < bottom):
+                # keep only layers whose bottom clears the head. botm decreases with depth, so this
+                # trims the upper (above-water-table) cells off the column.
+                kept = [k for k in base if float(botm3[k, j, i]) <= head_val - _CHD_MIN_HEAD_ABOVE_BOT]
+                n_above_head += (len(base) - len(kept))
+                if base and not kept:
+                    n_dry_cols += 1            # head below the whole active column -> no side CHD here
+            else:
+                kept = base
+            # honor "top layer only" AFTER the bottom filter -> shallowest layer that fits the head
+            layers = kept if copy_boundary_heads_to_all_layers else kept[:1]
+            for k in layers:
+                key = (int(k), j, i)
                 if key not in unique:
-                    chd_data.append([int(k), int(j), int(i), head_val])
+                    chd_data.append([int(k), j, i, head_val])
                     unique.add(key)
                 else:
                     dupes.add(key)
@@ -486,6 +584,10 @@ def compile_chd_data(
     _add_boundary(right_cells_0, right_heads)
     _add_boundary(up_cells_0,    up_heads)
     _add_boundary(down_cells_0,  down_heads)
+
+    if log and botm3 is not None and (n_above_head or n_dry_cols):
+        log(f"  CHD sides: skipped {n_above_head} cell(s) whose bottom was above the boundary head; "
+            f"{n_dry_cols} column(s) had the head below the model bottom (no side CHD placed there).")
 
     return chd_data, len(unique), len(dupes)
 
@@ -779,16 +881,25 @@ def csv_points_elevation(points_gdf: gpd.GeoDataFrame,
 
 
 def sample_surface_elevations_to_grid_points(surface_raster: str, grid_points: gpd.GeoDataFrame, out_csv: Path) -> pd.DataFrame:
-    coords = [(pt.x, pt.y) for pt in grid_points.geometry]
-    vals: list[float | None] = []
+    """Sample the raster at every grid point (None outside the raster footprint).
+
+    The raster is read ONCE and all points are indexed vectorized. The naive version of
+    this loop called ``src.read(1)`` PER POINT — with a 1 m water-surface raster (millions
+    of pixels, deflate-compressed) times tens of thousands of grid points that meant hours
+    of redundant decompression and froze runs at "Computing boundary heads".
+    """
+    xs = grid_points.geometry.x.to_numpy(dtype=float)
+    ys = grid_points.geometry.y.to_numpy(dtype=float)
     with rasterio.open(surface_raster) as src:
-        for x, y in coords:
-            row, col = rasterio.transform.rowcol(src.transform, x, y)
-            if 0 <= row < src.height and 0 <= col < src.width:
-                vals.append(src.read(1)[row, col])
-            else:
-                vals.append(None)
-    df = pd.DataFrame({"x": [c[0] for c in coords], "y": [c[1] for c in coords], "elevation": vals})
+        arr = src.read(1)
+        rows, cols = rasterio.transform.rowcol(src.transform, xs, ys)
+    rows = np.atleast_1d(np.asarray(rows, dtype=np.int64))
+    cols = np.atleast_1d(np.asarray(cols, dtype=np.int64))
+    inside = (rows >= 0) & (rows < arr.shape[0]) & (cols >= 0) & (cols < arr.shape[1])
+    vals = np.full(xs.shape[0], np.nan, dtype=float)
+    vals[inside] = arr[rows[inside], cols[inside]]
+    elevation = np.where(inside, vals, None)          # object array: None outside, like before
+    df = pd.DataFrame({"x": xs, "y": ys, "elevation": elevation})
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
     return df
@@ -893,13 +1004,18 @@ def fit_csv_to_grid(df: pd.DataFrame, ncol: int, nrow: int, xmin: float, ymin: f
 
 
 def extract_river_cells(df: pd.DataFrame, idomain: np.ndarray) -> list[tuple[int, int, int, float]]:
+    """Wetted stream cells as (k, row, col, stage). ``k`` is each column's TOP ACTIVE layer — the
+    streambed cell — which is layer 0 for the legacy datum but sits deeper along a sunken channel
+    once the model origin is at the upstream streambed and above-ground cells are deactivated."""
     river = []
+    toplay = top_active_layer(idomain)
     for _, row in df.iterrows():
         x, y = int(row['x_transformed']), int(row['y_transformed'])
         elev = float(row['elevation'])
         if 0 <= x < idomain.shape[2] and 0 <= y < idomain.shape[1]:
-            if idomain[0, y, x] == 1:
-                river.append((0, y, x, elev))
+            k = int(toplay[y, x])
+            if k >= 0:
+                river.append((k, y, x, elev))
     return river
 
 
@@ -1088,8 +1204,16 @@ def build_gwf_model(
     )
     gwf.modelgrid.crs = cfg.raster_crs
 
-    # IC
-    strt = np.full((cfg.nlay, cfg.nrow, cfg.ncol), cfg.bed_elevation, dtype=float)
+    # IC — start saturated so the solver can find the water table. With the grid lifted to the
+    # streambed origin, strt=min(DEM) sits BELOW every cell (all bottoms are origin-z or lower), so
+    # cells start dry and Newton converges to a trivial all-dry state (only the CHD cells wet -> head
+    # only on the perimeter). Anchor the initial head at the origin instead: every active cell starts
+    # wet with a one-cell margin and the solver drains to the CHD-defined water table. Legacy (no
+    # origin) keeps strt = bed_elevation. bed_elevation is untouched (it still floors the particle
+    # endpoint classification).
+    _o = getattr(cfg, "model_origin_elev", None)
+    strt_val = float(_o) if (_o is not None and np.isfinite(float(_o))) else float(cfg.bed_elevation)
+    strt = np.full((cfg.nlay, cfg.nrow, cfg.ncol), strt_val, dtype=float)
     flopy.mf6.ModflowGwfic(gwf, strt=strt)
 
     # NPF
@@ -1340,6 +1464,7 @@ def build_particle_models(
     *,
     mp7_ws: Path | str | None = None,
     exe_path: str | Path | None = None,
+    porosity: float = 0.3,        # effective porosity for MPBAS (drives residence times/velocities)
     nx: int = 1,                  # number of particles across X per river cell
     ny: int = 1,                  # number of particles across Y per river cell
     place_wse: bool = True,       # drop a particle at the water table (WSE)
@@ -1415,6 +1540,7 @@ def build_particle_models(
             rowcelldivisions=1,
             columncelldivisions=1,
             layercelldivisions=1,
+            porosity=float(porosity),
         )
 
         partlocs: list[tuple[int, int, int]] = []
@@ -1468,12 +1594,12 @@ def build_particle_models(
             if not fallback_zs:
                 fallback_zs = [1.0]  # at least something
 
-            for (_k_ignore, irow, icol, _stage) in river_cells:
-                if 0 <= irow < nrow and 0 <= icol < ncol and (idomain is None or idomain[0, irow, icol] == 1):
+            for (kk, irow, icol, _stage) in river_cells:
+                if 0 <= irow < nrow and 0 <= icol < ncol and (idomain is None or idomain[int(kk), irow, icol] == 1):
                     for yloc in ygrid:
                         for xloc in xgrid:
                             for zloc in fallback_zs:
-                                partlocs.append((0, int(irow), int(icol)))
+                                partlocs.append((int(kk), int(irow), int(icol)))
                                 localx.append(float(xloc))
                                 localy.append(float(yloc))
                                 localz.append(float(zloc))
@@ -1615,6 +1741,11 @@ def export_hydraulic_head_layers(*, cfg, gwf, log=print) -> dict:
     tifs_dir.mkdir(parents=True, exist_ok=True)
 
     # --- (A) Write per-layer GeoTIFFs (rotation-aware transform) ---
+    # NOTE: this engine fills its model arrays SOUTH-first (row 0 = the southernmost row —
+    # create_grid builds cell centers with np.linspace(ymin→ymax)), unlike flopy's north-first
+    # modelgrid convention. A +dy pixel height with the origin at yorigin (the SOUTH edge) is
+    # therefore the CORRECT georeferencing for head3d as read from the .hds — do not "fix" it
+    # to the usual north-up −dy form or every head raster flips vertically.
     theta = np.deg2rad(angrot)
     a = dx * np.cos(theta)
     b = -dy * np.sin(theta)
@@ -1887,6 +2018,9 @@ def parse(name):
                 v.grid_mapping = "spatial_ref"
                 v.missing_value = FILL  # ArcGIS understands both _FillValue and missing_value
 
+                # head3d is SOUTH-first (engine row 0 = southernmost row) and y_coords ascend
+                # south->north (CF convention, yvar.positive="up") — data[:, j, :] already sits
+                # at y_coords[j]; no row flip needed.
                 data = head3d.astype("float32")
                 mask = (~np.isfinite(data)) | (np.abs(data) >= BAD) | np.isclose(data, FILL)
                 data = np.where(mask, FILL, data).astype("float32")
@@ -1940,6 +2074,8 @@ def process_and_export_modpath7_results(
     plots_show: bool = False,
     budget_term: str = "CHD",             # e.g., "FLOW-JA-FACE", "CHD", "RIV", etc.
     budget_kstpkper: tuple[int, int] | None = None,  # e.g., (kstp, kper). If None, use last.
+    min_path_mult: float = 3.0,           # hyporheic filter: min horizontal path length as a
+    #                                       multiple of the mean cell size (0 keeps every loop)
 ) -> dict:
     """
     Export full MODPATH7 results (tables, vectors, figures) and write
@@ -2093,9 +2229,11 @@ def process_and_export_modpath7_results(
     if df_pl.empty:
         raise RuntimeError("No pathline records loaded for filtered particles.")
 
-    # keep "long" pathlines (kept)
+    # keep "long" pathlines: min horizontal length = min_path_mult × mean cell size (default 3).
+    # Hyporheic loops are often shorter than a few cells (median excursion ≈ 1 cell on a 10 m
+    # grid), so the multiplier is a user knob — lower it to include the short loops.
     mean_cell = float((np.mean(delr) + np.mean(delc)) / 2.0)
-    thr_feet = 3.0 * mean_cell
+    thr_feet = max(0.0, float(min_path_mult)) * mean_cell
     lengths_2d = (
         df_pl.sort_values(["particleid", "time"])
             .groupby("particleid")
@@ -2105,7 +2243,7 @@ def process_and_export_modpath7_results(
     df_long = df_pl[df_pl["particleid"].isin(keep_ids)].copy()
     if df_long.empty:
         # Short/shallow domains (e.g. a sub-km reach with a wide floodplain) can have every
-        # hyporheic path shorter than the 3x-cell horizontal filter — those paths are still valid,
+        # hyporheic path shorter than the horizontal length filter — those paths are still valid,
         # so keep them rather than abort a solved model.
         kept = lengths_2d[lengths_2d > 1e-6].index
         df_long = df_pl[df_pl["particleid"].isin(kept)].copy()
@@ -2175,18 +2313,24 @@ def process_and_export_modpath7_results(
     delc_mean = float(np.mean(delc))
     cell_volumes = np.zeros((nlay, nrow, ncol), dtype=float)
 
+    # Streambed cell volume = saturated thickness up to the stage, at each river column's layer
+    # (its TOP ACTIVE layer — 0 for the legacy datum, deeper along a sunken channel). Deeper layers
+    # get the uniform z-volume. Legacy (all river cells at layer 0) is reproduced exactly:
+    # layer-0 non-river cells stay 0, layer-0 river cells get river_stage - botm[0].
     river_stage_array = np.zeros((nrow, ncol), dtype=float)
+    river_k: dict[tuple[int, int], int] = {}
     if river_cells:
         for (k, j, i, stage) in river_cells:
-            if k == 0 and 0 <= j < nrow and 0 <= i < ncol:
-                river_stage_array[j, i] = float(stage)
+            if 0 <= int(j) < nrow and 0 <= int(i) < ncol and 0 <= int(k) < nlay:
+                river_stage_array[int(j), int(i)] = float(stage)
+                river_k[(int(j), int(i))] = int(k)
     top_arr = gwf.modelgrid.top
-    bot0 = gwf.modelgrid.botm[0, :, :]
-    use_river = river_stage_array > 0.0
-    thickness_top = np.where(use_river, np.maximum(river_stage_array - bot0, 0.0), 0.0)
-    cell_volumes[0, :, :] = delr_mean * delc_mean * thickness_top
+    botm3 = np.asarray(gwf.modelgrid.botm)
     for kk in range(1, nlay):
         cell_volumes[kk, :, :] = delr_mean * delc_mean * (float(z) if z is not None else default_z_cell_size)
+    for (j, i), k in river_k.items():
+        sat = max(river_stage_array[j, i] - float(botm3[k, j, i]), 0.0)
+        cell_volumes[k, j, i] = delr_mean * delc_mean * sat
 
     total_volume_per_cell = np.nansum(cell_volumes, axis=0)
     hyporheic_volumes = cell_volumes * binary_presence
@@ -4158,8 +4302,12 @@ def scenario(
         run_models(gwfsim, silent=False)
 
         print("Building MODPATH 7 forward")
+        # particles_per_cell ∈ {1, 4, 9} → an n×n local grid per wetted cell
+        n_side = max(1, int(round(float(getattr(cfg, "particles_per_cell", 1) or 1) ** 0.5)))
         mp_fwd, _mp_bwd = build_particle_models(
-            cfg.sim_name, gwf, river_cells, mp7_ws=cfg.mp7_ws, exe_path=cfg.md7_exe_path
+            cfg.sim_name, gwf, river_cells, mp7_ws=cfg.mp7_ws, exe_path=cfg.md7_exe_path,
+            porosity=float(getattr(cfg, "porosity", 0.3) or 0.3),
+            nx=n_side, ny=n_side,
         )
         if write:
             write_models(mp_fwd, silent=silent)

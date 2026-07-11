@@ -7,7 +7,7 @@ from pathlib import Path
 import geopandas as gpd
 
 
-def _to_geojson_4326(path, max_features: int = 4000):
+def _read_gdf_4326(path, max_features: int = 4000):
     if not path:
         return None
     p = Path(path)
@@ -19,7 +19,12 @@ def _to_geojson_4326(path, max_features: int = 4000):
     gdf = gdf.to_crs(4326)
     if len(gdf) > max_features:                      # down-sample dense particle sets
         gdf = gdf.sample(max_features, random_state=0).sort_index()
-    return json.loads(gdf.to_json())
+    return gdf
+
+
+def _to_geojson_4326(path, max_features: int = 4000):
+    gdf = _read_gdf_4326(path, max_features=max_features)
+    return None if gdf is None else json.loads(gdf.to_json())
 
 
 def pathlines_geojson(result: dict):
@@ -28,6 +33,202 @@ def pathlines_geojson(result: dict):
 
 def points_geojson(result: dict):
     return _to_geojson_4326(result.get("points_fc"), max_features=6000)
+
+
+def pathlines_gdf_4326(result: dict):
+    """The flow-path lines as a 4326 GeoDataFrame of (particleid, geometry) — the app renders the
+    map layer from this same (possibly down-sampled) frame, so the displayed set is exactly the
+    selectable set. Total feature count is capped like the old GeoJSON path (seeded sample)."""
+    gdf = _read_gdf_4326(result.get("pathlines_fc"))
+    if gdf is None:
+        return None
+    if "particleid" not in gdf.columns:              # defensive — the engine always writes it
+        gdf = gdf.assign(particleid=range(len(gdf)))
+    gdf["particleid"] = gdf["particleid"].astype(int)
+    return gdf[["particleid", "geometry"]]
+
+
+def gdf_geojson(gdf):
+    """GeoJSON dict for an already-4326 GeoDataFrame (the app draws the flow-path layer from the
+    same frame it keeps for selection, so displayed == selectable)."""
+    return None if gdf is None or len(gdf) == 0 else json.loads(gdf.to_json())
+
+
+def flowpath_downsampled(result: dict, gdf) -> bool:
+    """True when `gdf` is a down-sampled subset of the pathlines shapefile (>4000 features)."""
+    import pyogrio
+    p = result.get("pathlines_fc")
+    if gdf is None or not p or not Path(p).exists():
+        return False
+    try:
+        n = pyogrio.read_info(str(p)).get("features")
+        return n is not None and int(n) > len(gdf)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# NOTE on units: hypetool hardcodes "_ft" into its output column names, but it never converts —
+# the values are simply in whatever units the inputs used. This app's pipeline is metric end to
+# end (3DEP meters, UTM CRS, cell sizes in m), so lengths are m, velocities m/day, heads m. The
+# stat columns here are therefore unit-neutral; the pane labels say m / days / m/day.
+_FP_STAT_COLS = ["length", "horiz", "depth", "rtime_d", "vel",
+                 "head_start", "head_end", "hyd_grad"]
+
+
+def _fp_summary_file(out_dir, name: str):
+    """summary/Forward_<name>, tolerating a different tracking-direction prefix."""
+    sdir = Path(out_dir) / "summary"
+    p = sdir / f"Forward_{name}"
+    if p.exists():
+        return p
+    hits = sorted(sdir.glob(f"*_{name}"))
+    return hits[0] if hits else None
+
+
+def _fp_geom_stats(result: dict):
+    """Fallback per-particle stats from the 3D pathline geometry when the summary CSVs are
+    missing: horizontal length, 3D length and depth below start, all in the model's own units
+    (no conversion — geometry CRS and model units agree in this pipeline). Returns a DataFrame
+    indexed by particleid, or None."""
+    import numpy as np
+    import pandas as pd
+    p = result.get("pathlines_fc_3d") or result.get("pathlines_fc")
+    if not p or not Path(p).exists():
+        return None
+    gdf = gpd.read_file(p)
+    if gdf.empty or "particleid" not in gdf.columns:
+        return None
+    rows = {}
+    for pid, geom in zip(gdf["particleid"].astype(int), gdf.geometry):
+        if geom is None or geom.is_empty or geom.geom_type != "LineString":
+            continue
+        c = np.asarray(geom.coords, dtype=float)
+        if len(c) < 2:
+            continue
+        dxy = np.hypot(np.diff(c[:, 0]), np.diff(c[:, 1]))
+        horiz = float(dxy.sum())
+        if c.shape[1] >= 3:
+            z = c[:, 2]
+            depth = float(z[0] - z.min())
+            length = float(np.sqrt(dxy ** 2 + np.diff(z) ** 2).sum())
+        else:
+            depth = length = np.nan
+        rows[int(pid)] = (length, horiz, depth)
+    if not rows:
+        return None
+    df = pd.DataFrame.from_dict(rows, orient="index", columns=["length", "horiz", "depth"])
+    df.index.name = "particleid"
+    return df
+
+
+def flowpath_stats(result: dict, out_dir):
+    """Per-particle flow-path metrics for the Results properties pane, indexed by particleid:
+    length (3D along-path), horiz (Σ√(Δx²+Δy²)), depth (start z − deepest z), rtime_d, vel,
+    head_start, head_end, hyd_grad. Missing sources leave NaN columns ("n/a" in the pane)
+    rather than raising. Values are in the model's units (metric in this app: m / days / m/day;
+    hypetool's "_ft" column names are labels only — see _FP_STAT_COLS note)."""
+    import numpy as np
+    import pandas as pd
+
+    out = None
+    summary_p = _fp_summary_file(out_dir, "particle_summary_table.csv")
+    if summary_p is not None:
+        try:
+            s = pd.read_csv(summary_p)
+            s = s.set_index(pd.to_numeric(s["particleid"], errors="coerce").astype(int))
+            out = pd.DataFrame(index=s.index)
+            for src, dst in (("total_length_ft", "length"),
+                             ("total_residence_time_days", "rtime_d"),
+                             ("particle_velocity_ft_per_day", "vel"),
+                             ("starting_hydraulic_head", "head_start"),
+                             ("ending_hydraulic_head", "head_end"),
+                             ("hydraulic_gradient", "hyd_grad")):
+                out[dst] = (pd.to_numeric(s[src], errors="coerce")
+                            if src in s.columns else np.nan)
+        except Exception:  # noqa: BLE001
+            out = None
+
+    verts_p = _fp_summary_file(out_dir, "pathlines_filtered.csv")
+    if verts_p is not None:
+        try:
+            # The CSV carries raw vertices (particleid, time, x, y, z, …) — the Δx/Δy/Δz columns
+            # the engine uses internally are NOT written, so derive the deltas here.
+            v = pd.read_csv(verts_p, usecols=["particleid", "time", "x", "y", "z"])
+            v["particleid"] = pd.to_numeric(v["particleid"], errors="coerce").astype(int)
+            v = v.sort_values(["particleid", "time"])
+            gb0 = v.groupby("particleid")
+            v["_h"] = np.hypot(gb0["x"].diff(), gb0["y"].diff())  # NaN first rows → skipped by sum
+            gb = v.groupby("particleid")
+            vd = pd.DataFrame({"horiz": gb["_h"].sum(),
+                               "depth": gb["z"].first() - gb["z"].min()})
+            out = vd if out is None else out.join(vd, how="outer")
+        except Exception:  # noqa: BLE001
+            pass
+
+    if out is None or out.reindex(columns=["length", "horiz", "depth"]).isna().all(axis=None):
+        geo = _fp_geom_stats(result)                 # CSVs missing → best-effort from geometry
+        if geo is not None:
+            out = geo if out is None else out.combine_first(geo)
+    if out is None:
+        return None
+    out = out.reindex(columns=_FP_STAT_COLS)
+    out.index.name = "particleid"
+    return out
+
+
+def flowpath_nodes_geojson(gdf):
+    """(start_gj, end_gj) point FeatureCollections from the 4326 pathlines gdf. Pathline vertices
+    are time-ordered by construction, so coords[0]/coords[-1] are each particle's start/end —
+    and the nodes land exactly on the drawn (possibly down-sampled) paths."""
+    if gdf is None or len(gdf) == 0:
+        return None, None
+
+    def _pt(pid, c):
+        return {"type": "Feature", "properties": {"particleid": int(pid)},
+                "geometry": {"type": "Point", "coordinates": [float(c[0]), float(c[1])]}}
+
+    starts, ends = [], []
+    for pid, geom in zip(gdf["particleid"], gdf.geometry):
+        if geom is None or geom.is_empty:
+            continue
+        parts = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
+        try:
+            c0 = parts[0].coords[0]
+            c1 = parts[-1].coords[-1]
+        except Exception:  # noqa: BLE001
+            continue
+        starts.append(_pt(pid, c0))
+        ends.append(_pt(pid, c1))
+    fc = lambda feats: ({"type": "FeatureCollection", "features": feats} if feats else None)  # noqa: E731
+    return fc(starts), fc(ends)
+
+
+def hist_datauri(values, *, label: str, unit: str):
+    """A small histogram PNG (base64 data URI) for the multi-select flow-path pane, with a mean
+    line. Returns None when there are no finite values."""
+    import base64
+    import io
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    a = np.asarray(list(values), dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return None
+    fig, ax = plt.subplots(figsize=(3.2, 1.6))
+    bins = int(min(24, max(6, round(a.size ** 0.5) * 2)))
+    ax.hist(a, bins=bins, color="#2b7bff", edgecolor="white", linewidth=0.4)
+    ax.axvline(float(a.mean()), color="#e02020", linewidth=1.0)
+    ax.set_xlabel(f"{label} ({unit})", fontsize=8)
+    ax.set_ylabel("count", fontsize=8)
+    ax.tick_params(labelsize=7)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def bounds_latlon(result: dict):

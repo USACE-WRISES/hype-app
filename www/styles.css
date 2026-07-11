@@ -1,19 +1,78 @@
+/* ============================================================================
+   HYPE design system — single stylesheet, ordered sections:
+     1. design tokens          7. buttons + segmented control
+     2. base + typography      8. forms (inputs · checks · sliders · accordion)
+     3. header + stage bar     9. status icons · cards · progress · busy · log
+     4. floating panels       10. map overlays (labels · edit bar · tools)
+     5. layer tree            11. 3D viewer (canvas · toolbar · view cube)
+     6. properties pane       12. responsive guards
+   z-index ladder: map 0 · 3D 500-513 · panels/readout 1100 · edit bar/band 1150 ·
+   stage bar 1190 · header 1200 · autocomplete 1300 · pick tooltip 1400.
+   ========================================================================= */
+
+/* ============ 1. design tokens ============ */
 :root {
-  --hype-accent: #2f4b7c;          /* primary blue (EASI) */
-  --hype-accent-dark: #243a61;     /* dark navy — header / hover */
-  --hype-card-border: #d5deea;
-  --hype-rule: #e5e8ee;
-  --hype-surface-soft: #f6f8fb;
-  --hype-text: #33415c;
-  --hype-label: #2a3344;
-  --hype-muted: #8a93a3;
-  --hype-nav: #cdd8ec;
-  --hype-good: #327a50;
-  --hype-header-h: 50px;
+  /* brand */
+  --hype-accent:        #2f4b7c;   /* primary navy (EASI) */
+  --hype-accent-dark:   #243a61;   /* header, hover */
+  --hype-accent-soft:   #eef3fb;   /* tinted bg: active rows, chips, hovers */
+  --hype-accent-border: #c8d8f0;   /* tinted border */
+  /* surfaces + lines */
+  --hype-surface-soft:  #f6f8fb;
+  --hype-border:        #d5deea;   /* card + control borders */
+  --hype-rule:          #e5e8ee;   /* hairline dividers */
+  --hype-rule-faint:    #f1f4f9;   /* list-row separators */
+  /* text */
+  --hype-text-strong:   #2a3344;   /* titles, field labels */
+  --hype-text:          #33415c;   /* body */
+  --hype-text-muted:    #6d7889;   /* secondary (AA on white) */
+  --hype-text-faint:    #98a1b3;   /* disabled, placeholders, ticks */
+  --hype-on-accent-dim: #cdd8ec;   /* idle text on navy */
+  /* status — exactly one family per hue: strong (text/icon) · soft bg · border */
+  --hype-ok:          #1a7f37;  --hype-ok-soft:   #e9f6ee;  --hype-ok-border:   #b7dfc4;
+  --hype-warn:        #9a6700;  --hype-warn-soft: #fff6e2;  --hype-warn-border: #f0d492;
+  --hype-err:         #b42318;  --hype-err-soft:  #fdecea;  --hype-err-border:  #f3b4ad;
+  --hype-info:        var(--hype-accent);
+  --hype-info-soft:   var(--hype-accent-soft);
+  --hype-info-border: var(--hype-accent-border);
+  /* dark canvas (3D viewer, logs, on-map tooltips) */
+  --hype-dark-bg:     #0d1117;  --hype-dark-text:   #c9d1d9;
+  --hype-dark-muted:  #9fb0c3;  --hype-dark-border: #566e89;
+  --hype-dark-chip:   rgba(15, 23, 42, .84);
+  /* map interaction accents (GIS overlay colors, not chrome) */
+  --hype-sel:  #ff9500;  --hype-sel-text: #ffd28a;   /* selection, measure */
+  --hype-cut:  #0b7285;  --hype-cut-text: #7fe3e3;   /* cross-section tool */
+  /* type */
   --font-head: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
   --font-body: "Instrument Sans", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --fs-0: 11px;   /* captions, uppercase labels, mono readouts, logs */
+  --fs-1: 12px;   /* secondary UI: help, chips, sm buttons, notes */
+  --fs-2: 13px;   /* base: body, inputs, buttons, tree rows, titles */
+  --fs-3: 14px;   /* pane leads, 3D hint */
+  --fs-4: 17px;   /* brand wordmark, modal titles */
+  /* space · radius · shadow · focus */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px;
+  --r-1: 6px;                          /* controls, chips, notes */
+  --r-2: 10px;                         /* floating cards, toolbars */
+  --shadow-1: 0 1px 4px rgba(15, 23, 42, .12);   /* map chips, small pills */
+  --shadow-2: 0 4px 16px rgba(15, 23, 42, .14);  /* toolbars, edit bar, menus */
+  --shadow-3: 0 8px 28px rgba(15, 23, 42, .16);  /* floating panels */
+  --hype-focus: 0 0 0 3px rgba(47, 75, 124, .22);
+  /* layout */
+  --hype-header-h: 50px;
+  --hype-stage-h: 38px;
+  --hype-chrome-h: calc(var(--hype-header-h) + var(--hype-stage-h));
+  /* icon masks (colored via background on the host element) */
+  --ic-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5 6.5 12 13 4.5' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --ic-warn:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 2.2 15 13.8H1Z' fill='none' stroke='%23000' stroke-width='1.8' stroke-linejoin='round'/%3E%3Cpath d='M8 6.6v3.2' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='11.9' r='.9'/%3E%3C/svg%3E");
+  --ic-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8h9M8.5 4 12.5 8 8.5 12' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --ic-chev:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --ic-info:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.6' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M8 7.2v3.6' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='4.8' r='.9'/%3E%3C/svg%3E");
+  --ic-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 2v8M4.5 7 8 10.5 11.5 7' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M3 13h10' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
+/* ============ 2. base + typography ============ */
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
 body { font-family: var(--font-body); color: var(--hype-text); }
@@ -21,11 +80,471 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 
 .hype-shell { position: absolute; inset: 0; overflow: hidden; }
 
+/* section label — uppercase micro-heading with a trailing hairline */
+.hype-sec { display: flex; align-items: center; gap: var(--sp-2); margin: var(--sp-4) 0 var(--sp-2);
+  font: 600 var(--fs-0)/1 var(--font-body); letter-spacing: .07em; text-transform: uppercase;
+  color: var(--hype-text-muted); }
+.hype-sec::after { content: ""; flex: 1; height: 1px; background: var(--hype-rule); }
+
+/* ============ 3. header + stage bar ============ */
+.hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
+  display: flex; align-items: center; justify-content: space-between; padding: 0 16px;
+  background: var(--hype-accent-dark); color: #fff; }
+.hype-brand { font-family: var(--font-head); font-weight: 700; font-size: var(--fs-4); letter-spacing: .3px; }
+.hype-brand small { font-weight: 400; opacity: .82; font-size: var(--fs-1); margin-left: 10px; }
+.hype-nav { display: flex; align-items: center; gap: 18px; }
+.hype-nav a { color: var(--hype-on-accent-dim); text-decoration: none; font-size: var(--fs-2); cursor: pointer; }
+.hype-nav a:hover { color: #fff; }
+
+/* labeled header button (Download project) — quiet ghost on the navy bar */
+.hype-header-btn { display: inline-flex; align-items: center; gap: 7px; height: 30px;
+  padding: 0 12px; font: 500 var(--fs-1)/1 var(--font-body); color: var(--hype-on-accent-dim);
+  background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .22);
+  border-radius: var(--r-1); cursor: pointer; text-decoration: none; white-space: nowrap; }
+.hype-header-btn:hover { color: #fff; background: rgba(255, 255, 255, .16); text-decoration: none; }
+/* .hype-nav a (higher specificity) would override the button look — pin it back */
+.hype-nav a.hype-header-btn { color: var(--hype-on-accent-dim); font-size: var(--fs-1); }
+.hype-nav a.hype-header-btn:hover { color: #fff; }
+.hype-header-btn.dim { opacity: .45; cursor: default; pointer-events: none; }
+.hype-header-btn .hype-ic { width: 13px; height: 13px; background: currentColor;
+  -webkit-mask: var(--ic-download) center/contain no-repeat; mask: var(--ic-download) center/contain no-repeat; }
+/* disabled plain nav entry (Save before there's anything to save) — link look, no action */
+.hype-nav .hype-nav-dim { color: var(--hype-on-accent-dim); opacity: .45;
+  font-size: var(--fs-2); cursor: default; }
+
+/* stage bar — Reach · Terrain · Boundaries · Water surface · Groundwater · Results.
+   Chips are plain <button data-jump="…"> elements; tree.js's delegated handler routes
+   clicks through the ordinary tree_event select channel. */
+.hype-stagebar { position: absolute; top: var(--hype-header-h); left: 0; right: 0;
+  height: var(--hype-stage-h); z-index: 1190; display: flex; align-items: center;
+  gap: 2px; padding: 0 10px; background: #fff; border-bottom: 1px solid var(--hype-rule);
+  overflow-x: auto; overflow-y: hidden; }
+.hype-stage { display: inline-flex; align-items: center; gap: 7px; height: 28px; flex: none;
+  padding: 0 10px; border: 0; background: transparent; border-radius: var(--r-1);
+  cursor: pointer; font: 500 var(--fs-1)/1 var(--font-body); color: var(--hype-text-muted); }
+.hype-stage:hover { background: var(--hype-surface-soft); color: var(--hype-text); }
+.hype-stage:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-stage-num { display: inline-flex; align-items: center; justify-content: center;
+  width: 18px; height: 18px; flex: none; border-radius: 50%; font-size: 10px; font-weight: 600;
+  border: 1.5px solid var(--hype-border); color: var(--hype-text-muted); background: #fff;
+  position: relative; }
+.hype-stage-sep { width: 13px; height: 13px; flex: none; background: var(--hype-text-faint);
+  -webkit-mask: var(--ic-chev) center/contain no-repeat; mask: var(--ic-chev) center/contain no-repeat; }
+/* stage states (the shared status vocabulary, §9) */
+.hype-stage.st-locked { color: var(--hype-text-faint); }
+.hype-stage.st-locked .hype-stage-num { border-color: var(--hype-rule); color: var(--hype-text-faint); }
+.hype-stage.st-done { color: var(--hype-text); }
+.hype-stage.st-done .hype-stage-num { background: var(--hype-ok-soft);
+  border-color: var(--hype-ok-border); color: transparent; }
+.hype-stage.st-done .hype-stage-num::after { content: ""; position: absolute; inset: 2px;
+  background: var(--hype-ok); -webkit-mask: var(--ic-check) center/contain no-repeat;
+  mask: var(--ic-check) center/contain no-repeat; }
+.hype-stage.st-stale { color: var(--hype-warn); }
+.hype-stage.st-stale .hype-stage-num { background: var(--hype-warn-soft);
+  border-color: var(--hype-warn-border); color: transparent; }
+.hype-stage.st-stale .hype-stage-num::after { content: ""; position: absolute; inset: 2px;
+  background: var(--hype-warn); -webkit-mask: var(--ic-check) center/contain no-repeat;
+  mask: var(--ic-check) center/contain no-repeat; }   /* amber check = done but out of date */
+.hype-stage.st-error .hype-stage-num { border-color: var(--hype-err); color: var(--hype-err); }
+.hype-stage.st-running .hype-stage-num { border: 2px solid var(--hype-accent);
+  border-top-color: transparent; color: transparent; animation: hype-spin .8s linear infinite; }
+/* active (current focus) wins over any state fill — declared last on purpose */
+.hype-stage.active { color: var(--hype-accent-dark); font-weight: 600; }
+.hype-stage.active .hype-stage-num { background: var(--hype-accent);
+  border-color: var(--hype-accent); color: #fff; }
+.hype-stage.active .hype-stage-num::after { display: none; }
+.hype-stage.active.st-running .hype-stage-num { border: 2px solid var(--hype-accent);
+  border-top-color: transparent; background: #fff; color: transparent; }
+
+/* ============ 4. floating panels (layer tree left · properties right) ============ */
+.hype-tree-panel, .hype-props-panel { position: absolute; top: calc(var(--hype-chrome-h) + 12px);
+  z-index: 1100; display: flex; flex-direction: column; background: #fff;
+  border: 1px solid var(--hype-border); border-radius: var(--r-2); overflow: hidden;
+  box-shadow: var(--shadow-3); max-height: calc(100vh - var(--hype-chrome-h) - 24px); }
+.hype-tree-panel { left: 12px; width: 316px; }
+/* right: 60px keeps the card — collapsed OR expanded — clear of the leaflet control column
+   (zoom + draw tools live at the map's top-right edge, ~46px wide incl. margin) */
+.hype-props-panel { right: 60px; width: 360px; display: none; }
+.hype-props-panel.has-content { display: flex; }
+.hype-tree-panel.collapsed, .hype-props-panel.collapsed { width: auto; min-width: 0;
+  box-shadow: var(--shadow-2); }
+.hype-tree-panel.collapsed .hype-tree-body, .hype-props-panel.collapsed .hype-props-body { display: none; }
+
+/* one white head treatment for BOTH panels */
+.hype-panel-head, .hype-props-head { display: flex; align-items: center; gap: var(--sp-2);
+  height: 38px; padding: 0 var(--sp-3); flex: none; cursor: pointer; user-select: none;
+  background: #fff; color: var(--hype-text-strong); border-bottom: 1px solid var(--hype-rule); }
+.hype-panel-head:hover { background: var(--hype-surface-soft); }
+.hype-tree-panel.collapsed .hype-panel-head, .hype-props-panel.collapsed .hype-panel-head,
+.hype-props-panel.collapsed .hype-props-head { border-bottom: none; }
+.hype-panel-title { font-family: var(--font-head); font-weight: 600; font-size: var(--fs-2);
+  color: var(--hype-text-strong); white-space: nowrap; }
+/* panel-head expander: a DRAWN chevron (border L rotated), not a font triangle — the ▾/▸
+   glyphs render tiny at any font-size and were repeatedly reported as hard to see */
+.hype-panel-caret { width: 20px; height: 20px; flex: none; display: inline-flex;
+  align-items: center; justify-content: center; color: var(--hype-text-muted); }
+.hype-panel-caret::before { content: ""; width: 9px; height: 9px;
+  border-right: 2.5px solid currentColor; border-bottom: 2.5px solid currentColor;
+  transform: rotate(45deg) translate(-1.5px, -1.5px); transition: transform .15s ease; }
+.hype-tree-panel.collapsed .hype-panel-caret::before,
+.hype-props-panel.collapsed .hype-panel-caret::before {
+  transform: rotate(-45deg) translate(-1.5px, -1.5px); }
+
+/* props-head action buttons (zoom · clear results · ×) — muted icon buttons on white */
+.hype-props-head .hype-panel-caret { color: var(--hype-text-muted); }
+.hype-props-close { border: 0; background: transparent; color: var(--hype-text-muted);
+  font-size: 19px; line-height: 1; cursor: pointer; padding: 2px 6px; border-radius: var(--sp-1); }
+.hype-props-close:hover { color: var(--hype-text-strong); background: var(--hype-surface-soft); }
+.hype-props-zoom { margin-left: auto; border: 0; background: transparent; color: var(--hype-text-muted);
+  cursor: pointer; padding: 3px 6px; border-radius: var(--sp-1); display: flex; align-items: center; }
+.hype-props-zoom:hover { color: var(--hype-text-strong); background: var(--hype-surface-soft); }
+.hype-props-clear { margin-left: auto; border: 0; background: transparent; color: var(--hype-text-muted);
+  font-size: var(--fs-1); line-height: 1; cursor: pointer; padding: 3px 8px; border-radius: var(--sp-1);
+  white-space: nowrap; }
+.hype-props-clear:hover { color: var(--hype-err); background: var(--hype-err-soft); }
+.hype-props-clear + .hype-props-zoom { margin-left: 0; }   /* clear owns the single auto-margin */
+
+/* props head — accent-filled: ties the pane to the navy selected tree row */
+.hype-props-head { background: var(--hype-accent); border-bottom: none; }
+.hype-props-head:hover { background: var(--hype-accent-dark); }   /* whole head = collapse toggle */
+.hype-props-head .hype-panel-title { color: #fff; }
+.hype-props-head .hype-panel-caret { color: rgba(255, 255, 255, .85); }
+.hype-props-head .hype-props-close,
+.hype-props-head .hype-props-zoom,
+.hype-props-head .hype-props-clear { color: var(--hype-on-accent-dim); }
+.hype-props-head .hype-props-close:hover,
+.hype-props-head .hype-props-zoom:hover,
+.hype-props-head .hype-props-clear:hover { color: #fff; background: rgba(255, 255, 255, .15); }
+.hype-props-head button:focus-visible { outline: none;
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .55); }
+
+/* ============ 5. layer tree ============ */
+.hype-tree-body { flex: 1; overflow-y: auto; padding: 6px 6px 8px; }
+.hype-tree-row { display: flex; align-items: center; gap: 6px; height: 30px; padding-right: 8px;
+  border-radius: 5px; cursor: pointer; font-size: var(--fs-2); color: var(--hype-text); }
+.hype-tree-row:hover { background: var(--hype-surface-soft); }
+.hype-tree-row.selected { background: var(--hype-accent); color: #fff; }
+.hype-tree-row.selected:hover { background: var(--hype-accent-dark); }
+.hype-tree-row.disabled { color: var(--hype-text-faint); }
+.hype-tree-row.selected.disabled { color: rgba(255, 255, 255, .62); }
+.hype-tree-row.hidden { display: none; }
+.hype-tree-row.group .hype-tree-label { font-weight: 600; }
+.hype-tree-caret { width: 20px; flex: none; align-self: stretch; display: inline-flex;
+  align-items: center; justify-content: center; color: var(--hype-text-muted); cursor: pointer; }
+.hype-tree-caret.is-group::before { content: ""; width: 8px; height: 8px;
+  border-right: 2.5px solid currentColor; border-bottom: 2.5px solid currentColor;
+  transform: rotate(-45deg); transition: transform .15s ease; }
+.hype-tree-caret.open::before { transform: rotate(45deg) translate(-1px, -1px); }
+.hype-tree-caret:hover { color: var(--hype-text); }
+.hype-tree-row.selected .hype-tree-caret { color: rgba(255, 255, 255, .85); }
+.hype-tree-check { width: 15px; height: 15px; flex: none; margin: 0; accent-color: var(--hype-accent);
+  cursor: pointer; }
+.hype-tree-row.selected .hype-tree-check { accent-color: #fff; }
+/* row is checked but an unchecked ancestor group is hiding its layers */
+.hype-tree-row.veiled .hype-tree-check { opacity: .45; }
+.hype-tree-row.veiled .hype-tree-label { color: var(--hype-text-faint); }
+.hype-tree-nocheck { width: 14px; flex: none; }
+.hype-tree-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* per-row status icons — same mask vocabulary as .hype-st and the stage bar */
+.hype-tree-status { width: 14px; height: 14px; flex: none; position: relative; }
+.hype-tree-status::before { content: ""; position: absolute; inset: 1px; }
+.hype-tree-status.s-done::before { background: var(--hype-ok);
+  -webkit-mask: var(--ic-check) center/contain no-repeat; mask: var(--ic-check) center/contain no-repeat; }
+.hype-tree-row.selected .hype-tree-status.s-done::before { background: #fff; }
+.hype-tree-status.s-error::before { inset: 3px; background: var(--hype-err); border-radius: 50%; }
+.hype-tree-status.s-stale::before { inset: 3px; background: var(--hype-warn); border-radius: 50%; }
+.hype-tree-row.selected .hype-tree-status.s-error::before,
+.hype-tree-row.selected .hype-tree-status.s-stale::before { background: #fff; }
+.hype-tree-status.s-running { border: 2px solid var(--hype-accent); border-top-color: transparent;
+  border-radius: 50%; width: 11px; height: 11px; margin: 0 1.5px; animation: hype-spin .8s linear infinite; }
+.hype-tree-status.s-running::before { display: none; }
+.hype-tree-row.selected .hype-tree-status.s-running { border-color: #fff; border-top-color: transparent; }
+
+/* ============ 6. properties pane content ============ */
+.hype-props-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 14px 16px; }
+
+.hype-instr { background: var(--hype-surface-soft); border-left: 2px solid var(--hype-accent-border);
+  padding: 8px 10px; font-size: var(--fs-1); color: var(--hype-text); margin-bottom: 10px;
+  border-radius: 0 var(--r-1) var(--r-1) 0; line-height: 1.45; }
+.hype-instr ul { margin: 2px 0 0; padding-left: 18px; }
+.hype-instr li { margin: 1px 0; }
+.hype-actions { display: flex; gap: var(--sp-2); margin-top: 14px; }
+.hype-chk { font-size: var(--fs-2); color: var(--hype-text-muted); padding: 2px 0; }
+.hype-chk.ok { color: var(--hype-ok); font-weight: 600; }
+
+/* small button row (K-zone Add / Remove / Clear) */
+.hype-bnd-row { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* boundary legend (Boundaries step; lines are edited by clicking them on the map) */
+.hype-legend { margin: 8px 0 2px; border: 1px solid var(--hype-rule); border-radius: var(--r-1); overflow: hidden; }
+.hype-leg-row { display: flex; align-items: center; gap: 8px; padding: 5px 9px; font-size: var(--fs-1);
+  color: var(--hype-text); border-top: 1px solid var(--hype-rule); }
+.hype-leg-row:first-child { border-top: none; }
+.hype-leg-row.active { background: var(--hype-accent-soft); font-weight: 600; }
+.hype-leg-swatch { width: 16px; height: 3px; border-radius: 2px; flex: none; }
+.hype-leg-name { flex: 1; }
+.hype-leg-mark { color: var(--hype-text-muted); font-weight: 600; }
+.hype-leg-mark.ok { color: var(--hype-ok); }
+.hype-leg-draw { font-size: var(--fs-1); }
+.hype-leg-edit { font-size: var(--fs-1); margin-left: 4px; font-weight: 600; }
+.hype-leg-row.active .hype-leg-edit { color: var(--hype-ok); }
+
+/* flow-path properties (Results step) */
+.hype-props { border: 1px solid var(--hype-border); border-radius: var(--r-1); padding: 9px 10px;
+  margin: 0 0 10px; background: #fff; }
+.hype-props-title { font-family: var(--font-head); font-weight: 600; font-size: var(--fs-2);
+  color: var(--hype-accent); margin-bottom: 6px; }
+.hype-props-table { width: 100%; border-collapse: collapse; font-size: var(--fs-1); color: var(--hype-text); }
+.hype-props-table td, .hype-props-table th { padding: 2.5px 4px; border-top: 1px solid var(--hype-rule); }
+.hype-props-table tr:first-child td, .hype-props-table tr:first-child th { border-top: none; }
+.hype-props-table td:first-child { color: var(--hype-text-strong); }
+.hype-props-table td:not(:first-child), .hype-props-table th:not(:first-child) {
+  text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.hype-props-table th { font-weight: 600; color: var(--hype-text-muted); font-size: var(--fs-0);
+  text-transform: uppercase; letter-spacing: .3px; }
+.hype-props-hist { width: 100%; margin-top: 8px; display: block; }
+.hype-props-note { font-size: var(--fs-0); color: var(--hype-text-muted); margin-top: 6px; line-height: 1.35; }
+.hype-props-actions { margin-top: 8px; display: flex; justify-content: flex-end; }
+
+/* hyporheic-zone panes (class stats + volume stats) */
+.hype-hz-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+  margin-right: 7px; vertical-align: -1px; border: 1px solid rgba(0, 0, 0, .18); }
+.hype-hz-head { display: flex; align-items: center; margin: 4px 0 8px; }
+.hype-hz-title { font-weight: 600; font-size: var(--fs-2); color: var(--hype-text); }
+.hype-hz-row { display: flex; justify-content: space-between; gap: 10px; font-size: var(--fs-1);
+  padding: 3px 0; border-bottom: 1px solid var(--hype-rule-faint); }
+.hype-hz-k { color: var(--hype-text-muted); }
+.hype-hz-v { color: var(--hype-text); font-weight: 500; font-variant-numeric: tabular-nums;
+  text-align: right; }
+
+/* groundwater run-hub readiness rows (inside .hype-legend) */
+.hype-leg-row .hype-hub-detail { color: var(--hype-text-muted); font-size: var(--fs-0);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+.hype-hub-edit { border: 0; background: transparent; color: var(--hype-accent);
+  font: 600 var(--fs-1)/1 var(--font-body); cursor: pointer; padding: 2px 4px;
+  border-radius: var(--sp-1); }
+.hype-hub-edit:hover { text-decoration: underline; }
+.hype-hub-edit:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+
+/* selection-mode buttons under the Results instructions */
+.hype-fpsel-row { display: flex; gap: 6px; align-items: center; margin: 0 0 10px; flex-wrap: wrap; }
+.hype-fpsel-lbl { font-size: var(--fs-1); color: var(--hype-text-muted); }
+
+/* Results map-layer toggles */
+.hype-lyr-head { font-size: var(--fs-1); font-weight: 600; color: var(--hype-text-strong); margin: 6px 0 2px; }
+.hype-lyr-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; margin-bottom: 6px; }
+.hype-lyr-grid .form-check, .hype-lyr-grid .checkbox { margin: 0; }
+.hype-lyr-grid label { font-size: var(--fs-1); }
+
+/* welcome / get-started card (first run) */
+.hype-welcome-steps { list-style: none; margin: 10px 0 4px; padding: 0;
+  display: flex; flex-direction: column; gap: 10px; }
+.hype-welcome-steps li { display: flex; gap: 10px; align-items: flex-start;
+  font-size: var(--fs-2); color: var(--hype-text); line-height: 1.45; }
+.hype-welcome-num { display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; flex: none; border-radius: 50%; font-size: var(--fs-0); font-weight: 600;
+  background: var(--hype-accent-soft); border: 1px solid var(--hype-accent-border);
+  color: var(--hype-accent); margin-top: 1px; }
+.hype-welcome-note { font-size: var(--fs-1); color: var(--hype-text-muted); margin: 10px 0 12px;
+  line-height: 1.45; }
+
+/* ============ 7. buttons + segmented control ============ */
+/* one system: primary · secondary (outline) · ghost chip · danger · link; md 32px / sm 24px */
+.btn { font-family: var(--font-body); font-weight: 500; border-radius: var(--r-1);
+  font-size: var(--fs-2); padding: 5px 14px; line-height: 1.35;
+  transition: background .12s ease, border-color .12s ease, color .12s ease; }
+.btn-sm { font-size: var(--fs-1); padding: 2px 10px; border-radius: var(--r-1); }
+.btn:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+
+.btn-primary { --bs-btn-bg: var(--hype-accent); --bs-btn-border-color: var(--hype-accent);
+  --bs-btn-hover-bg: var(--hype-accent-dark); --bs-btn-hover-border-color: var(--hype-accent-dark);
+  --bs-btn-active-bg: var(--hype-accent-dark); --bs-btn-active-border-color: var(--hype-accent-dark);
+  --bs-btn-disabled-bg: var(--hype-accent); --bs-btn-disabled-border-color: var(--hype-accent);
+  --bs-btn-focus-shadow-rgb: 47, 75, 124; }
+.btn-outline-secondary { --bs-btn-color: var(--hype-text); --bs-btn-border-color: var(--hype-border);
+  --bs-btn-hover-color: var(--hype-accent); --bs-btn-hover-bg: var(--hype-surface-soft);
+  --bs-btn-hover-border-color: var(--hype-accent);
+  --bs-btn-active-color: var(--hype-accent); --bs-btn-active-bg: var(--hype-accent-soft);
+  --bs-btn-active-border-color: var(--hype-accent); --bs-btn-focus-shadow-rgb: 47, 75, 124; }
+.btn-outline-danger { --bs-btn-color: var(--hype-err); --bs-btn-border-color: var(--hype-err-border);
+  --bs-btn-hover-color: var(--hype-err); --bs-btn-hover-bg: var(--hype-err-soft);
+  --bs-btn-hover-border-color: var(--hype-err);
+  --bs-btn-active-color: #fff; --bs-btn-active-bg: var(--hype-err);
+  --bs-btn-active-border-color: var(--hype-err); --bs-btn-focus-shadow-rgb: 180, 35, 24; }
+.btn-danger { --bs-btn-bg: var(--hype-err); --bs-btn-border-color: var(--hype-err);
+  --bs-btn-hover-bg: #9a1e14; --bs-btn-hover-border-color: #9a1e14;
+  --bs-btn-active-bg: #9a1e14; --bs-btn-active-border-color: #9a1e14;
+  --bs-btn-focus-shadow-rgb: 180, 35, 24; }
+
+/* ghost chip — the "next step" jump (tree.js data-jump delegation; class name frozen) */
+.hype-jump { font: 600 var(--fs-1)/1.35 var(--font-body); color: var(--hype-accent);
+  background: var(--hype-accent-soft); border: 1px solid var(--hype-accent-border);
+  border-radius: var(--r-1); padding: 4px 12px; cursor: pointer;
+  transition: background .12s ease, border-color .12s ease; }
+.hype-jump:hover { border-color: var(--hype-accent); }
+.hype-jump:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-jump.primary { color: #fff; background: var(--hype-accent); border-color: var(--hype-accent); }
+.hype-jump.primary:hover { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark); }
+
+/* toolbar variant — every JS-injected small button shares ONE recipe (class names frozen:
+   map edit bar, Results selection row, 3D toolbar) */
+.hype-edit-btn, .hype-fpsel-row button,
+.hype-mesh3d-bar button, .hype-mesh3d-bar select {
+  font: 500 var(--fs-1)/1.35 var(--font-body); color: var(--hype-text); background: #fff;
+  border: 1px solid var(--hype-border); border-radius: var(--r-1); padding: 3px 10px;
+  cursor: pointer; transition: background .12s ease, border-color .12s ease, color .12s ease; }
+.hype-edit-btn:hover, .hype-fpsel-row button:hover,
+.hype-mesh3d-bar button:hover:not(:disabled) {
+  background: var(--hype-surface-soft); border-color: var(--hype-accent); color: var(--hype-accent); }
+.hype-edit-btn.primary, .hype-fpsel-row button.active, .hype-mesh3d-bar button.active {
+  background: var(--hype-accent); border-color: var(--hype-accent); color: #fff; }
+.hype-edit-btn.primary:hover { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark);
+  color: #fff; }
+.hype-mesh3d-bar button.active:hover { background: var(--hype-accent-dark);
+  border-color: var(--hype-accent-dark); color: #fff; }
+.hype-edit-btn:focus-visible, .hype-fpsel-row button:focus-visible,
+.hype-mesh3d-bar button:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-mesh3d-bar button:disabled { opacity: .45; cursor: not-allowed; }
+.hype-mesh3d-bar button:disabled:hover { background: #fff; }
+
+/* corrective action inside a warning card — amber outline, not a third bespoke look */
+.hype-warn-btn { font: 600 var(--fs-1)/1.35 var(--font-body); color: var(--hype-warn);
+  background: #fff; border: 1px solid var(--hype-warn-border); border-radius: var(--r-1);
+  padding: 4px 12px; margin-top: 7px; cursor: pointer; }
+.hype-warn-btn:hover { background: var(--hype-warn-soft); }
+
+/* header 2D/3D canvas toggle — segmented control on the navy bar */
+.hype-view-toggle { display: flex; gap: 0; border: 1px solid rgba(255, 255, 255, .30);
+  border-radius: var(--r-1); overflow: hidden; }
+.hype-view-btn { font: 500 var(--fs-1)/1 var(--font-body); color: var(--hype-on-accent-dim);
+  background: transparent; border: 0; padding: 7px 14px; cursor: pointer; }
+.hype-view-btn:hover { background: rgba(255, 255, 255, .12); color: #fff; }
+.hype-view-btn.active { background: #fff; color: var(--hype-accent-dark); font-weight: 600; }
+.hype-view-btn:focus-visible { outline: none; box-shadow: inset 0 0 0 2px rgba(255, 255, 255, .55); }
+
+/* ============ 8. forms ============ */
+.hype-props-body .form-label { font-size: var(--fs-1); font-weight: 600;
+  color: var(--hype-text-strong); margin-bottom: 3px; }
+/* Shiny defaults input containers to a fixed 300px — inside the 360px pane (and especially
+   inside .hype-field-row's ~160px grid cells) that fixed width overflows; make them fluid. */
+.hype-props-body .shiny-input-container { margin-bottom: var(--sp-3); width: 100%;
+  max-width: 100%; }
+.hype-props-body input.form-control, .hype-props-body select.form-select {
+  font-size: var(--fs-2); color: var(--hype-text); padding: 5px 10px; min-height: 32px;
+  border-color: var(--hype-border); border-radius: var(--r-1); }
+.hype-props-body .form-control::placeholder { color: var(--hype-text-faint); }
+.hype-props-body .form-control:focus, .hype-props-body .form-select:focus {
+  border-color: var(--hype-accent); box-shadow: var(--hype-focus); }
+.form-check-input { border-color: var(--hype-border); }
+.form-check-input:checked { background-color: var(--hype-accent); border-color: var(--hype-accent); }
+.form-check-input:focus { border-color: var(--hype-accent); box-shadow: var(--hype-focus); }
+.hype-props-body .form-check-label, .hype-props-body .form-check { font-size: var(--fs-2); }
+
+/* ionRangeSlider (ui.input_slider) */
+.irs--shiny .irs-bar, .irs--shiny .irs-single, .irs--shiny .irs-from, .irs--shiny .irs-to {
+  background: var(--hype-accent); border-color: var(--hype-accent); }
+.irs--shiny .irs-handle { border-color: var(--hype-accent); box-shadow: none; }
+.irs--shiny .irs-line { background: var(--hype-rule); border: 0; }
+.irs--shiny .irs-min, .irs--shiny .irs-max { color: var(--hype-text-faint); }
+
+/* help text under an input (explanations live here, not in the label) */
+.hype-help { font-size: var(--fs-0); color: var(--hype-text-muted);
+  margin: -8px 0 var(--sp-3); line-height: 1.4; }
+/* compact 2-up field row for paired numerics (KH/KV, corner gradients, min/max).
+   min-width: 0 is load-bearing — number inputs have a large intrinsic min-content width,
+   and without it the 1fr tracks refuse to shrink and force the pane to scroll sideways. */
+.hype-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--sp-2); }
+.hype-field-row > * { min-width: 0; }
+/* input + trailing inline adornment (info tip) on one row */
+.hype-field-inline { display: flex; align-items: flex-end; gap: 8px; }
+.hype-field-inline > .shiny-input-container { flex: 1; }
+.hype-field-inline > .hype-info-tip { margin-bottom: 21px; }
+.hype-info-tip { display: inline-block; width: 14px; height: 14px; flex: none;
+  background: var(--hype-text-faint); cursor: help;
+  -webkit-mask: var(--ic-info) center/contain no-repeat; mask: var(--ic-info) center/contain no-repeat; }
+.hype-info-tip:hover { background: var(--hype-text-muted); }
+
+/* the lone "Advanced" accordion — reads like a .hype-sec label with a disclosure chevron */
+.hype-props-body .accordion { --bs-accordion-bg: transparent; --bs-accordion-border-color: transparent;
+  --bs-accordion-btn-padding-x: 0; --bs-accordion-btn-padding-y: 7px;
+  --bs-accordion-body-padding-x: 0; --bs-accordion-body-padding-y: 4px;
+  --bs-accordion-btn-focus-box-shadow: var(--hype-focus); margin-bottom: var(--sp-2); }
+.hype-props-body .accordion-button { font: 600 var(--fs-0)/1 var(--font-body);
+  letter-spacing: .07em; text-transform: uppercase; color: var(--hype-text-muted);
+  background: transparent; box-shadow: none; }
+.hype-props-body .accordion-button:not(.collapsed) { color: var(--hype-text-strong); }
+.hype-props-body .accordion-item { border: 0; border-top: 1px solid var(--hype-rule);
+  background: transparent; }
+
+/* ============ 9. status icons · cards · progress · busy · log ============ */
+/* inline status glyph — replaces literal ✓ ○ ➤ ● ⚠ characters in pane text */
+.hype-st { display: inline-block; width: 13px; height: 13px; flex: none;
+  vertical-align: -2px; margin-right: 6px; }
+.hype-st.st-done { background: var(--hype-ok);
+  -webkit-mask: var(--ic-check) center/contain no-repeat; mask: var(--ic-check) center/contain no-repeat; }
+.hype-st.st-active { background: var(--hype-accent);
+  -webkit-mask: var(--ic-arrow) center/contain no-repeat; mask: var(--ic-arrow) center/contain no-repeat; }
+.hype-st.st-warn { background: var(--hype-warn);
+  -webkit-mask: var(--ic-warn) center/contain no-repeat; mask: var(--ic-warn) center/contain no-repeat; }
+.hype-st.st-todo { width: 10px; height: 10px; margin: 0 8px 0 1px;
+  border: 1.5px solid var(--hype-text-faint); border-radius: 50%; background: transparent; }
+.hype-st.st-running { width: 12px; height: 12px; border: 2px solid var(--hype-accent);
+  border-top-color: transparent; border-radius: 50%; background: transparent;
+  animation: hype-spin .8s linear infinite; }
+.hype-st.st-error { width: 9px; height: 9px; margin: 0 8px 0 2px;
+  background: var(--hype-err); border-radius: 50%; }
+.hype-st.st-stale { width: 9px; height: 9px; margin: 0 8px 0 2px;
+  background: var(--hype-warn); border-radius: 50%; }
+
+/* status cards — one pattern for results, warnings, and the estimate bands.
+   (.hype-estimate.green/amber/red and .hype-warn are legacy aliases restyled in place.) */
+.hype-card, .hype-estimate, .hype-warn { position: relative; font-size: var(--fs-1);
+  line-height: 1.45; color: var(--hype-text); background: #fff;
+  border: 1px solid var(--hype-rule); border-radius: var(--r-1);
+  padding: 8px 10px 8px 30px; margin-top: var(--sp-3); }
+.hype-card::before, .hype-estimate::before, .hype-warn::before { content: ""; position: absolute;
+  left: 9px; top: 10px; width: 14px; height: 14px; background: var(--st-c, var(--hype-text-muted));
+  -webkit-mask: var(--st-i, var(--ic-info)) center/contain no-repeat;
+  mask: var(--st-i, var(--ic-info)) center/contain no-repeat; }
+.hype-card.ok, .hype-estimate.green { background: var(--hype-ok-soft);
+  border-color: var(--hype-ok-border); --st-c: var(--hype-ok); --st-i: var(--ic-check); }
+.hype-card.warn, .hype-estimate.amber, .hype-warn { background: var(--hype-warn-soft);
+  border-color: var(--hype-warn-border); --st-c: var(--hype-warn); --st-i: var(--ic-warn); }
+.hype-card.err, .hype-estimate.red { background: var(--hype-err-soft);
+  border-color: var(--hype-err-border); --st-c: var(--hype-err); --st-i: var(--ic-warn); }
+.hype-card b, .hype-estimate b, .hype-warn b { color: var(--hype-text-strong); font-weight: 600; }
+
+/* busy / spinner */
+.hype-busy { display: flex; align-items: center; gap: 8px; color: var(--hype-accent);
+  font-size: var(--fs-2); margin: 10px 0; }
+.hype-spinner { width: 15px; height: 15px; border: 2px solid var(--hype-accent-border);
+  border-top-color: var(--hype-accent); border-radius: 50%; animation: hype-spin .8s linear infinite; }
+@keyframes hype-spin { to { transform: rotate(360deg); } }
+
+/* run status + progress bar */
+.hype-run-status { margin: 4px 0 2px; }
+.hype-run-head { display: flex; align-items: center; gap: 8px; font-size: var(--fs-2); color: var(--hype-text); }
+.hype-run-label { flex: 1; font-weight: 600; }
+.hype-elapsed { font-variant-numeric: tabular-nums; color: var(--hype-text-muted); font-size: var(--fs-1); }
+.hype-prog { height: 7px; background: var(--hype-rule); border-radius: 5px; overflow: hidden; margin-top: 8px; }
+.hype-prog-bar { height: 100%; background: var(--hype-accent); border-radius: 5px; transition: width .4s ease; }
+.hype-prog-bar.indet { width: 35%; animation: hype-indet 1.2s ease-in-out infinite; }
+@keyframes hype-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
+.hype-prog-label { font-size: var(--fs-1); color: var(--hype-text-muted); margin-top: 4px;
+                   font-variant-numeric: tabular-nums; }
+
+/* live log */
+.hype-log { font-family: var(--font-mono); font-size: var(--fs-0); white-space: pre-wrap;
+  max-height: 340px; overflow: auto; background: var(--hype-dark-bg); color: var(--hype-dark-text);
+  padding: 10px; border-radius: var(--r-1); margin: 8px 0 0; }
+
+/* ============ 10. map overlays ============ */
 /* map fills everything BELOW the header so leaflet's controls never land on the header.
    :not(.hype-edit-bar) is critical — the floating edit bar is also a direct <div> child of
    .hype-map-wrap, and without the exclusion this rule stretched it to 100%×100%, turning its
    near-opaque white background into a sheet that covered the whole map in boundary edit mode. */
-.hype-map-wrap { position: absolute; top: var(--hype-header-h); left: 0; right: 0; bottom: 0; z-index: 0; }
+.hype-map-wrap { position: absolute; top: var(--hype-chrome-h); left: 0; right: 0; bottom: 0; z-index: 0; }
 .hype-map-wrap > div:not(.hype-edit-bar),
 .hype-map-wrap .shiny-html-output,
 .hype-map-wrap .jupyter-widgets { height: 100% !important; width: 100% !important; }
@@ -42,172 +561,166 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
    points you drag while editing a boundary are unmistakable. */
 .hype-map-wrap .leaflet-editing-icon {
   background: #fff; border: 2px solid var(--hype-accent); border-radius: 3px;
-  box-shadow: 0 1px 3px rgba(20, 40, 80, .35); box-sizing: border-box; opacity: 1; }
+  box-shadow: var(--shadow-1); box-sizing: border-box; opacity: 1; }
 .hype-map-label { display: inline-block; transform: translate(-50%, -50%); white-space: nowrap;
-  font: 600 11px/1.15 "Instrument Sans", system-ui, -apple-system, sans-serif;
+  font: 600 var(--fs-0)/1.15 var(--font-body);
   padding: 2px 7px; border-radius: 10px; background: #fff; border: 1px solid currentColor;
-  box-shadow: 0 1px 3px rgba(20, 40, 80, .28); pointer-events: none; }
+  box-shadow: var(--shadow-1); pointer-events: none; }
 
-/* ---- header ---- */
-.hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
-  display: flex; align-items: center; justify-content: space-between; padding: 0 16px;
-  background: var(--hype-accent-dark); color: #fff; }
-.hype-brand { font-family: var(--font-head); font-weight: 700; font-size: 1.08rem; letter-spacing: .3px; }
-.hype-brand small { font-weight: 400; opacity: .82; font-size: .8rem; margin-left: 10px; }
-.hype-nav { display: flex; gap: 18px; }
-.hype-nav a { color: var(--hype-nav); text-decoration: none; font-size: 13px; cursor: pointer; }
-.hype-nav a:hover { color: #fff; }
+/* label markers must NEVER intercept clicks (their pills are pointer-events:none but the
+   leaflet icon WRAPPER isn't) — and an invisible (visible=False → opacity 0) label would
+   otherwise ghost-block clicks on the line beneath it */
+.hype-map-wrap .leaflet-marker-icon:has(.hype-map-label) { pointer-events: none; }
 
-/* ---- left workflow pane ---- */
-.hype-leftpane { position: absolute; top: calc(var(--hype-header-h) + 12px); left: 12px; width: 336px;
-  max-height: calc(100vh - var(--hype-header-h) - 24px); overflow-y: auto; z-index: 1100;
-  background: #fff; border: 1px solid var(--hype-card-border); border-radius: 8px;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, .18); }
-.hype-pane-head { background: var(--hype-accent); color: #fff; padding: 9px 14px;
-  font-family: var(--font-head); font-weight: 600; border-radius: 8px 8px 0 0; }
-.hype-pane-body { padding: 12px 14px 16px; }
+/* raster overlays (hillshade, WSE/depth/head PNGs) are pure display — their <img> nodes
+   must never swallow clicks meant for the vector lines (or the map) beneath them */
+.hype-map-wrap .leaflet-image-layer { pointer-events: none; }
 
-/* ---- stepper ---- */
-.hype-steps { display: flex; gap: 4px; margin-bottom: 14px; }
-.hype-step { flex: 1; text-align: center; font-size: 10px; color: var(--hype-muted); padding: 5px 2px 6px;
-  border-top: 3px solid #e2e7ef; text-decoration: none; cursor: pointer; border-radius: 0 0 3px 3px; }
-.hype-step:hover { background: var(--hype-surface-soft); color: var(--hype-accent); text-decoration: none; }
-.hype-step.active { color: var(--hype-accent); font-weight: 700; border-top-color: var(--hype-accent); }
-.hype-step.disabled { color: #c2c8d2; pointer-events: none; border-top-color: #eef1f5; }
-
-/* ---- pane content ---- */
-.hype-instr { background: var(--hype-surface-soft); border-left: 3px solid var(--hype-accent);
-  padding: 8px 10px; font-size: 12.5px; color: var(--hype-text); margin-bottom: 10px;
-  border-radius: 0 4px 4px 0; line-height: 1.4; }
-.hype-actions { display: flex; gap: 8px; margin-top: 14px; }
-.hype-chk { font-size: 13px; color: var(--hype-muted); padding: 2px 0; }
-.hype-chk.ok { color: var(--hype-good); font-weight: 600; }
-
-/* ---- small button row (K-zone Add / Remove / Clear) ---- */
-.hype-bnd-row { display: flex; flex-wrap: wrap; gap: 6px; }
-
-/* ---- boundary legend (Boundaries step; lines are edited by clicking them on the map) ---- */
-.hype-legend { margin: 8px 0 2px; border: 1px solid var(--hype-rule); border-radius: 6px; overflow: hidden; }
-.hype-leg-row { display: flex; align-items: center; gap: 8px; padding: 5px 9px; font-size: 12.5px;
-  color: var(--hype-text); border-top: 1px solid var(--hype-rule); }
-.hype-leg-row:first-child { border-top: none; }
-.hype-leg-row.active { background: #eef3fb; font-weight: 600; }
-.hype-leg-swatch { width: 16px; height: 3px; border-radius: 2px; flex: none; }
-.hype-leg-name { flex: 1; }
-.hype-leg-mark { color: var(--hype-muted); font-weight: 600; }
-.hype-leg-mark.ok { color: var(--hype-good); }
-.hype-leg-draw { font-size: 12px; }
-.hype-leg-edit { font-size: 12px; margin-left: 4px; font-weight: 600; }
-.hype-leg-row.active .hype-leg-edit { color: var(--hype-good); }
-
-/* ---- floating boundary edit bar over the map ---- */
-.hype-edit-bar { position: absolute; left: calc(50% + 168px); bottom: 16px; transform: translateX(-50%);
-  z-index: 1150; display: flex; align-items: center; gap: 10px; background: rgba(255, 255, 255, .97);
-  border: 1px solid var(--hype-card-border); border-radius: 10px; box-shadow: 0 2px 12px rgba(20, 40, 80, .22);
-  padding: 7px 12px; font-size: 12.5px; color: var(--hype-text); }
-.hype-edit-label { font-weight: 600; }
-.hype-edit-btn { font-size: 12px; padding: 3px 10px; border: 1px solid var(--hype-card-border);
-  background: #fff; border-radius: 5px; cursor: pointer; }
-.hype-edit-btn:hover { background: var(--hype-surface-soft); }
-.hype-edit-btn.primary { background: var(--hype-accent); border-color: var(--hype-accent); color: #fff; }
-.hype-edit-btn.primary:hover { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark); }
-
-.hype-warn { font-size: 12px; color: #9a6700; background: #fff8e1; border: 1px solid #ffe0a3;
-  border-radius: 6px; padding: 6px 8px; margin-top: 10px; }
-.hype-warn-btn { margin-top: 7px; font-size: 12px; font-weight: 600; padding: 4px 12px;
-  color: #7a5200; background: #ffe6a8; border: 1px solid #e6b64d; border-radius: 5px; cursor: pointer; }
-.hype-warn-btn:hover { background: #ffdc8a; }
-
-.hype-estimate { font-size: 12.5px; padding: 8px 10px; border-radius: 6px; margin-top: 12px; line-height: 1.35; }
-.hype-estimate.green { background: #e7f7ec; color: #1a7f37; border: 1px solid #b7e3c3; }
-.hype-estimate.amber { background: #fff6e5; color: #9a6700; border: 1px solid #ffd591; }
-.hype-estimate.red   { background: #fdecea; color: #b42318; border: 1px solid #f3b4ad; }
-
-/* ---- bottom-left readout ---- */
-.hype-readout { position: absolute; left: 12px; bottom: 12px; z-index: 1100;
-  background: rgba(255, 255, 255, .92); border: 1px solid var(--hype-card-border); border-radius: 5px;
-  padding: 4px 9px; font-size: 11px; color: var(--hype-text); font-variant-numeric: tabular-nums; }
-
-/* ---- location search (Photon autocomplete) + bottom stream-loading cue ---- */
-.hype-ac-credit { font-size: 10px; color: var(--hype-muted); margin: 2px 0 6px; }
-.hype-ac-menu { position: absolute; z-index: 1300; background: #fff;
-  border: 1px solid var(--hype-card-border); border-radius: 6px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, .16); max-height: 280px; overflow-y: auto; padding: 4px 0; }
-.hype-ac-item { display: flex; flex-direction: column; gap: 1px; padding: 6px 10px; cursor: pointer;
-  border-bottom: 1px solid #f1f4f9; }
-.hype-ac-item:last-child { border-bottom: none; }
-.hype-ac-item:hover { background: #eef3fb; }
-.hype-ac-name { font-size: 12.5px; color: #2a3344; font-weight: 600; }
-.hype-ac-meta { font-size: 10.5px; color: #8a93a3; }
-.hype-flow-loading { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
-  z-index: 1100; display: flex; align-items: center; gap: 8px; background: rgba(255, 255, 255, .96);
-  border: 1px solid var(--hype-card-border); border-radius: 16px;
-  box-shadow: 0 2px 11px rgba(20, 40, 80, .15); padding: 5px 14px 5px 11px; font-size: 12px;
-  font-weight: 500; color: var(--hype-accent); }
-
-/* ---- auto-pick map tooltip (follows the cursor; mirrors Leaflet.draw's .leaflet-draw-tooltip
-   so auto + manual modes feel cohesive — see www/reach_draw.js) ---- */
-.hype-pick-tooltip { position: fixed; z-index: 1400; pointer-events: none; white-space: nowrap;
-  background: rgba(0, 0, 0, .55); color: #fff; border-radius: 4px; padding: 4px 8px;
-  font: 12px/18px var(--font-body); box-shadow: 0 1px 4px rgba(0, 0, 0, .3); }
-.hype-pick-tooltip::before { content: ""; position: absolute; top: 7px; left: -7px;
-  border-top: 6px solid transparent; border-bottom: 6px solid transparent;
-  border-right: 6px solid rgba(0, 0, 0, .55); }
-
-/* ---- 3D mesh viewer overlay (vtk.js; shown only on the Mesh step via mesh3d_style) ---- */
-.hype-mesh3d { position: absolute; top: var(--hype-header-h); left: 0; right: 0; bottom: 0;
-  z-index: 500; display: none; background: #0d1117; }
-.hype-mesh3d canvas { display: block; }
-.hype-mesh3d-bar { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
-  z-index: 510; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
-  background: rgba(255, 255, 255, .95); border: 1px solid var(--hype-card-border);
-  border-radius: 10px; box-shadow: 0 2px 12px rgba(20, 40, 80, .22); padding: 8px 14px;
-  font-size: 12px; color: var(--hype-text); max-width: calc(100% - 372px); }
-.hype-mesh3d-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; font-weight: 500; }
-.hype-mesh3d-bar input[type="range"] { width: 120px; }
-.hype-mesh3d-bar input[type="number"] { width: 74px; font-size: 12px; padding: 2px 5px;
-  border: 1px solid var(--hype-card-border); border-radius: 5px; }
-.hype-mesh3d-bar select, .hype-mesh3d-bar button { font-size: 12px; padding: 3px 8px;
-  border: 1px solid var(--hype-card-border); background: #fff; border-radius: 5px; cursor: pointer; }
-.hype-mesh3d-bar button:hover { background: var(--hype-surface-soft); }
-.hype-mesh3d-hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-  z-index: 505; color: #9fb0c3; font-size: 14px; text-align: center; pointer-events: none; }
-.hype-mesh3d-label { position: absolute; z-index: 508; transform: translate(-50%, -130%);
-  pointer-events: none; white-space: nowrap; font-size: 11px; font-weight: 600;
-  padding: 2px 8px; border-radius: 10px; background: rgba(13, 17, 23, .78);
-  border: 1px solid currentColor; }
-
-/* ---- busy / spinner ---- */
-.hype-busy { display: flex; align-items: center; gap: 8px; color: var(--hype-accent); font-size: 13px; margin: 10px 0; }
-.hype-spinner { width: 15px; height: 15px; border: 2px solid var(--hype-nav); border-top-color: var(--hype-accent);
-  border-radius: 50%; animation: hype-spin .8s linear infinite; }
-@keyframes hype-spin { to { transform: rotate(360deg); } }
-
-/* ---- live log ---- */
-.hype-log { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11px; white-space: pre-wrap;
-  max-height: 340px; overflow: auto; background: #0d1117; color: #c9d1d9; padding: 10px; border-radius: 6px; margin: 8px 0 0; }
-
-/* ---- buttons + inputs ---- */
-.btn-primary { background: var(--hype-accent); border-color: var(--hype-accent); }
-.btn-primary:hover, .btn-primary:focus { background: var(--hype-accent-dark); border-color: var(--hype-accent-dark); }
-.hype-pane-body .form-label { font-size: 12.5px; margin-bottom: 2px; color: var(--hype-label); font-weight: 500; }
-.hype-pane-body .shiny-input-container { margin-bottom: 9px; }
-.hype-pane-body input.form-control, .hype-pane-body select.form-select { font-size: 13px; padding: 4px 8px; }
-.hype-pane-body .btn { font-size: 13px; }
-
-/* ---- leaflet controls: accent + subtle inset from the header ---- */
+/* leaflet controls: accent + subtle inset from the header */
 .hype-map-wrap .leaflet-control-zoom a, .hype-map-wrap .leaflet-bar a { color: var(--hype-accent); }
 .hype-map-wrap .leaflet-top { top: 6px; }
 .hype-map-wrap .leaflet-right { right: 6px; }
 
-/* ---- run status card + progress bar ---- */
-.hype-run-status { margin: 4px 0 2px; }
-.hype-run-head { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--hype-text); }
-.hype-run-label { flex: 1; font-weight: 600; }
-.hype-elapsed { font-variant-numeric: tabular-nums; color: var(--hype-muted); font-size: 12px; }
-.hype-prog { height: 7px; background: #e6ebf3; border-radius: 5px; overflow: hidden; margin-top: 8px; }
-.hype-prog-bar { height: 100%; background: var(--hype-accent); border-radius: 5px; transition: width .4s ease; }
-.hype-prog-bar.indet { width: 35%; animation: hype-indet 1.2s ease-in-out infinite; }
-@keyframes hype-indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
-.hype-prog-label { font-size: 12px; color: var(--hype-muted); margin-top: 4px;
-                   font-variant-numeric: tabular-nums; }
+/* The raw Leaflet.draw toolbar is never user-clicked (reach_draw.js drives it via the hidden
+   anchors), so hide it on every step — its polyline/polygon buttons only confuse. */
+.hype-map-wrap .leaflet-draw { display: none !important; }
+
+/* floating boundary edit bar over the map */
+.hype-edit-bar { position: absolute; left: calc(50% + 168px); bottom: 16px; transform: translateX(-50%);
+  z-index: 1150; display: flex; align-items: center; gap: 10px; background: rgba(255, 255, 255, .97);
+  border: 1px solid var(--hype-border); border-radius: var(--r-2); box-shadow: var(--shadow-2);
+  padding: 7px 12px; font-size: var(--fs-1); color: var(--hype-text); }
+.hype-edit-label { font-weight: 600; }
+
+/* bottom-left readout */
+.hype-readout { position: absolute; left: 12px; bottom: 12px; z-index: 1100;
+  background: rgba(255, 255, 255, .92); border: 1px solid var(--hype-border); border-radius: 5px;
+  padding: 4px 9px; font-size: var(--fs-0); color: var(--hype-text); font-variant-numeric: tabular-nums; }
+
+/* location search (Photon autocomplete) + bottom stream-loading cue */
+.hype-ac-credit { font-size: 10px; color: var(--hype-text-muted); margin: 2px 0 6px; }
+.hype-ac-menu { position: absolute; z-index: 1300; background: #fff;
+  border: 1px solid var(--hype-border); border-radius: var(--r-1);
+  box-shadow: var(--shadow-2); max-height: 280px; overflow-y: auto; padding: 4px 0; }
+.hype-ac-item { display: flex; flex-direction: column; gap: 1px; padding: 6px 10px; cursor: pointer;
+  border-bottom: 1px solid var(--hype-rule-faint); }
+.hype-ac-item:last-child { border-bottom: none; }
+.hype-ac-item:hover { background: var(--hype-accent-soft); }
+.hype-ac-name { font-size: var(--fs-1); color: var(--hype-text-strong); font-weight: 600; }
+.hype-ac-meta { font-size: var(--fs-0); color: var(--hype-text-muted); }
+.hype-flow-loading { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+  z-index: 1100; display: flex; align-items: center; gap: 8px; background: rgba(255, 255, 255, .96);
+  border: 1px solid var(--hype-border); border-radius: 16px;
+  box-shadow: var(--shadow-1); padding: 5px 14px 5px 11px; font-size: var(--fs-1);
+  font-weight: 500; color: var(--hype-accent); }
+
+/* auto-pick map tooltip (follows the cursor; mirrors Leaflet.draw's .leaflet-draw-tooltip
+   so auto + manual modes feel cohesive — see www/reach_draw.js) */
+.hype-pick-tooltip { position: fixed; z-index: 1400; pointer-events: none; white-space: nowrap;
+  background: var(--hype-dark-chip); color: #fff; border-radius: var(--sp-1); padding: 4px 8px;
+  font: var(--fs-1)/18px var(--font-body); box-shadow: var(--shadow-1); }
+.hype-pick-tooltip::before { content: ""; position: absolute; top: 7px; left: -7px;
+  border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+  border-right: 6px solid var(--hype-dark-chip); }
+
+/* box-select control + rubber band (Results step; revealed by map_edit_style) */
+.hype-map-wrap .hype-fpsel { display: none; }
+.hype-map-wrap .hype-fpsel a { font-size: 17px; line-height: 26px; }
+.hype-map-wrap .hype-fpsel.active a { background: var(--hype-accent); color: #fff; }
+.hype-map-wrap .leaflet-container.hype-fpsel-arming,
+.hype-map-wrap .leaflet-container.hype-fpsel-arming * { cursor: crosshair !important; }
+.hype-map-wrap .hype-fpsel-arming .leaflet-interactive { pointer-events: none; }
+.hype-fpsel-band { position: absolute; z-index: 1150; pointer-events: none;
+  border: 2px dashed var(--hype-sel); background: rgba(255, 149, 0, .1); border-radius: 2px; }
+.hype-map-wrap path.hype-fp-sel { pointer-events: none; }  /* decorative highlight only */
+
+/* 2-D length ruler (www/measure2d.js; always available on the map) */
+.hype-map-wrap .hype-measure2d a { font-size: 15px; line-height: 26px; color: var(--hype-text); }
+.hype-map-wrap .hype-measure2d a svg { width: 18px; height: 18px; vertical-align: middle; }
+.hype-map-wrap .hype-measure2d.active a { background: var(--hype-accent); color: #fff; }
+.hype-map-wrap .leaflet-container.hype-measuring-2d,
+.hype-map-wrap .leaflet-container.hype-measuring-2d * { cursor: crosshair !important; }
+/* while measuring, vectors + markers ignore the pointer so clicks land on the map */
+.hype-map-wrap .hype-measuring-2d .leaflet-interactive,
+.hype-map-wrap .hype-measuring-2d .leaflet-marker-icon { pointer-events: none; }
+.hype-measure2d-tip { background: var(--hype-dark-chip); color: var(--hype-sel-text);
+  border: 1px solid var(--hype-sel); border-radius: 5px; font-size: var(--fs-1); font-weight: 600;
+  padding: 2px 7px; box-shadow: none; }
+.hype-measure2d-tip::before { display: none; }  /* drop leaflet's tooltip arrow */
+
+/* terrain cross-section tool (www/xsection.js; revealed by xsect_style while DEM on) */
+.hype-map-wrap .hype-xsect { display: none; }
+.hype-map-wrap .hype-xsect a { line-height: 26px; color: var(--hype-text); }
+.hype-map-wrap .hype-xsect a svg { width: 18px; height: 18px; vertical-align: middle; }
+.hype-map-wrap .hype-xsect.active a { background: var(--hype-accent); color: #fff; }  /* svg uses currentColor */
+.hype-map-wrap .leaflet-container.hype-xsecting,
+.hype-map-wrap .leaflet-container.hype-xsecting * { cursor: crosshair !important; }
+/* while drawing a section, vectors + markers ignore the pointer so clicks land on the map */
+.hype-map-wrap .hype-xsecting .leaflet-interactive,
+.hype-map-wrap .hype-xsecting .leaflet-marker-icon { pointer-events: none; }
+/* live "double-click to end" hint that follows the cursor while drawing */
+.hype-xsect-tip { background: var(--hype-dark-chip); color: var(--hype-cut-text);
+  border: 1px solid var(--hype-cut); border-radius: 5px; font-size: var(--fs-1); font-weight: 600;
+  padding: 2px 7px; box-shadow: none; }
+.hype-xsect-tip::before { display: none; }  /* drop leaflet's tooltip arrow */
+
+/* ============ 11. 3D viewer (vtk.js; shown on the Mesh step via mesh3d_style) ============ */
+.hype-mesh3d { position: absolute; top: var(--hype-chrome-h); left: 0; right: 0; bottom: 0;
+  z-index: 500; display: none; background: var(--hype-dark-bg); }
+.hype-mesh3d canvas { display: block; }
+.hype-mesh3d-bar { position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+  z-index: 510; display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  background: rgba(255, 255, 255, .95); border: 1px solid var(--hype-border);
+  border-radius: var(--r-2); box-shadow: var(--shadow-2); padding: 8px 14px;
+  font-size: var(--fs-1); color: var(--hype-text); max-width: calc(100% - 372px); }
+.hype-mesh3d-bar label { display: flex; align-items: center; gap: 6px; white-space: nowrap; font-weight: 500; }
+.hype-mesh3d-bar input[type="range"] { width: 120px; accent-color: var(--hype-accent); }
+.hype-mesh3d-bar input[type="number"] { width: 74px; font-size: var(--fs-1); padding: 2px 5px;
+  border: 1px solid var(--hype-border); border-radius: var(--r-1); }
+.hype-mesh3d-hint { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  z-index: 505; color: var(--hype-dark-muted); font-size: var(--fs-3); text-align: center; pointer-events: none; }
+.hype-mesh3d-label { position: absolute; z-index: 508; transform: translate(-50%, -130%);
+  pointer-events: none; white-space: nowrap; font-size: var(--fs-0); font-weight: 600;
+  padding: 2px 8px; border-radius: 10px; background: var(--hype-dark-chip);
+  border: 1px solid currentColor; }
+
+/* 3D view cube (top-center; camera-synced CSS cube, faces jump to presets) */
+.hype-mesh3d-cube { position: absolute; top: 26px; left: 50%; margin-left: -38px;
+  width: 76px; height: 76px; z-index: 512; }
+.hype-cube-box { position: absolute; inset: 0; transform-style: preserve-3d; }
+.hype-cube-face { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; background: rgba(30, 41, 59, .82); color: var(--hype-dark-text);
+  border: 1px solid var(--hype-dark-border); font: 600 var(--fs-1)/1 var(--font-body, system-ui);
+  letter-spacing: .3px; backface-visibility: hidden; cursor: pointer; user-select: none; }
+.hype-cube-face:hover { background: rgba(59, 91, 130, .95); color: #fff; }
+.hype-cube-face.active { background: rgba(74, 124, 155, .96); color: #fff; border-color: #9fc3d8; }
+/* faces live in the cube's BOX space (world with y negated — see mesh3d.js syncCube):
+   north = B −y, south = B +y, east = B +x, west = B −x */
+.face-top    { transform: translateZ(38px); }
+.face-bottom { transform: rotateY(180deg) translateZ(38px); }
+.face-north  { transform: rotateX(90deg) translateZ(38px); }
+.face-south  { transform: rotateX(-90deg) translateZ(38px); }
+.face-east   { transform: rotateY(90deg) translateZ(38px); }
+.face-west   { transform: rotateY(-90deg) translateZ(38px); }
+.hype-cube-face span { display: inline-block; pointer-events: none; }
+.hype-cube-home { position: absolute; left: 50%; transform: translateX(-50%); bottom: -34px;
+  font-size: var(--fs-0); font-weight: 600; padding: 3px 10px; border-radius: 10px; cursor: pointer;
+  background: rgba(30, 41, 59, .82); color: var(--hype-dark-text); border: 1px solid var(--hype-dark-border); }
+.hype-cube-home:hover { background: rgba(59, 91, 130, .95); color: #fff; }
+.hype-cube-home.active { background: rgba(74, 124, 155, .96); color: #fff; border-color: #9fc3d8; }
+
+/* 3D measure tool */
+.hype-mesh3d.hype-measuring, .hype-mesh3d.hype-measuring canvas { cursor: crosshair; }
+.hype-mesh3d-measure { position: absolute; z-index: 513; transform: translate(-50%, -150%);
+  pointer-events: none; white-space: nowrap; font-size: var(--fs-1); font-weight: 600;
+  padding: 3px 9px; border-radius: var(--r-1); background: var(--hype-dark-chip);
+  color: var(--hype-sel-text); border: 1px solid var(--hype-sel); }
+
+/* ============ 12. responsive guards ============ */
+@media (max-width: 980px) {
+  .hype-brand small { display: none; }
+}
+@media (max-width: 760px) {
+  .hype-stage-name { display: none; }        /* number-only chips on narrow screens */
+  .hype-props-panel { width: 320px; }
+}
