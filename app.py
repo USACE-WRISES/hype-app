@@ -1254,6 +1254,13 @@ def server(input, output, session):
         if match is not None and sv is not None:
             if slot != "wse":
                 match = _snap_boundary_endpoints(slot, match)   # snap ends onto nearby neighbour ends
+            if slot in ("up", "down"):
+                cs = ((match.get("geometry") or {}).get("coordinates")) or []
+                if len(cs) > 2:              # BC lines are straight by design → keep the chord
+                    match = {"type": "Feature",
+                             "properties": (match.get("properties") or {}),
+                             "geometry": {"type": "LineString",
+                                          "coordinates": [cs[0], cs[-1]]}}
             if isinstance(match.get("properties"), dict):
                 match["properties"].pop("style", None)   # drop the edit-only colour (see _edit_feature)
             sv.set(match)                                 # so stored features stay pristine for statics/engine
@@ -6810,19 +6817,25 @@ def server(input, output, session):
 
     @render.ui
     def domain_warning():
-        # Warn when the four boundaries don't meet at a corner. The derived domain still force-closes
-        # for the model run, but a big gap means the user's lines are disconnected — guide them to fix
-        # it. (Snapping auto-connects near endpoints; this catches the ones too far apart to snap.)
+        # Soft boundary sanity warnings, stacked: (1) the four boundaries don't meet at a corner
+        # (the derived domain still force-closes; snapping auto-connects near endpoints — this
+        # catches the ones too far apart to snap); (2) the reach centerline doesn't meet the
+        # up/down boundaries or crosses a floodplain side. Guidance only — never gates the step.
         if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
             return None
+        children = []
         gap = geometry.corner_gaps_m(up_feat(), left_feat(), right_feat(), down_feat())
-        if gap is None or gap <= 25.0:
-            return None
-        return ui.div(
-            ui.div(f"Boundaries don't meet at a corner (gap ≈ {gap:.0f} m). Drag an endpoint onto "
-                   "the neighbouring line to connect them, or:"),
-            ui.input_action_button("snap_corners", "Snap corners together", class_="hype-warn-btn"),
-            class_="hype-warn")
+        if gap is not None and gap > 25.0:
+            children.append(ui.div(
+                ui.div(f"Boundaries don't meet at a corner (gap ≈ {gap:.0f} m). Drag an endpoint "
+                       "onto the neighbouring line to connect them, or:"),
+                ui.input_action_button("snap_corners", "Snap corners together",
+                                       class_="hype-warn-btn"),
+                class_="hype-warn"))
+        for msg in geometry.reach_boundary_issues(reach_feat(), up_feat(), left_feat(),
+                                                  right_feat(), down_feat()):
+            children.append(ui.div(msg, class_="hype-warn"))
+        return ui.TagList(*children) if children else None
 
     @render.ui
     def kzone_status():

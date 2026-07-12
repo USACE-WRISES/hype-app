@@ -338,6 +338,67 @@ def _simplify(geom, tol=SIMPLIFY_TOL_M):
     return s if (s is not None and not s.is_empty) else geom
 
 
+def condition_boundary_sides(left, right, up_cap, down_cap, tol=SIMPLIFY_TOL_M):
+    """Straighten the upstream/downstream caps to true 2-point chords and migrate cap-collinear
+    lead/tail vertices of the left/right floodplain lines into them, so the caps are straight
+    BC lines and the floodplain lines are purely the sides. Pure geometry in projected metres.
+
+    Assumes the ``_sides_from_ring`` / fallback corner convention (left ul→dl, right ur→dr,
+    up ul→ur, down dl→dr, shared corner coords exact) — the cap chords are taken from the SIDE
+    endpoints, which keeps the shared corners bit-exact. A side vertex counts as collinear when
+    its perpendicular distance to the cap's ORIGINAL chord line is ≤ ``tol``; every candidate is
+    tested against that fixed line (never a drifting one), so outward runs (end-plane clamp
+    remnants beyond the corner) extend the cap and inward runs (overlap spikes doubling back
+    inside the cap span) square it, with the same test. A side always keeps ≥ 2 vertices and
+    never gives up its opposite endpoint. Returns ``(left, right, up_cap, down_cap)``."""
+    from math import hypot
+
+    from shapely.geometry import LineString
+
+    L = [tuple(c[:2]) for c in left.coords]
+    R = [tuple(c[:2]) for c in right.coords]
+    if len(L) < 2 or len(R) < 2:
+        return left, right, up_cap, down_cap               # degenerate input: hands off
+
+    UL, UR, DL, DR = L[0], R[0], L[-1], R[-1]
+
+    def _dist_fn(A, B):
+        """Perpendicular distance to the infinite line A→B (None for a ~zero-length chord)."""
+        ux, uy = B[0] - A[0], B[1] - A[1]
+        n = hypot(ux, uy)
+        if n < 1e-9:
+            return None
+        return lambda p: abs((p[0] - A[0]) * uy - (p[1] - A[1]) * ux) / n
+
+    d_up, d_dn = _dist_fn(UL, UR), _dist_fn(DL, DR)
+
+    def _run(P, dist):
+        """Length of the contiguous collinear run walking in from P[0] (the corner itself);
+        stops before the opposite endpoint so a side can never be consumed whole."""
+        if dist is None:
+            return 0
+        j = 0
+        while j + 1 <= len(P) - 2 and dist(P[j + 1]) <= tol:
+            j += 1
+        return j
+
+    def _trim(P):
+        a = _run(P, d_up)                     # lead run → absorbed into the up cap
+        b = _run(P[::-1], d_dn)               # tail run → absorbed into the down cap
+        while a + b > len(P) - 2:             # keep ≥ 2 vertices when both ends migrate
+            if a >= b:
+                a -= 1
+            else:
+                b -= 1
+        return P[a:len(P) - b]
+
+    L2, R2 = _trim(L), _trim(R)
+    up2, dn2 = LineString([L2[0], R2[0]]), LineString([L2[-1], R2[-1]])
+    if up2.length <= 0 or dn2.length <= 0:    # migrations collapsed a cap → straighten only
+        return left, right, LineString([UL, UR]), LineString([DL, DR])
+    return LineString(L2), LineString(R2), up2, dn2
+
+
 def _nverts(geom):
     """Vertex count of a Polygon ring / LineString (for the delineation readout)."""
     if geom is None or getattr(geom, "is_empty", True):
@@ -442,6 +503,18 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
     right_line = _maximize_floodplain(right_line, line)
     fpl_dropped = (n_l0 - _nverts(left_line)) + (n_r0 - _nverts(right_line))
 
+    # Straight caps + square corners: the caps become true 2-point chords (they are the RAS BC
+    # lines), and lead/tail side vertices collinear with a cap (end-plane clamp remnants,
+    # ring-slice jogs, overlap spikes) migrate into that cap so the floodplain lines are purely
+    # the sides. The returned "domain" stays the raw ribbon — no consumer reads it; the app
+    # always reassembles its domain from these four sides (geometry.assemble_domain_from_sides).
+    n_u0, n_d0 = _nverts(up_cap), _nverts(down_cap)
+    n_l1, n_r1 = _nverts(left_line), _nverts(right_line)
+    left_line, right_line, up_cap, down_cap = condition_boundary_sides(
+        left_line, right_line, up_cap, down_cap)
+    cap_dropped = (n_u0 - _nverts(up_cap)) + (n_d0 - _nverts(down_cap))
+    cap_migrated = (n_l1 - _nverts(left_line)) + (n_r1 - _nverts(right_line))
+
     # --- wetted extent (only when the app will actually use it) ---
     wse = (_wse_ribbon(dem, line, L, depth_bf=depth_bf, half=half, n_samp=n_samp,
                        chan_half=chan_half) if want_wse else None)
@@ -487,7 +560,9 @@ def auto_delineate(reach_geojson, dem_path, *, da_sqkm, lat=None, lon=None,
     }
     log(f"Delineated: {len(dleft)} domain XS, reach {L:.0f} m, "
         f"bankfull depth {depth_bf:.2f} m ({bf['division_name']}), X={x_mult}; "
-        f"floodplain simplification dropped {fpl_dropped} inward vertex(es).")
+        f"floodplain simplification dropped {fpl_dropped} inward vertex(es); "
+        f"caps straightened ({cap_dropped} bend vertex(es) removed, "
+        f"{cap_migrated} collinear side vertex(es) migrated into the caps).")
     return out
 
 

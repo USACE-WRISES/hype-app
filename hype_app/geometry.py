@@ -10,7 +10,7 @@ from math import cos, hypot, radians
 from typing import Iterable, Optional
 
 import geopandas as gpd
-from shapely.geometry import LineString, Polygon, mapping, shape
+from shapely.geometry import LineString, Point, Polygon, mapping, shape
 
 
 def features_to_gdf(features: Iterable[dict], crs="EPSG:4326") -> gpd.GeoDataFrame:
@@ -137,3 +137,49 @@ def corner_gaps_m(up, left, right, down) -> Optional[float]:
                    for pa in a_ends for pb in b_ends)
     return max(_gap(_ends("up"), _ends("left")), _gap(_ends("up"), _ends("right")),
                _gap(_ends("down"), _ends("left")), _gap(_ends("down"), _ends("right")))
+
+
+def reach_boundary_issues(reach, up, left, right, down, *, touch_tol_m=10.0) -> list:
+    """Soft validation of the reach centerline against the four boundary lines: flow enters and
+    leaves through the upstream/downstream boundaries, so the centerline must meet both of them
+    and must NOT intersect the left/right floodplain lines. Returns human-readable issue strings —
+    empty when everything passes OR when any input is missing (absence is reported elsewhere).
+
+    Same local equirectangular-metres approximation as ``corner_gaps_m`` (affine scaling preserves
+    the intersection predicates). Generation places each cap *through* a reach endpoint with up to
+    ~2 m of simplify/ring-projection slop, so "meets" is intersects OR a reach endpoint within
+    ``touch_tol_m`` — an exact predicate would be knife-edge on the touch. Min over both reach
+    endpoints, so the check doesn't depend on the stored reach orientation."""
+    rc = _coords_of(reach) if reach else []
+    if len(rc) < 2:
+        return []
+    coords = {}
+    for k, f in (("up", up), ("left", left), ("right", right), ("down", down)):
+        c = _coords_of(f) if f else []
+        if len(c) < 2:
+            return []
+        coords[k] = c
+    lat0 = rc[0][1]
+    kx = 111320.0 * cos(radians(lat0))       # metres per degree lon at this latitude
+    ky = 110540.0                            # metres per degree lat
+
+    def _m(pts):
+        return [(x * kx, y * ky) for x, y in pts]
+
+    reach_m = LineString(_m(rc))
+    lines = {k: LineString(_m(v)) for k, v in coords.items()}
+    ends = (Point(reach_m.coords[0]), Point(reach_m.coords[-1]))
+    issues = []
+    for k, label in (("up", "Upstream"), ("down", "Downstream")):
+        if reach_m.intersects(lines[k]):
+            continue                                       # crossing or touch — both count
+        gap = min(p.distance(lines[k]) for p in ends)
+        if gap > touch_tol_m:
+            issues.append(f"The reach centerline doesn't reach the {label} boundary "
+                          f"(gap ≈ {gap:.0f} m) — extend the centerline or move the boundary, "
+                          f"then regenerate.")
+    for k, label in (("left", "Left"), ("right", "Right")):
+        if reach_m.intersects(lines[k]):
+            issues.append(f"The reach centerline crosses the {label} floodplain boundary — "
+                          f"it should only cross the upstream/downstream lines.")
+    return issues
