@@ -7,7 +7,9 @@
      5. layer tree            11. 3D viewer (canvas · toolbar · view cube)
      6. properties pane       12. responsive guards
    z-index ladder: map 0 · 3D 500-513 · panels/readout 1100 · edit bar/band 1150 ·
-   stage bar 1190 · header 1200 · autocomplete 1300 · pick tooltip 1400.
+   stage bar 1190 · header 1200 · autocomplete 1300 · pick tooltip 1400 ·
+   modal backdrop 1490 / modal 1500 (Bootstrap ships 1050/1055, which would put
+   dialogs BEHIND the floating panels — the lift below is required).
    ========================================================================= */
 
 /* ============ 1. design tokens ============ */
@@ -85,6 +87,12 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   font: 600 var(--fs-0)/1 var(--font-body); letter-spacing: .07em; text-transform: uppercase;
   color: var(--hype-text-muted); }
 .hype-sec::after { content: ""; flex: 1; height: 1px; background: var(--hype-rule); }
+
+/* Bootstrap dialogs ship at 1050/1055 — below every floating panel (1100+), so a modal
+   ("Start a new project?", USGS flow, report) would open BEHIND the properties pane and
+   header. Lift them above the whole app ladder; notifications (Shiny, 99999) still win. */
+.modal-backdrop { z-index: 1490; }
+.modal { z-index: 1500; }
 
 /* ============ 3. header + stage bar ============ */
 .hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
