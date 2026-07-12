@@ -55,11 +55,47 @@ def ras_bundle_dir() -> Path:
     return _APP_ROOT / "bin" / "ras2025"
 
 
+def dedupe_arc_vertices(xy, cell_size: float):
+    """Drop interior polyline vertices closer than ~half a mesh cell to their kept neighbor.
+
+    The RAS mesher pins a mesh node at EVERY arc vertex; a boundary segment far shorter
+    than the cell size (the app's auto-generated floodplain lines can carry vertices <1 m
+    apart) produces a degenerate perimeter face and the 2025-alpha CPU solver dies at
+    initialization with a silent exit -1. Endpoints (the snapped shared corners) are
+    always preserved; sub-cell interior detail is unresolvable at cell_size anyway.
+    """
+    import numpy as np
+
+    xy = np.asarray(xy, dtype=np.float64)
+    if len(xy) <= 2:
+        return xy
+    min_seg = max(0.25, 0.5 * float(cell_size))
+    kept = [xy[0]]
+    for p in xy[1:-1]:
+        if float(np.hypot(*(p - kept[-1]))) >= min_seg:
+            kept.append(p)
+    while len(kept) > 1 and float(np.hypot(*(xy[-1] - kept[-1]))) < min_seg:
+        kept.pop()                       # interior vertex crowding the far endpoint
+    kept.append(xy[-1])
+    return np.asarray(kept, dtype=np.float64)
+
+
+def _win_ref_exe() -> Path | None:
+    """The git-ignored in-repo HEC-RAS 2025 dev install (Windows only), used when
+    HYPE_RAS_BIN is unset or points at a path that no longer exists (e.g. the repo
+    folder was renamed and an absolute HYPE_RAS_BIN went stale)."""
+    if not sys.platform.startswith("win"):
+        return None
+    exe = _APP_ROOT / "reference" / "HEC-RAS_2025" / "HEC-RAS 2025 Alpha" / "ras.exe"
+    return exe if exe.exists() else None
+
+
 def ras_cmd() -> tuple[list[str], dict]:
     """(argv prefix, env) for invoking the RAS CLI on this platform.
 
     HYPE_RAS_BIN may point at ras.exe itself or its folder (Windows dev — GDAL is found
-    automatically next to the exe). Otherwise the bundled linux-x64 runtime is used.
+    automatically next to the exe); if it is unset or stale, the in-repo reference/
+    install is tried on Windows. Otherwise the bundled linux-x64 runtime is used.
     """
     env = dict(os.environ)
     override = os.environ.get("HYPE_RAS_BIN")
@@ -67,7 +103,15 @@ def ras_cmd() -> tuple[list[str], dict]:
         exe = Path(override)
         if exe.is_dir():
             exe = exe / ("ras.exe" if sys.platform.startswith("win") else "ras")
-        return [str(exe)], env
+        if exe.exists():
+            return [str(exe)], env
+        fallback = _win_ref_exe()
+        if fallback is not None:
+            return [str(fallback)], env
+        return [str(exe)], env      # stale + no fallback: keep old argv (gated by ras_available)
+    fallback = _win_ref_exe()
+    if fallback is not None:
+        return [str(fallback)], env
 
     bundle = ras_bundle_dir()
     dotnet = bundle / "dotnet" / "dotnet"
@@ -133,14 +177,17 @@ def prepare_linux_bundle() -> None:
 
 
 def ras_available() -> bool:
-    """Is a RAS CLI plausibly runnable here (dev override or bundled runtime present)?"""
+    """Is a RAS CLI plausibly runnable here (dev override, in-repo dev install, or
+    bundled runtime present)?"""
     override = os.environ.get("HYPE_RAS_BIN")
     if override:
         p = Path(override)
-        return (p / "ras.exe").exists() if p.is_dir() else p.exists()
+        if (p / "ras.exe").exists() if p.is_dir() else p.exists():
+            return True
+        return _win_ref_exe() is not None       # stale override -> in-repo dev install
     if sys.platform.startswith("win"):
-        return False    # the bundled runtime's dotnet host is a linux-x64 ELF — Windows
-    #                     needs HYPE_RAS_BIN pointing at a HEC-RAS 2025 install
+        return _win_ref_exe() is not None   # the bundled runtime's dotnet host is a
+    #                     linux-x64 ELF — Windows needs a real HEC-RAS 2025 install
     return (ras_bundle_dir() / "app" / "ras.dll").exists()
 
 
@@ -429,11 +476,17 @@ def run_surface_model(payload: dict, log=print, cancel_evt=None, proc_holder=Non
         x, y = tr.transform(cs[:, 0], cs[:, 1])
         return np.column_stack([x, y])
 
-    sides_xy = {k: _xy(payload[k]) for k in ("up", "left", "right", "down")}
+    cell_size = float(payload["cell_size_m"])
+    raw_xy = {k: _xy(payload[k]) for k in ("up", "left", "right", "down")}
+    sides_xy = {k: dedupe_arc_vertices(v, cell_size) for k, v in raw_xy.items()}
+    dropped = sum(len(raw_xy[k]) - len(sides_xy[k]) for k in raw_xy)
+    if dropped:
+        log(f"Boundary conditioning: dropped {dropped} sub-cell vertices "
+            f"(min spacing {max(0.25, 0.5 * cell_size):g} m) to keep the mesh solver stable")
     wkt = crs.to_wkt("WKT1_GDAL")
     duration_s = float(payload["duration_hr"]) * 3600.0
 
-    topo = ras_h5.write_geometry_topology(geometry_h5, sides_xy, float(payload["cell_size_m"]))
+    topo = ras_h5.write_geometry_topology(geometry_h5, sides_xy, cell_size)
     log(f"Topology written: arc cells {topo['arc_cell_counts']}, "
         f"{topo['n_internal_points']} interior vertices")
     ras_h5.write_bc_lines(bc_h5, up_xy=sides_xy["up"], down_xy=sides_xy["down"],
@@ -592,8 +645,9 @@ def build_mesh_preview(payload: dict, log=print, cancel_evt=None, proc_holder=No
         x, y = tr.transform(cs[:, 0], cs[:, 1])
         return np.column_stack([x, y])
 
-    sides_xy = {k: _xy(payload[k]) for k in ("up", "left", "right", "down")}
     cell = float(payload["cell_size_m"])
+    sides_xy = {k: dedupe_arc_vertices(_xy(payload[k]), cell)
+                for k in ("up", "left", "right", "down")}
     ras_h5.write_geometry_topology(geometry_h5, sides_xy, cell)
     _run_ras(["mesh", "--source", str(geometry_h5)],
              cwd=proj, env=None, log=log, cancel_evt=cancel_evt, proc_holder=proc_holder,

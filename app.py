@@ -3580,7 +3580,7 @@ def server(input, output, session):
         basemap (unlike hype3d_clear, which _reset uses)."""
         for k in keys:
             await session.send_custom_message(
-                "hype3d_layer", {"key": k, "kind": "lines3d", "polylines": []})
+                "hype3d_layer", {"key": k, "kind": "lines3d", "data": {"polylines": []}})
 
     async def _cascade_clear(stage, *, include_self=False):
         """Clear a pipeline stage's outputs and everything downstream. Order: bnd -> sw -> gw -> hz
