@@ -36,7 +36,9 @@ class GradientQualitative(str, Enum):
     strongly_losing = "strongly_losing"
 
 
-# LOCKED (§3.4): category center = multiplier × reference slope. Do not reopen.
+# Default scale (§3.4): category center = multiplier × reference slope. Since 2026-07 the UI
+# may override the slight/strong magnitudes (from_qualitative(slight=…, strong=…)); these
+# defaults reproduce the original locked scale.
 QUALITATIVE_MULTIPLIER: dict[GradientQualitative, float] = {
     GradientQualitative.strongly_gaining: +1.0,
     GradientQualitative.slightly_gaining: +0.5,
@@ -134,10 +136,20 @@ class GradientBoundaryConfigV2(HypeModel):
     @classmethod
     def from_qualitative(cls, *, left: GradientQualitative, right: GradientQualitative,
                          reference_slope: ReferenceSlope,
-                         provenance: Provenance | None = None) -> "GradientBoundaryConfigV2":
-        """Build a uniform-per-side config from qualitative categories (§3.4 locked multipliers)."""
+                         provenance: Provenance | None = None,
+                         slight: float = 0.5, strong: float = 1.0) -> "GradientBoundaryConfigV2":
+        """Build a uniform-per-side config from qualitative categories (§3.4 multipliers).
+
+        `slight`/`strong` set the multiplier magnitudes (symmetric for gaining/losing); the
+        defaults reproduce the original locked ±0.5/±1.0 scale."""
+        mult = {GradientQualitative.strongly_gaining: +float(strong),
+                GradientQualitative.slightly_gaining: +float(slight),
+                GradientQualitative.neutral: 0.0,
+                GradientQualitative.slightly_losing: -float(slight),
+                GradientQualitative.strongly_losing: -float(strong)}
+
         def _controls(side: Side, cat: GradientQualitative) -> list[GradientControl]:
-            g = QUALITATIVE_MULTIPLIER[cat] * reference_slope.value
+            g = mult[cat] * reference_slope.value
             return [GradientControl(id=f"{side.value}-{s:g}", side=side, station=s,
                                     preferred=g, source="qualitative", provenance=provenance)
                     for s in (0.0, 1.0)]

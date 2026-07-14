@@ -191,6 +191,34 @@ def qualitative_neighbors(cat: GradientQualitative) -> tuple[GradientQualitative
     return _QUAL_ORDER[max(0, i - 1)], _QUAL_ORDER[min(len(_QUAL_ORDER) - 1, i + 1)]
 
 
+def signed_multiplier(cat: GradientQualitative, *, slight: float = 0.5,
+                      strong: float = 1.0) -> float:
+    """Signed multiplier for a category on a (possibly user-overridden) slight/strong scale.
+    Defaults reproduce QUALITATIVE_MULTIPLIER; magnitudes apply symmetrically to gaining/losing."""
+    return {GradientQualitative.strongly_gaining: +float(strong),
+            GradientQualitative.slightly_gaining: +float(slight),
+            GradientQualitative.neutral: 0.0,
+            GradientQualitative.slightly_losing: -float(slight),
+            GradientQualitative.strongly_losing: -float(strong)}[cat]
+
+
+def apply_default_bounds(controls: list[GradientControl], *, ref_slope_value=None,
+                         slight: float = 0.5) -> list[GradientControl]:
+    """Fill missing lower/upper sensitivity bounds on gradient-point controls (§10.1 default):
+    ± slight × reference slope when a slope is available, else ±50% of the control's own
+    gradient. Explicit bounds are preserved; a zero gradient with no slope leaves the bounds
+    unset (the sensitivity manifest then collapses and the app explains why)."""
+    out = []
+    for c in controls:
+        if c.lower is not None or c.upper is not None:
+            out.append(c)
+            continue
+        d = float(slight) * float(ref_slope_value) if ref_slope_value else 0.5 * abs(c.preferred)
+        out.append(c if d <= 0 else c.model_copy(update={"lower": c.preferred - d,
+                                                         "upper": c.preferred + d}))
+    return out
+
+
 def config_from_legacy_corners(corner_gradients: dict, *, side: Side) -> list[GradientControl]:
     """Upgrade a legacy 4-corner config to structured controls for one side (§7.7 upgrade preview).
 
@@ -208,8 +236,54 @@ def config_from_legacy_corners(corner_gradients: dict, *, side: Side) -> list[Gr
                             source="legacy_upgrade")]
 
 
+def migrate_kept_gradients(kept: dict, saved_pts) -> list[dict]:
+    """Upgrade a pre-points project's kept inputs to the gradient-points model.
+
+    Mutates `kept` in place and returns the intermediate-point records
+    (``{"id","side","station","gradient"[,"lower","upper"]}``):
+    - kept ``bc_mode == "4 Corner Gradients"`` becomes the points mode (the corner numerics
+      g_ul/g_ur/g_dl/g_dr already hold the corner gradients — a lossless migration);
+    - legacy structured text (g_left_ctl/g_right_ctl) maps stations 0/1 onto the corner
+      numerics and interior stations onto point records (explicit bounds preserved);
+    - a saved ``grad_pts`` list always wins over legacy text; unparseable text is ignored
+      (the corners keep whatever the kept dict already holds).
+    """
+    import uuid
+
+    if kept.get("bc_mode") == "4 Corner Gradients":
+        kept["bc_mode"] = "Spatially Varying Gradient"
+    pts = [dict(p) for p in (saved_pts or []) if isinstance(p, dict)]
+    if pts:
+        return pts
+    for side, key, k0, k1 in (("left", "g_left_ctl", "g_ul", "g_dl"),
+                              ("right", "g_right_ctl", "g_ur", "g_dr")):
+        txt = kept.get(key)
+        if not txt:
+            continue
+        try:
+            controls = parse_control_lines(str(txt), Side(side))
+        except Exception:  # noqa: BLE001 — parse or pydantic validation errors
+            continue
+        for c in controls:
+            if c.station <= 1e-6:
+                kept[k0] = float(c.preferred)
+            elif c.station >= 1.0 - 1e-6:
+                kept[k1] = float(c.preferred)
+            else:
+                rec = {"id": uuid.uuid4().hex[:8], "side": side,
+                       "station": float(c.station), "gradient": float(c.preferred)}
+                if c.lower is not None:
+                    rec["lower"] = float(c.lower)
+                if c.upper is not None:
+                    rec["upper"] = float(c.upper)
+                pts.append(rec)
+    pts.sort(key=lambda p: (p["side"], p["station"]))
+    return pts
+
+
 __all__ = [
     "anchor_head", "ControlGeometry", "interpolate_to_stations", "realized_side_heads",
     "reference_slope_from_samples", "validate_config", "config_from_legacy_corners",
     "parse_control_lines", "serialize_profile", "qualitative_neighbors",
+    "signed_multiplier", "apply_default_bounds", "migrate_kept_gradients",
 ]

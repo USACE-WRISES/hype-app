@@ -1812,7 +1812,9 @@ def export_hydraulic_head_layers(*, cfg, gwf, log=print) -> dict:
                 dst.write(arr, 1)
             geotiffs.append(str(tif))
         out["geotiffs"] = geotiffs
-        print(f"Wrote {len(geotiffs)} head GeoTIFFs → {tifs_dir}")
+        # ASCII arrow: the spawned child's stdout is cp1252 on Windows — a Unicode arrow makes
+        # THIS success print raise, and the except turns it into a bogus "[WARN] Could not write"
+        print(f"Wrote {len(geotiffs)} head GeoTIFFs -> {tifs_dir}")
     except Exception as e:
         print(f"[WARN] Could not write head GeoTIFFs: {e}")
 
@@ -2049,7 +2051,7 @@ def parse(name):
                 v[:, :, :] = data
 
             out["netcdf"] = str(nc_path)
-            print(f"Wrote netCDF head cube → {nc_path}")
+            print(f"Wrote netCDF head cube -> {nc_path}")   # ASCII: cp1252 child stdout (Windows)
         except Exception as e:
             print(f"[WARN] netCDF export skipped: {e}")
     else:

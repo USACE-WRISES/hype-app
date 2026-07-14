@@ -627,8 +627,10 @@ def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[f
     """Minimum finite DEM elevation sampled along a LineString Feature (EPSG:4326).
 
     Used to pick the streambed (thalweg) elevation where a boundary cap crosses the channel: sample
-    the (carved) terrain along the upstream/downstream boundary line and take the min. Returns None
-    when the geometry is empty or nothing valid samples.
+    the (carved) terrain along the upstream/downstream boundary line and take the min. Also samples
+    WSE rasters (reference-slope reporting), so values <= -1000 m are treated as undeclared nodata
+    sentinels (-9999 uploads) — no terrestrial elevation goes that low. Returns None when the
+    geometry is empty or nothing valid samples.
     """
     import numpy as np
     import rasterio
@@ -650,6 +652,7 @@ def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[f
         nod = src.nodata
     if nod is not None:
         vals = np.where(vals == nod, np.nan, vals)
+    vals = np.where(vals <= -1000.0, np.nan, vals)   # undeclared sentinels (e.g. -9999 uploads)
     vals = vals[np.isfinite(vals)]
     if not vals.size:
         return None

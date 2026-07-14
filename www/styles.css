@@ -464,6 +464,21 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
    and without it the 1fr tracks refuse to shrink and force the pane to scroll sideways. */
 .hype-field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--sp-2); }
 .hype-field-row > * { min-width: 0; }
+
+/* Gradient points (Groundwater hub, points mode): point rows, corner grid, heads table */
+.hype-gpt-row { display: flex; align-items: center; gap: var(--sp-2); margin: 2px 0; }
+.hype-gpt-row .form-group, .hype-gpt-row .shiny-input-container { margin-bottom: 0; }
+.hype-gpt-tag { min-width: 84px; font-size: var(--fs-0); opacity: 0.8; }
+.hype-gpt-rm { border: 0; background: none; font-size: 15px; line-height: 1;
+  padding: 2px 6px; cursor: pointer; opacity: 0.6; }
+.hype-gpt-rm:hover { color: #d83933; opacity: 1; }
+.hype-gpt-add { margin-top: 6px; }
+.hype-gpt-corners .form-group { margin-bottom: 6px; }
+.hype-gpt-table { font-size: var(--fs-0); margin: 6px 0 2px; width: auto; }
+.hype-gpt-table td, .hype-gpt-table th { padding: 2px 10px 2px 0; }
+.hype-link { border: 0; background: none; padding: 0 4px; color: var(--hype-accent);
+  cursor: pointer; font-size: var(--fs-0); text-decoration: underline; }
+.hype-dim { opacity: 0.75; }
 /* input + trailing inline adornment (info tip) on one row */
 .hype-field-inline { display: flex; align-items: flex-end; gap: 8px; }
 .hype-field-inline > .shiny-input-container { flex: 1; }
@@ -579,6 +594,13 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
    leaflet icon WRAPPER isn't) — and an invisible (visible=False → opacity 0) label would
    otherwise ghost-block clicks on the line beneath it */
 .hype-map-wrap .leaflet-marker-icon:has(.hype-map-label) { pointer-events: none; }
+
+/* gradient-point arrowheads (Groundwater hub): rotated ▲ at the WSE cell each point's head
+   anchors to; transform (translate + rotate) is set inline per marker. Same non-interactive
+   discipline as the label pills — the wrapper must not eat clicks on the boundary lines. */
+.hype-grad-head { display: inline-block; font-size: 13px; line-height: 1;
+  text-shadow: 0 0 2px #fff, 0 0 3px #fff; pointer-events: none; }
+.hype-map-wrap .leaflet-marker-icon:has(.hype-grad-head) { pointer-events: none; }
 
 /* raster overlays (hillshade, WSE/depth/head PNGs) are pure display — their <img> nodes
    must never swallow clicks meant for the vector lines (or the map) beneath them */

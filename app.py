@@ -124,15 +124,16 @@ HZ_STEPS = {0: "Preparing…", 1: "Loading the flow solution", 2: "Seeding parti
             7: "Writing artifacts"}
 HZ_MAX_PARTICLES = int(os.environ.get("HYPE_HZ_MAX_PARTICLES", "2000000"))
 
-BC_CORNER = "4 Corner Gradients"
+BC_CORNER = "4 Corner Gradients"   # legacy value: no UI mode anymore; restores migrate to points
 BC_PROFILE = "Spatially Varying Gradient"
 BC_QUAL = "Qualitative"          # app-side only: category × reference slope -> profile strings
-# Locked qualitative categories (revision §3.4): multiplier × reference slope.
-_QUAL_CHOICES = {"strongly_gaining": "Strongly gaining (+1.0 × slope)",
-                 "slightly_gaining": "Slightly gaining (+0.5 × slope)",
-                 "neutral": "Neutral (0)",
-                 "slightly_losing": "Slightly losing (−0.5 × slope)",
-                 "strongly_losing": "Strongly losing (−1.0 × slope)"}
+# Qualitative categories (revision §3.4): signed multiplier × reference slope; the slight/strong
+# magnitudes are editable in the pane (defaults 0.5/1.0), so the labels stay scale-free.
+_QUAL_CHOICES = {"strongly_gaining": "Strongly gaining",
+                 "slightly_gaining": "Slightly gaining",
+                 "neutral": "Neutral",
+                 "slightly_losing": "Slightly losing",
+                 "strongly_losing": "Strongly losing"}
 
 # Progress labels keyed by the driver's "STEP N" log markers (the headless run emits 2–7).
 RUN_TOTAL = 7
@@ -247,16 +248,18 @@ def server(input, output, session):
 
     @reactive.effect
     def _auto_view_mode():
-        # Preserve the old Mesh-step UX: entering the Model-grid context flips to 3D, leaving
-        # flips back — the header toggle overrides either way until the next crossing.
-        step = current_step()
-        prev = _map_ui.get("view_step")
-        _map_ui["view_step"] = step
-        if prev == step:
+        # Preserve the old Mesh-step UX for the Model-grid NODE only: selecting gw.mesh flips to
+        # 3D, leaving flips back — the header toggle overrides either way until the next crossing.
+        # The Groundwater hub shares STEP_MESH but stays on the 2-D map: its boundary-condition
+        # gradient points are placed by clicking the boundary lines there.
+        want3d = current_step() == STEP_MESH and sel_node() == "gw.mesh"
+        prev = _map_ui.get("view_want3d")
+        _map_ui["view_want3d"] = want3d
+        if prev == want3d:
             return
-        if step == STEP_MESH:
+        if want3d:
             view_mode_v.set("3d")
-        elif prev == STEP_MESH:
+        elif prev:                     # crossed OUT of the 3-D context (not the first run)
             view_mode_v.set("2d")
 
     @reactive.effect
@@ -287,6 +290,12 @@ def server(input, output, session):
     bnd_slot = reactive.value(None)        # boundary being drawn/edited: up|left|right|down|wse|None
     bnd_commit = reactive.value(0)         # ++ to ask the client to Save the active edit (legend Save)
     kz_adding = reactive.value(False)      # True while a guided "Add K-zone" polygon draw is armed
+    grad_pts = reactive.value([])          # intermediate gradient points on the L/R boundary lines:
+    #                                        [{"id","side","station","gradient"[,"lower","upper"]}]
+    #                                        (stations 0/1 = the corner numerics; project-state key)
+    grad_ver = reactive.value(0)           # ++ on in-place gradient edits (heads recompute without
+    #                                        remounting the per-point numeric being typed in)
+    grad_adding = reactive.value(None)     # None|"left"|"right" — armed "add gradient point" click
     mesh_geom = reactive.value(None)       # last computed 3D mesh geometry (for status + viewer)
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
@@ -308,6 +317,7 @@ def server(input, output, session):
     carve_meta = reactive.value(None)      # {path, diff_path, cells_cut, max_cut_m}
     _stale_marks = reactive.value(frozenset())  # {"sw","gw"} whose results predate a carve/revert
     origin_override = reactive.value(None)  # user-set Model Origin (streambed elev, m); None = computed default
+    ref_slope_override = reactive.value(None)  # user-set Reference slope (m/m); None = track auto
 
     @reactive.calc
     def active_dem():
@@ -670,11 +680,114 @@ def server(input, output, session):
 
     @reactive.effect
     def _reset_origin_on_reach_cleared():
-        # New run / clear / redraw all null the reach → drop any stale streambed override so the
-        # default recomputes for the new reach. (An in-place boundary edit keeps the reach, and the
-        # override, per "persist until the app is closed or they select a new run".)
+        # New run / clear / redraw all null the reach → drop any stale streambed/reference-slope
+        # override so the defaults recompute for the new reach. (An in-place boundary edit keeps
+        # the reach, and the overrides, per "persist until the app is closed or a new run".)
         if reach_feat() is None:
             origin_override.set(None)
+            ref_slope_override.set(None)
+
+    # ---- reference slope: centerline-length method + manual override (revision 2026-07) ----
+    @reactive.calc
+    def wse_preview_path():
+        """The WSE raster previews sample (slopes + gradient-point heads). _wse_path() COPIES
+        uploads and WRITES the wetted-extent clip as side effects, so it must only run inside
+        this cached calc — recomputing only when its real inputs change (idempotent paths)."""
+        try:
+            return _wse_path()
+        except Exception:  # noqa: BLE001
+            return None
+
+    @reactive.calc
+    def reach_len_live_m():
+        """Length (m) of the LIVE drawn centerline. The slope denominators must track the current
+        line, so no snapshot fallback here (unlike _reach_length_m, which prefers the frozen run)."""
+        try:
+            crs = proj_crs()
+            gdf = geometry.single_feature_gdf(reach_feat())
+            if crs is None or gdf is None or not len(gdf):
+                return None
+            length = float(gdf.to_crs(crs).length.iloc[0])
+            return length if length > 0 else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @reactive.calc
+    def dem_slope_centerline():
+        """Average DEM slope along the reach: (min terrain touching the upstream cap − touching
+        the downstream cap) / drawn centerline length."""
+        from hype_app import gradients as grad_mod
+        se, length = streambed_elevs(), reach_len_live_m()
+        if not se or length is None or se.get("up") is None or se.get("down") is None:
+            return None
+        return grad_mod.reference_slope_from_samples(
+            se["up"], se["down"], length, source="dem_drop",
+            method="min DEM at caps / centerline length")
+
+    @reactive.calc
+    def wse_cap_elevs():
+        """Min WSE-raster value touching each boundary cap → {"up","down"} in m, or None."""
+        build, p = _domain_build(), wse_preview_path()
+        if not build or not p:
+            return None
+        up = delineate.min_elevation_along_line(build["up"], p)
+        down = delineate.min_elevation_along_line(build["down"], p)
+        if up is None or down is None:
+            return None
+        return {"up": up, "down": down}
+
+    @reactive.calc
+    def wse_slope_centerline():
+        """Water-surface slope along the reach: (WSE touching the upstream cap − touching the
+        downstream cap) / drawn centerline length."""
+        from hype_app import gradients as grad_mod
+        we, length = wse_cap_elevs(), reach_len_live_m()
+        if not we or length is None:
+            return None
+        return grad_mod.reference_slope_from_samples(
+            we["up"], we["down"], length, source="wse_raster",
+            method="min WSE at caps / centerline length")
+
+    @reactive.calc
+    def ref_slope_auto():
+        """Auto reference slope: the water-surface slope when a WSE exists, else the DEM slope
+        (§7.4 priority, both on the centerline-length method). None = flat/adverse/nothing yet."""
+        return wse_slope_centerline() or dem_slope_centerline()
+
+    @reactive.effect
+    @reactive.event(input.g_ref_slope, ignore_init=True)
+    def _capture_ref_slope():
+        """Persist a user edit to the Reference slope (the model_origin pattern). A value equal to
+        the auto slope — the programmatic prefill, or the user typing it back — clears the override
+        so the field tracks auto again; comparisons use the same round(…, 6) the updates send."""
+        try:
+            v = float(input.g_ref_slope())
+        except Exception:  # noqa: BLE001 — input absent until the pane mounts
+            return
+        with reactive.isolate():
+            a = ref_slope_auto()
+            cur = ref_slope_override()
+        if a is not None and abs(v - round(a.value, 6)) < 1e-12:
+            if cur is not None:
+                ref_slope_override.set(None)
+        elif v > 0 and cur != v:
+            ref_slope_override.set(v)
+
+    @reactive.effect
+    def _track_ref_slope_auto():
+        # Keep the numeric showing the LIVE auto value while no override is set (no-op when the
+        # pane is unmounted). Sends round(…, 6) so _capture_ref_slope recognizes it as auto.
+        a = ref_slope_auto()
+        if a is not None and ref_slope_override() is None:
+            ui.update_numeric("g_ref_slope", value=round(a.value, 6))
+
+    @reactive.effect
+    @reactive.event(input.g_ref_auto_evt)
+    def _reset_ref_slope():
+        ref_slope_override.set(None)
+        a = ref_slope_auto()
+        if a is not None:
+            ui.update_numeric("g_ref_slope", value=round(a.value, 6))
 
     def _domain_gdf_4326():
         f = domain_feat()
@@ -766,8 +879,8 @@ def server(input, output, session):
 
     def _mk_mirror_click(nid):
         def _h(**kw):
-            with reactive.isolate():        # widget callback: never while a draw/edit is live
-                if bnd_slot() is not None or kz_adding():
+            with reactive.isolate():        # widget callback: never while a draw/edit/add is live
+                if bnd_slot() is not None or kz_adding() or grad_adding():
                     return
                 if current_step() == STEP_REACH and reach_feat() is None:
                     return                  # clicks are point picks / draw vertices until traced
@@ -930,6 +1043,63 @@ def server(input, output, session):
                 except Exception:  # noqa: BLE001
                     pass
             _set_layer(key, _label_marker(pt, text, color))
+
+    def _grad_overlay_children(rows):
+        """LayerGroup children for the gradient-point overlay: per point a side-colored glyph, a
+        dashed shaft to the WSE cell whose value anchors its head (rotated ▲ at the cell), and a
+        head-value pill. Rows come from grad_point_heads()."""
+        import math
+        feats, marks = [], []
+        for r in rows:
+            color = LEFT_STYLE["color"] if r["side"] == "left" else RIGHT_STYLE["color"]
+            plon, plat = r["pt"]
+            feats.append({"type": "Feature",
+                          "properties": {"hz_lyr": "grad_pts",
+                                         "style": {"color": color, "fillColor": color,
+                                                   "weight": 2, "fillOpacity": 0.9}},
+                          "geometry": {"type": "Point", "coordinates": [plon, plat]}})
+            if r.get("edge") is not None:
+                elon, elat = r["edge"]
+                feats.append({"type": "Feature",
+                              "properties": {"hz_lyr": "grad_pts",
+                                             "style": {"color": color, "weight": 1.5,
+                                                       "opacity": 0.85, "dashArray": "4 3"}},
+                              "geometry": {"type": "LineString",
+                                           "coordinates": [[plon, plat], [elon, elat]]}})
+                # ▲ points north at 0°; rotate(90−θ) aims it along the shaft bearing
+                ang = math.degrees(math.atan2(
+                    elat - plat, (elon - plon) * math.cos(math.radians(plat))))
+                marks.append(Marker(location=(elat, elon), draggable=False, icon=DivIcon(
+                    html=(f'<div class="hype-grad-head" style="color:{color};'
+                          f'transform:translate(-50%,-50%) rotate({90.0 - ang:.0f}deg)">▲</div>'),
+                    icon_size=[0, 0], icon_anchor=[0, 0])))
+            txt = "h —" if r.get("head") is None else f"h {r['head']:.2f} m"
+            marks.append(_label_marker((plat, plon), txt, color))
+        gj = GeoJSON(data={"type": "FeatureCollection", "features": feats},
+                     point_style={"radius": 4, "weight": 2, "fillOpacity": 0.9},
+                     name="Gradient points")
+        return (gj, *marks)
+
+    @reactive.effect
+    def _sync_grad_overlay():
+        # Gradient-point overlay (points mode on the Groundwater hub only): ONE LayerGroup under
+        # "grad_pts" added once via _set_layer, then children swapped by assigning grp.layers —
+        # group-internal mutation, never bursty map add/removes (the ipyleaflet drop gotcha).
+        # Hidden state = empty children. Not tree-checkbox wired: mode+node scoping IS the story.
+        if not _HAS_MAP:
+            return
+        on = sel_node() == "gw" and str(_safe("bc_mode", BC_QUAL)) == BC_PROFILE
+        rows = grad_point_heads() if on else []
+        grp = _layers.get("grad_pts")
+        if not rows:
+            if isinstance(grp, LayerGroup) and grp.layers:
+                grp.layers = ()
+            return
+        kids = _grad_overlay_children(rows)
+        if isinstance(grp, LayerGroup):
+            grp.layers = kids
+        else:
+            _set_layer("grad_pts", LayerGroup(layers=kids, name="Gradient points"))
 
     def _render_boundaries(active):
         """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
@@ -1968,26 +2138,20 @@ def server(input, output, session):
             nper=1, nstp=1, perlen=1.0, tsmult=1.0, sim_name="hyporheic",
             boundary_condition_mode=bc,
         )
-        if bc in (BC_QUAL, BC_PROFILE):
-            # Structured/qualitative controls serialize losslessly onto the engine's
-            # spatially-varying path (§7.5 head-anchor method). A parse error here falls
-            # back to a flat default; _start_run re-validates and blocks with the message.
-            from hype_app import gradients as grad_mod
-            base["boundary_condition_mode"] = BC_PROFILE     # the engine's mode name
-            try:
-                cfg = _gradient_config()
-                base["left_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.left_controls)
-                base["right_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.right_controls)
-            except Exception:  # noqa: BLE001
-                base["left_boundary_gradient_profile"] = "0,0.005 1,0.005"
-                base["right_boundary_gradient_profile"] = "0,0.005 1,0.005"
-        else:
-            base.update(
-                upstream_left_fpl_gw_gradient=float(_safe("g_ul", 0.005)),
-                upstream_right_fpl_gw_gradient=float(_safe("g_ur", 0.005)),
-                downstream_left_fpl_gw_gradient=float(_safe("g_dl", 0.005)),
-                downstream_right_fpl_gw_gradient=float(_safe("g_dr", 0.005)),
-            )
+        # Qualitative and gradient-points controls both serialize losslessly onto the engine's
+        # spatially-varying path (§7.5 head-anchor method: anchor head per station, linear head
+        # interpolation between). A config error here falls back to a flat default; _start_run
+        # re-validates and blocks with the message. (The legacy 4-corner mode is gone — a stale
+        # kept value rides the points branch on the same corner numerics.)
+        from hype_app import gradients as grad_mod
+        base["boundary_condition_mode"] = BC_PROFILE     # the engine's mode name
+        try:
+            cfg = _gradient_config()
+            base["left_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.left_controls)
+            base["right_boundary_gradient_profile"] = grad_mod.serialize_profile(cfg.right_controls)
+        except Exception:  # noqa: BLE001
+            base["left_boundary_gradient_profile"] = "0,0.005 1,0.005"
+            base["right_boundary_gradient_profile"] = "0,0.005 1,0.005"
         return base
 
     @reactive.calc
@@ -2202,8 +2366,9 @@ def server(input, output, session):
     _kept_ts: dict = {}        # monotonic of each id's last real change (vs _restore_stamp)
     _restore_stamp: dict = {}  # {"t": monotonic} of the last Open — see _safe's staleness rule
     _KEEP_IDS = ("address", "manual_da", "dem_res", "fp_mult", "bc_mode",
-                 "g_ul", "g_ur", "g_dl", "g_dr", "g_left_profile", "g_right_profile",
-                 "g_qual_left", "g_qual_right", "g_ref_slope", "g_left_ctl", "g_right_ctl",
+                 "g_ul", "g_ur", "g_dl", "g_dr",
+                 "g_qual_left", "g_qual_right", "g_ref_slope",
+                 "g_mult_slight", "g_mult_strong",
                  "usgs_region", "usgs_lat", "usgs_lon", "usgs_national",
                  "soil_policy", "use_soil_k", "sens_design",
                  "site_name", "site_analyst", "site_org", "site_date", "site_notes",
@@ -2980,16 +3145,18 @@ def server(input, output, session):
             ui.notification_show(f"Fix the boundary gradients first: {ge}", type="warning",
                                  duration=8)
             return
-        if gcfg is None:
-            ui.notification_show("Sensitivity uses the structured/qualitative gradient modes — "
-                                 "switch the boundary condition off the legacy corner mode.",
-                                 type="warning", duration=8)
-            return
         from hype_app import gradients as grad_mod
         from hype_app import sensitivity as sens_mod
         from hype_app.contracts import GeneratorType
         gen = GeneratorType(str(_safe("sens_design", "linked")))
         manifest = sens_mod.build_manifest(gcfg, gen)
+        if len(manifest.scenarios) < 2:
+            # all lower/upper bounds collapsed onto the preferred gradients (zero gradients with
+            # no reference slope) — the variants dedupe away and the run would prove nothing
+            ui.notification_show("Sensitivity would only re-run the preferred gradients — no "
+                                 "usable lower/upper variation (zero gradients and no reference "
+                                 "slope).", type="warning", duration=8)
+            return
         scen_payloads = [{
             "id": s.id, "label": s.label, "is_preferred": s.is_preferred,
             "left_profile": grad_mod.serialize_profile(s.gradients.left_controls),
@@ -3117,6 +3284,10 @@ def server(input, output, session):
                              "crossed": "Left × right crossed (9 scenarios)",
                              "one_at_a_time": "One control at a time"},
                             selected=str(_keep("sens_design", "linked"))),
+            ui.div(("Bounds: one qualitative category step each way on the current multiplier "
+                    "scale." if str(_safe("bc_mode", BC_QUAL)) == BC_QUAL else
+                    "Bounds: ± Slight × reference slope per gradient point (±50% of the "
+                    "gradient when no slope is available)."), class_="hype-instr"),
         ]
         if running:
             _ = sens_log_tick()
@@ -3172,103 +3343,243 @@ def server(input, output, session):
     # Structured / qualitative gradients (revision §7): config + reference slope
     # ------------------------------------------------------------------
     def _reference_slope():
-        """ReferenceSlope with the §7.4 priority: modeled WSE raster → DEM drop → manual.
-        Returns None when nothing usable (flat/adverse) — the UI then requires manual input."""
+        """ReferenceSlope for qualitative categories: the user's override when set, else the auto
+        centerline-method slope (water-surface first, DEM fallback — ref_slope_auto). None when
+        neither exists (flat/adverse and nothing typed)."""
         from hype_app import gradients as grad_mod
-        build = _domain_build()
-        rr = ras_result()
-        if build and rr and rr.get("wse_tif") and Path(rr["wse_tif"]).is_file():
-            try:
-                s = ras_engine.default_friction_slope(rr["wse_tif"], build["up"], build["down"])
-                if s and s > 0:
-                    return grad_mod.ReferenceSlope(value=float(s), source="wse_raster",
-                                                   method="cap-line sample over reach distance")
-            except Exception:  # noqa: BLE001
-                pass
-        s = ras_slope_default()
-        if s and s > 0:
-            return grad_mod.ReferenceSlope(value=float(s), source="dem_drop",
-                                           method="cap-line sample over reach distance")
-        manual = _safe("g_ref_slope", None)
-        if manual and float(manual) > 0:
-            return grad_mod.ReferenceSlope(value=float(manual), source="manual")
-        return None
+        ov = ref_slope_override()
+        if ov is not None and float(ov) > 0:
+            return grad_mod.ReferenceSlope(value=float(ov), source="manual",
+                                           method="user override")
+        return ref_slope_auto()
+
+    def _points_controls(side):
+        """GradientControls for one side of the points mode: the corner numerics are the mandatory
+        station-0/1 controls, plus the intermediate map points. Where a point carries no explicit
+        bounds, default sensitivity bounds = ± slight × reference slope (else ±50% of the
+        gradient; a zero gradient with no slope leaves the bounds unset)."""
+        from hype_app import gradients as grad_mod
+        from hype_app.contracts import GradientControl
+        grad_ver()                                   # in-place gradient edits invalidate too
+        k0, k1 = ("g_ul", "g_dl") if side.value == "left" else ("g_ur", "g_dr")
+        ctls = [GradientControl(id=f"{side.value}-0", side=side, station=0.0,
+                                preferred=float(_safe(k0, 0.005)), source="manual"),
+                GradientControl(id=f"{side.value}-1", side=side, station=1.0,
+                                preferred=float(_safe(k1, 0.005)), source="manual")]
+        for p in grad_pts():
+            if p["side"] == side.value:
+                ctls.append(GradientControl(
+                    id=f"{side.value}-{p['id']}", side=side, station=float(p["station"]),
+                    preferred=float(p["gradient"]), lower=p.get("lower"), upper=p.get("upper"),
+                    source="manual"))
+        rs = ref_slope_auto()
+        return grad_mod.apply_default_bounds(
+            ctls, ref_slope_value=(rs.value if rs is not None else None),
+            slight=max(0.0, float(_safe("g_mult_slight", 0.5) or 0.0)))
 
     def _gradient_config():
-        """GradientBoundaryConfigV2 from the current UI (qualitative or structured modes).
-        Returns None in legacy corner mode; raises ValueError with a user-facing message."""
+        """GradientBoundaryConfigV2 from the current UI (qualitative or gradient-points modes).
+        Raises ValueError with a user-facing message when qualitative has no usable slope. A
+        stale legacy corner bc_mode falls into the points branch — same corner numerics."""
         from hype_app import gradients as grad_mod
         from hype_app.contracts import (GradientBoundaryConfigV2, GradientQualitative, Side)
         bc = _safe("bc_mode", BC_QUAL)
         if bc == BC_QUAL:
             rs = _reference_slope()
             if rs is None:
-                raise ValueError("No usable reference slope (flat or adverse reach) — enter a "
-                                 "manual reference slope or use structured controls.")
+                raise ValueError("No usable reference slope (flat or adverse reach) — enter one "
+                                 "in the Reference slope field.")
+            slight = max(0.0, float(_safe("g_mult_slight", 0.5) or 0.0))
+            strong = max(0.0, float(_safe("g_mult_strong", 1.0) or 0.0))
             left = GradientQualitative(_safe("g_qual_left", "neutral"))
             right = GradientQualitative(_safe("g_qual_right", "neutral"))
             cfg = GradientBoundaryConfigV2.from_qualitative(
-                left=left, right=right, reference_slope=rs)
-            # sensitivity bounds = one category step either way (§10.1 qualitative default)
+                left=left, right=right, reference_slope=rs, slight=slight, strong=strong)
+            # sensitivity bounds = one category step either way, on the LIVE multiplier scale
             def _with_bounds(controls, cat):
-                from hype_app.contracts import QUALITATIVE_MULTIPLIER as QM
                 lo_cat, hi_cat = grad_mod.qualitative_neighbors(cat)
-                lo, hi = sorted((QM[lo_cat] * rs.value, QM[hi_cat] * rs.value))
+                lo, hi = sorted((
+                    grad_mod.signed_multiplier(lo_cat, slight=slight, strong=strong) * rs.value,
+                    grad_mod.signed_multiplier(hi_cat, slight=slight, strong=strong) * rs.value))
                 return [c.model_copy(update={"lower": lo, "upper": hi}) for c in controls]
             return cfg.model_copy(update={
                 "left_controls": _with_bounds(cfg.left_controls, left),
                 "right_controls": _with_bounds(cfg.right_controls, right)})
-        if bc == BC_PROFILE:
-            left = grad_mod.parse_control_lines(
-                _safe("g_left_ctl", "0, 0.005\n1, 0.005"), Side.left)
-            right = grad_mod.parse_control_lines(
-                _safe("g_right_ctl", "0, 0.005\n1, 0.005"), Side.right)
-            return GradientBoundaryConfigV2(mode="quantitative",
-                                            left_controls=left, right_controls=right)
-        return None                                   # legacy corner mode
+        return GradientBoundaryConfigV2(mode="quantitative",
+                                        left_controls=_points_controls(Side.left),
+                                        right_controls=_points_controls(Side.right))
+
+    @reactive.calc
+    def wse_edge_samples():
+        """Wetted-edge samples of the current WSE raster, in BOTH the metric project CRS (x/y —
+        distance math; the raster itself may be geographic, e.g. py3dep DEMs) and 4326 (lon/lat —
+        display). None until a water surface + projected CRS exist."""
+        p, crs = wse_preview_path(), proj_crs()
+        if not p or crs is None:
+            return None
+        try:
+            from pyproj import Transformer
+
+            from hype_app import wse_index
+            raw = wse_index.build_edge_samples(p)
+            if raw is None:
+                return None
+            xm, ym = Transformer.from_crs(raw["crs"], crs,
+                                          always_xy=True).transform(raw["x"], raw["y"])
+            lon, lat = Transformer.from_crs(raw["crs"], "EPSG:4326",
+                                            always_xy=True).transform(raw["x"], raw["y"])
+            return {"x": xm, "y": ym, "value": raw["value"], "lon": lon, "lat": lat}
+        except Exception:  # noqa: BLE001
+            return None
+
+    @reactive.calc
+    def grad_point_heads():
+        """Preview rows for every gradient-specified point (the four corners + the intermediate
+        points): map position, nearest wetted WSE cell, and head = WSE + gradient × distance —
+        the same anchor formula the engine applies along each side at run time. edge/wse/dist/
+        head stay None until a water surface exists."""
+        build, crs = _domain_build(), proj_crs()
+        if not build or crs is None:
+            return []
+        grad_ver()                                   # in-place gradient edits recompute heads
+        pts = grad_pts()
+        idx = wse_edge_samples()
+        import geopandas as gpd
+        from pyproj import Transformer
+        from shapely.geometry import shape as _shape
+
+        from hype_app import gradients as grad_mod
+        from hype_app import wse_index
+        rows = []
+        try:
+            back = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+            for side, k0, k1 in (("left", "g_ul", "g_dl"), ("right", "g_ur", "g_dr")):
+                feat = build[side]
+                ln = gpd.GeoSeries([_shape(feat["geometry"])], crs=4326).to_crs(crs).iloc[0]
+                if ln.is_empty or ln.length <= 0:
+                    continue
+                c4326 = feat["geometry"]["coordinates"]
+                first, last = ln.coords[0], ln.coords[-1]
+                entries = [(0.0, float(_safe(k0, 0.005)),
+                            (float(c4326[0][0]), float(c4326[0][1])), (first[0], first[1])),
+                           (1.0, float(_safe(k1, 0.005)),
+                            (float(c4326[-1][0]), float(c4326[-1][1])), (last[0], last[1]))]
+                for p in pts:
+                    if p["side"] != side:
+                        continue
+                    q = ln.interpolate(float(p["station"]) * ln.length)
+                    lon, lat = back.transform(q.x, q.y)
+                    entries.append((float(p["station"]), float(p["gradient"]),
+                                    (lon, lat), (q.x, q.y)))
+                for stn, g, lonlat, xy in sorted(entries, key=lambda e: e[0]):
+                    row = {"side": side, "station": stn, "gradient": g, "pt": lonlat,
+                           "edge": None, "wse": None, "dist": None, "head": None}
+                    if idx is not None:
+                        d, w, _ex, _ey, i = wse_index.nearest_edge(idx, xy[0], xy[1])
+                        row.update(edge=(float(idx["lon"][i]), float(idx["lat"][i])),
+                                   wse=w, dist=d, head=grad_mod.anchor_head(w, g, d))
+                    rows.append(row)
+        except Exception:  # noqa: BLE001
+            return rows
+        return rows
 
     @render.ui
     def gradient_qual_preview():
+        # Text-only (the slope + multiplier inputs live statically in the pane — re-rendering
+        # here never remounts an input mid-keystroke).
         try:
-            _ = input.g_qual_left(), input.g_qual_right()   # subscribe
+            _ = (input.g_qual_left(), input.g_qual_right(),
+                 input.g_mult_slight(), input.g_mult_strong())      # subscribe
         except Exception:  # noqa: BLE001
             pass
-        rs = _reference_slope()
-        if rs is None:
-            return ui.TagList(
-                ui.div("No usable reference slope from the water surface or DEM — enter one:",
-                       class_="hype-warn"),
-                ui.input_numeric("g_ref_slope", "Reference slope (m/m)",
-                                 value=_keep("g_ref_slope", 0.005), min=0.0, step=0.001))
+        ov, auto = ref_slope_override(), ref_slope_auto()
+        dem_s, wse_s = dem_slope_centerline(), wse_slope_centerline()
+        length = reach_len_live_m()
+
+        def _f(s):
+            return f"{s.value:.5f}" if s is not None else "—"
+        src = ("manual override" if ov is not None else
+               {"wse_raster": "auto · water-surface slope",
+                "dem_drop": "auto · DEM slope"}.get(getattr(auto, "source", None),
+                                                    "unavailable — enter one"))
+        reset = (ui.tags.button(
+                     "reset to auto", type="button", class_="hype-link",
+                     onclick="Shiny.setInputValue('g_ref_auto_evt',Date.now(),{priority:'event'})")
+                 if ov is not None and auto is not None else None)
+        bits = [ui.div(ui.span(f"Reference slope: {src}"), reset, class_="hype-instr hype-dim"),
+                ui.div(f"DEM slope {_f(dem_s)} · water-surface slope {_f(wse_s)}"
+                       + (f" · centerline {length:,.0f} m" if length else ""),
+                       class_="hype-instr hype-dim")]
         try:
             cfg = _gradient_config()
-            gl = cfg.left_controls[0].preferred
-            gr = cfg.right_controls[0].preferred
-            return ui.div(f"Reference slope {rs.value:.5f} m/m ({rs.source}) → left gradient "
-                          f"{gl:+.5f}, right {gr:+.5f} m/m.", class_="hype-instr")
-        except Exception as e:  # noqa: BLE001
-            return ui.div(str(e), class_="hype-warn")
+            bits.append(ui.div(
+                f"Left {cfg.left_controls[0].preferred:+.5f} · "
+                f"right {cfg.right_controls[0].preferred:+.5f} m/m", class_="hype-instr"))
+        except ValueError as e:
+            bits.append(ui.div(str(e), class_="hype-warn"))
+        return ui.TagList(*bits)
 
     @render.ui
-    def gradient_ctl_check():
+    def gradient_pts_rows():
+        # STRUCTURAL renderer only (grad_pts + grad_adding): the per-point numerics mount here
+        # once per add/remove; typing routes through _gpt_mirror without re-rendering this output
+        # (a re-render would remount the input being typed in and drop focus).
+        pts, arm = grad_pts(), grad_adding()
+        rows = []
+        for p in sorted(pts, key=lambda p: (p["side"], p["station"])):
+            rows.append(ui.div(
+                ui.span(f"{p['side'].capitalize()} · {p['station']:.0%}", class_="hype-gpt-tag"),
+                ui.input_numeric(f"gpt_g_{p['id']}", None, value=p["gradient"], step=0.001,
+                                 width="110px"),
+                ui.tags.button("×", type="button", class_="hype-gpt-rm", title="Remove point",
+                               onclick=("Shiny.setInputValue('gpt_rm','" + p["id"]
+                                        + ":'+Date.now(),{priority:'event'})")),
+                class_="hype-gpt-row"))
+        if arm:
+            tail = ui.div(
+                ui.span(f"Click the {arm} floodplain line on the map…"),
+                ui.tags.button("cancel", type="button", class_="hype-link",
+                               onclick="Shiny.setInputValue('gpt_arm','off:'+Date.now(),"
+                                       "{priority:'event'})"),
+                class_="hype-instr")
+        else:
+            def _arm_btn(side):
+                return ui.tags.button(
+                    f"+ Point on {side}", type="button",
+                    class_="btn btn-sm btn-outline-secondary",
+                    onclick=(f"Shiny.setInputValue('gpt_arm','{side}:'+Date.now(),"
+                             + "{priority:'event'})"))
+            tail = ui.div(_arm_btn("left"), _arm_btn("right"), class_="hype-actions hype-gpt-add")
+        return ui.TagList(*rows, tail)
+
+    @render.ui
+    def gradient_pts_check():
+        # Heads table + validation warnings; free to re-render (contains no inputs).
         from hype_app import gradients as grad_mod
-        try:
-            _ = input.g_left_ctl(), input.g_right_ctl()     # subscribe
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            cfg = _gradient_config()
-        except ValueError as e:
-            return ui.div(str(e), class_="hype-warn")
-        if cfg is None:
+        rows = grad_point_heads()
+        if not rows:
             return None
-        warns = grad_mod.validate_config(cfg)
-        n = len(cfg.left_controls) + len(cfg.right_controls)
-        bits = [ui.div(f"{n} controls parsed — heads anchor at each control "
-                       "(head = WSE + gradient × distance) and interpolate between.",
-                       class_="hype-instr")]
-        bits += [ui.div(w.message, class_="hype-warn") for w in warns]
-        return ui.TagList(*bits)
+        parts = []
+        if rows[0]["head"] is None:
+            parts.append(ui.div("Run the surface model, draw a wetted extent, or upload a water "
+                                "surface to compute heads.", class_="hype-instr"))
+        else:
+            parts.append(ui.tags.table(
+                ui.tags.thead(ui.tags.tr(*[ui.tags.th(h) for h in
+                                           ("Side", "Station", "Gradient", "WSE", "Dist",
+                                            "Head")])),
+                ui.tags.tbody(*[ui.tags.tr(
+                    ui.tags.td(r["side"]), ui.tags.td(f"{r['station']:.0%}"),
+                    ui.tags.td(f"{r['gradient']:+.4f}"), ui.tags.td(f"{r['wse']:.2f}"),
+                    ui.tags.td(f"{r['dist']:.1f} m"), ui.tags.td(f"{r['head']:.2f} m"))
+                    for r in rows]),
+                class_="table table-sm hype-gpt-table"))
+        try:
+            parts += [ui.div(w.message, class_="hype-warn")
+                      for w in grad_mod.validate_config(_gradient_config())]
+        except ValueError as e:
+            parts.append(ui.div(str(e), class_="hype-warn"))
+        return ui.TagList(*parts)
 
     @reactive.effect
     async def _start_surface():
@@ -3688,7 +3999,7 @@ def server(input, output, session):
                                  "model, or upload a WSE raster.", type="warning", duration=6)
             return
         try:
-            gradients_cfg = _gradient_config()   # None in legacy corner mode
+            gradients_cfg = _gradient_config()   # qualitative or gradient-points (never None)
         except ValueError as ge:
             ui.notification_show(f"Fix the boundary gradients first: {ge}",
                                  type="warning", duration=8)
@@ -5039,7 +5350,13 @@ def server(input, output, session):
                 await _cascade_clear(nid, include_self=True)
         elif kind == "mapclear":
             # Empty-map click → deselect (clears the props context). Skipped when a map-driven
-            # selection consumed the same click (mirror/boundary/path picks stamp map_sel_ts).
+            # selection consumed the same click (mirror/boundary/path picks stamp map_sel_ts),
+            # and while an "add gradient point" click is armed — that click IS the placement
+            # (tree.js can't see this state, and near-line clicks land on tiles, not the line;
+            # message order vs the widget interaction is not guaranteed).
+            with reactive.isolate():
+                if grad_adding() is not None:
+                    return
             ts = _map_ui.get("map_sel_ts")
             if ts is not None and (time.monotonic() - float(ts)) < 0.8:
                 return
@@ -5258,6 +5575,94 @@ def server(input, output, session):
             return
 
     @reactive.effect
+    @reactive.event(last_click)
+    def _grad_add_on_click():
+        # Gradient-point placement (Groundwater hub, points mode): an armed click on/near the
+        # left/right boundary line becomes an intermediate gradient point at that station.
+        side = grad_adding()
+        if side is None or sel_node() != "gw":
+            return
+        c, crs, build = last_click(), proj_crs(), _domain_build()
+        if not c or crs is None or not build:
+            return
+        import math
+        import uuid
+        import geopandas as gpd
+        from shapely.geometry import Point, shape as _shape
+        try:
+            pt = gpd.GeoSeries([Point(float(c[1]), float(c[0]))], crs=4326).to_crs(crs).iloc[0]
+            line = gpd.GeoSeries([_shape(build[side]["geometry"])], crs=4326).to_crs(crs).iloc[0]
+            z = _view()[0] or 16
+            mpp = 156543.03 * math.cos(math.radians(float(c[0]))) / (2 ** int(z))
+            if pt.distance(line) > 14 * mpp:      # ~14 px, zoom-scaled — a miss keeps the arm alive
+                return
+            st = min(max(float(line.project(pt) / line.length), 0.02), 0.98)  # corners own 0 / 1
+            pts = list(grad_pts())
+            if any(p["side"] == side and abs(p["station"] - st) < 0.005 for p in pts):
+                ui.notification_show("A gradient point already sits there.", duration=4)
+                return
+            k0, k1 = ("g_ul", "g_dl") if side == "left" else ("g_ur", "g_dr")
+            g0, g1 = float(_safe(k0, 0.005)), float(_safe(k1, 0.005))
+            pts.append({"id": uuid.uuid4().hex[:8], "side": side, "station": round(st, 4),
+                        "gradient": round(g0 + (g1 - g0) * st, 6)})   # prefill: corner interp
+            pts.sort(key=lambda p: (p["side"], p["station"]))
+            _map_ui["map_sel_ts"] = time.monotonic()   # consumed — mapclear must not deselect
+            grad_pts.set(pts)
+            grad_adding.set(None)
+        except Exception:  # noqa: BLE001
+            return
+
+    @reactive.effect
+    @reactive.event(input.gpt_arm)
+    def _gpt_arm():
+        # Value-encoded nonce input ("left:<ts>" / "right:<ts>" / "off:<ts>") — remount-proof.
+        side = str(input.gpt_arm() or "").split(":", 1)[0]
+        grad_adding.set(side if side in ("left", "right") else None)
+        if side in ("left", "right"):
+            view_mode_v.set("2d")                  # the points live on the 2-D map
+
+    @reactive.effect
+    @reactive.event(input.gpt_rm)
+    def _gpt_rm():
+        uid = str(input.gpt_rm() or "").split(":", 1)[0]
+        pts = [p for p in grad_pts() if p["id"] != uid]
+        if len(pts) != len(grad_pts()):
+            grad_pts.set(pts)
+
+    _gpt_seen: dict = {}
+
+    @reactive.effect
+    def _gpt_mirror():
+        # The _keep_inputs idiom for the per-point numerics: on change, write the gradient IN
+        # PLACE and bump grad_ver — heads/params re-read without remounting the row being typed in.
+        changed = False
+        for p in grad_pts():                       # re-arms when rows are added/removed
+            iid = f"gpt_g_{p['id']}"
+            try:
+                v = input[iid]()                   # subscribes; SilentException until mounted
+            except Exception:  # noqa: BLE001
+                continue
+            if v is None or v == _gpt_seen.get(iid, _MISSING):
+                continue
+            _gpt_seen[iid] = v
+            try:
+                p["gradient"] = float(v)
+                changed = True
+            except (TypeError, ValueError):
+                pass
+        if changed:
+            with reactive.isolate():
+                grad_ver.set(grad_ver() + 1)
+
+    @reactive.effect
+    def _reset_grad_adding():
+        # Disarm when the user navigates off the hub or leaves points mode (mirrors
+        # _reset_kz_adding) — a stale arm would swallow the next unrelated map click.
+        if grad_adding() is not None and (
+                sel_node() != "gw" or str(_safe("bc_mode", BC_QUAL)) != BC_PROFILE):
+            grad_adding.set(None)
+
+    @reactive.effect
     def _reach_edit_toggle():
         # Props-pane "Edit centerline" / "Done editing" button → flip reach_edit. Strict-increment
         # guard (reach_edit_ctl re-renders, resetting the click count) — like _bnd_edit_buttons.
@@ -5417,6 +5822,7 @@ def server(input, output, session):
         _clear_auto_picks()
         up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
         kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
+        grad_pts.set([]); grad_adding.set(None); ref_slope_override.set(None)
         dem_path.set(None); dem_meta.set(None)   # also drop the downloaded DEM + its overlay
         dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _set_layer("dem", None)
@@ -5665,6 +6071,8 @@ def server(input, output, session):
                 "dem_hs": dem_hs_v(), "dem_opacity": dem_opacity_v(),
                 "dem_stretch": dem_stretch_v(),
                 "origin_override": origin_override(),
+                "ref_slope_override": ref_slope_override(),
+                "grad_pts": list(grad_pts()),
                 "wse_mode": wse_mode_v(),
                 "ras_result": _tokenize_paths(ras_result()),
                 "ras_opacity": ras_opacity_v(),
@@ -5807,6 +6215,13 @@ def server(input, output, session):
         _kept.clear()
         _kept.update(st.get("kept") or {})
         _restore_stamp["t"] = time.monotonic()
+        # gradient boundary conditions: migrate legacy kept modes (4-corner, structured text)
+        # onto the points model in place; a saved grad_pts list always wins over legacy text
+        from hype_app import gradients as _grad_mod
+        grad_pts.set(_grad_mod.migrate_kept_gradients(_kept, st.get("grad_pts")))
+        grad_adding.set(None)
+        _rs_ov = st.get("ref_slope_override")
+        ref_slope_override.set(float(_rs_ov) if _rs_ov is not None else None)
 
         # terrain
         dem_p = work_dir / "inputs" / "dem.tif"
@@ -6211,6 +6626,14 @@ def server(input, output, session):
                         + (f" · {kz_n} zone{'' if kz_n == 1 else 's'}" if kz_n else ""))
             grid_detail = (f"{float(_safe('cell_size', 10.0)):g} m cells · "
                            f"{float(_safe('gw_mod_depth', 6.0)):g} m deep")
+            _bc0 = str(_keep("bc_mode", BC_QUAL))
+            if _bc0 == BC_CORNER:                    # legacy mode: same corner numerics as points
+                _bc0 = BC_PROFILE
+            with reactive.isolate():                 # prefill only — _track_ref_slope_auto keeps
+                _ov, _auto = ref_slope_override(), ref_slope_auto()   # the numeric live after
+                _rs0 = (_ov if _ov is not None else
+                        (round(_auto.value, 6) if _auto is not None
+                         else _keep("g_ref_slope", 0.005)))
             return ui.TagList(
                 ui.div("Everything the groundwater run needs, in one place — check the inputs, "
                        "set the boundary gradients, then run.", class_="hype-instr"),
@@ -6220,13 +6643,9 @@ def server(input, output, session):
                     _hub_row(sw_ok, "Water surface", sw_detail, "sw"),
                     class_="hype-legend"),
                 ui.input_select("bc_mode", "Boundary condition",
-                                {BC_QUAL: "Qualitative (per side)",
-                                 BC_PROFILE: "Structured controls (spatially varying)",
-                                 BC_CORNER: "4 corner gradients (legacy)"},
-                                selected=str(_keep("bc_mode", BC_QUAL))),
-                ui.div("Sign convention: positive = floodplain head above the stream water "
-                       "surface (gaining tendency); negative = below (losing). Units m/m.",
-                       class_="hype-instr"),
+                                {BC_QUAL: "Qualitative",
+                                 BC_PROFILE: "Gradient points (spatially varying)"},
+                                selected=_bc0),
                 ui.panel_conditional(
                     f"input.bc_mode === '{BC_QUAL}'",
                     ui.div(
@@ -6235,34 +6654,30 @@ def server(input, output, session):
                         ui.input_select("g_qual_right", "Right floodplain", _QUAL_CHOICES,
                                         selected=str(_keep("g_qual_right", "neutral"))),
                         class_="hype-field-row"),
+                    ui.div(
+                        ui.input_numeric("g_ref_slope", "Reference slope (m/m)", value=_rs0,
+                                         min=0.0, step=0.0005),
+                        ui.input_numeric("g_mult_slight", "Slight ×",
+                                         value=_keep("g_mult_slight", 0.5), min=0.0, step=0.1),
+                        ui.input_numeric("g_mult_strong", "Strong ×",
+                                         value=_keep("g_mult_strong", 1.0), min=0.0, step=0.1),
+                        class_="hype-field-row"),
                     ui.output_ui("gradient_qual_preview")),
                 ui.panel_conditional(
                     f"input.bc_mode === '{BC_PROFILE}'",
-                    ui.input_text_area(
-                        "g_left_ctl", "Left controls",
-                        value=_keep("g_left_ctl", "0, 0.005\n1, 0.005"), rows=3),
-                    ui.input_text_area(
-                        "g_right_ctl", "Right controls",
-                        value=_keep("g_right_ctl", "0, 0.005\n1, 0.005"), rows=3),
-                    ui.div("One control per line: 'station, gradient[, lower, upper]'. Station "
-                           "runs 0 (upstream) to 1 (downstream) and must include 0 and 1; the "
-                           "optional lower/upper bounds feed the sensitivity scenarios.",
-                           class_="hype-instr"),
-                    ui.output_ui("gradient_ctl_check")),
-                ui.panel_conditional(
-                    f"input.bc_mode === '{BC_CORNER}'",
                     ui.div(
-                        ui.input_numeric("g_ul", "Upstream-left gradient",
+                        ui.input_numeric("g_ul", "Upstream · left",
                                          value=_keep("g_ul", 0.005), step=0.001),
-                        ui.input_numeric("g_ur", "Upstream-right gradient",
+                        ui.input_numeric("g_ur", "Upstream · right",
                                          value=_keep("g_ur", 0.005), step=0.001),
-                        ui.input_numeric("g_dl", "Downstream-left gradient",
+                        ui.input_numeric("g_dl", "Downstream · left",
                                          value=_keep("g_dl", 0.005), step=0.001),
-                        ui.input_numeric("g_dr", "Downstream-right gradient",
+                        ui.input_numeric("g_dr", "Downstream · right",
                                          value=_keep("g_dr", 0.005), step=0.001),
-                        class_="hype-field-row"),
-                    ui.div("Legacy method: heads interpolate linearly between the two corner "
-                           "anchors of each side.", class_="hype-instr")),
+                        class_="hype-field-row hype-gpt-corners"),
+                    ui.output_ui("gradient_pts_rows"),
+                    ui.output_ui("gradient_pts_check")),
+                ui.div("m/m · + gaining · − losing", class_="hype-instr hype-dim"),
                 ui.accordion(
                     ui.accordion_panel(
                         "Particle tracking",
@@ -7267,7 +7682,8 @@ def server(input, output, session):
         # tooltip lives in the popup pane, so it still shows). Add a crosshair only while a pick or a
         # fresh draw is actually possible. Mirrors EASI's cursor_style pattern.
         step = current_step()
-        if not _HAS_MAP or step not in (STEP_REACH, STEP_BOUNDARIES, STEP_K, STEP_RESULTS):
+        if not _HAS_MAP or step not in (STEP_REACH, STEP_BOUNDARIES, STEP_K, STEP_MESH,
+                                        STEP_RESULTS):
             return None
         css = ".hype-map-wrap .leaflet-draw{display:none !important;}"
         if step == STEP_RESULTS:                    # nothing to draw here; show the box-select tool
@@ -7292,6 +7708,8 @@ def server(input, output, session):
             slot = bnd_slot()
             sv = _slot_value(slot) if slot else None
             crosshair = bool(slot) and (sv is None or sv() is None)
+        elif step == STEP_MESH:                     # gw hub — crosshair while placing a grad point
+            crosshair = grad_adding() is not None
         else:                                       # STEP_K — crosshair while adding a K-zone
             crosshair = kz_adding()
         if crosshair:
