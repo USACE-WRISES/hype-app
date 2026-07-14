@@ -3542,7 +3542,7 @@ def server(input, output, session):
         if sel_node() != "gw" or str(_safe("bc_mode", BC_QUAL)) != BC_PROFILE:
             return
         rows = grad_point_heads()
-        warn = grad_mod.downstream_head_warnings(rows)
+        warn = grad_mod.downstream_wse_warnings(rows)
         cells = {r["uid"]: {**_gpt_cell_text(r), "warn": r["uid"] in warn} for r in rows}
         if cells:
             await session.send_custom_message("hype_gpt_cells", {"cells": cells})
@@ -3558,7 +3558,7 @@ def server(input, output, session):
         with reactive.isolate():
             hrows = grad_point_heads()
             snap = {r["uid"]: _gpt_cell_text(r) for r in hrows}
-            warn0 = grad_mod.downstream_head_warnings(hrows)
+            warn0 = grad_mod.downstream_wse_warnings(hrows)
 
         def _row(uid, side, stn, iid, val, cap=None):
             cells = snap.get(uid) or {"wse": "—", "dist": "—", "head": "—"}

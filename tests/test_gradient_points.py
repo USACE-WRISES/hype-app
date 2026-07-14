@@ -21,7 +21,7 @@ from hype_app.contracts import (
 from hype_app.gradients import (
     anchor_head,
     apply_default_bounds,
-    downstream_head_warnings,
+    downstream_wse_warnings,
     migrate_kept_gradients,
     signed_multiplier,
 )
@@ -253,32 +253,33 @@ def test_manifest_collapses_without_bounds():
     assert len(manifest.scenarios) == 1
 
 
-# --- downstream-head monotonicity warnings -------------------------------------------------
+# --- downstream-WSE monotonicity warnings --------------------------------------------------
 
 
-def _hrow(uid, side, station, head):
-    return {"uid": uid, "side": side, "station": station, "head": head}
+def _wrow(uid, side, station, wse):
+    return {"uid": uid, "side": side, "station": station, "wse": wse}
 
 
-def test_downstream_head_warnings_flags_lower_than_next():
-    # The screenshot scenario: left heads decline 0% → 63% then jump at the downstream corner;
-    # only the 63% row (lower than its downstream neighbour) is flagged.
-    rows = [_hrow("ul", "left", 0.0, 192.72), _hrow("p1", "left", 0.20, 192.03),
-            _hrow("p2", "left", 0.63, 191.44), _hrow("dl", "left", 1.0, 193.12),
-            _hrow("ur", "right", 0.0, 192.10), _hrow("dr", "right", 1.0, 186.86)]
-    assert downstream_head_warnings(rows) == {"p2"}
+def test_downstream_wse_warnings_flags_lower_than_next():
+    # The live example: left WSE declines 0% → 64% (192.54 > 190.59 — no flag on the corner),
+    # then the downstream corner samples HIGHER (192.21) — only the 64% row is flagged. The
+    # comparison is on the raw WSE sample, not the gradient-derived head.
+    rows = [_wrow("ul", "left", 0.0, 192.54), _wrow("p1", "left", 0.64, 190.59),
+            _wrow("dl", "left", 1.0, 192.21),
+            _wrow("ur", "right", 0.0, 191.09), _wrow("dr", "right", 1.0, 186.42)]
+    assert downstream_wse_warnings(rows) == {"p1"}
 
 
-def test_downstream_head_warnings_sides_independent():
+def test_downstream_wse_warnings_sides_independent():
     # A rise on the right never flags left rows (and vice versa), even when the left values
     # interleave with the right ones globally; unsorted input is sorted per side by station.
-    rows = [_hrow("dr", "right", 1.0, 200.0), _hrow("ul", "left", 0.0, 195.0),
-            _hrow("ur", "right", 0.0, 190.0), _hrow("dl", "left", 1.0, 194.0)]
-    assert downstream_head_warnings(rows) == {"ur"}
+    rows = [_wrow("dr", "right", 1.0, 200.0), _wrow("ul", "left", 0.0, 195.0),
+            _wrow("ur", "right", 0.0, 190.0), _wrow("dl", "left", 1.0, 194.0)]
+    assert downstream_wse_warnings(rows) == {"ur"}
 
 
-def test_downstream_head_warnings_none_and_equal_heads():
-    rows = [_hrow("ul", "left", 0.0, None), _hrow("p1", "left", 0.5, 191.0),
-            _hrow("dl", "left", 1.0, None),
-            _hrow("ur", "right", 0.0, 190.0), _hrow("dr", "right", 1.0, 190.0)]
-    assert downstream_head_warnings(rows) == set()
+def test_downstream_wse_warnings_none_and_equal_values():
+    rows = [_wrow("ul", "left", 0.0, None), _wrow("p1", "left", 0.5, 191.0),
+            _wrow("dl", "left", 1.0, None),
+            _wrow("ur", "right", 0.0, 190.0), _wrow("dr", "right", 1.0, 190.0)]
+    assert downstream_wse_warnings(rows) == set()
