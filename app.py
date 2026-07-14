@@ -3460,19 +3460,19 @@ def server(input, output, session):
                     continue
                 c4326 = feat["geometry"]["coordinates"]
                 first, last = ln.coords[0], ln.coords[-1]
-                entries = [(0.0, float(_safe(k0, 0.005)),
+                entries = [(0.0, float(_safe(k0, 0.005)), k0[2:],
                             (float(c4326[0][0]), float(c4326[0][1])), (first[0], first[1])),
-                           (1.0, float(_safe(k1, 0.005)),
+                           (1.0, float(_safe(k1, 0.005)), k1[2:],
                             (float(c4326[-1][0]), float(c4326[-1][1])), (last[0], last[1]))]
                 for p in pts:
                     if p["side"] != side:
                         continue
                     q = ln.interpolate(float(p["station"]) * ln.length)
                     lon, lat = back.transform(q.x, q.y)
-                    entries.append((float(p["station"]), float(p["gradient"]),
+                    entries.append((float(p["station"]), float(p["gradient"]), p["id"],
                                     (lon, lat), (q.x, q.y)))
-                for stn, g, lonlat, xy in sorted(entries, key=lambda e: e[0]):
-                    row = {"side": side, "station": stn, "gradient": g, "pt": lonlat,
+                for stn, g, uid, lonlat, xy in sorted(entries, key=lambda e: e[0]):
+                    row = {"uid": uid, "side": side, "station": stn, "gradient": g, "pt": lonlat,
                            "edge": None, "wse": None, "dist": None, "head": None}
                     if idx is not None:
                         d, w, _ex, _ey, i = wse_index.nearest_edge(idx, xy[0], xy[1])
@@ -3519,22 +3519,65 @@ def server(input, output, session):
             bits.append(ui.div(str(e), class_="hype-warn"))
         return ui.TagList(*bits)
 
+    def _gpt_cell_text(r):
+        """Display strings for one gradient-point row — shared by the initial table paint and
+        the hype_gpt_cells patch so both surfaces always agree."""
+        if r.get("head") is None:
+            return {"wse": "—", "dist": "—", "head": "—"}
+        return {"wse": f"{r['wse']:.2f}", "dist": f"{r['dist']:.0f}",
+                "head": f"{r['head']:.2f}"}
+
+    @reactive.effect
+    async def _push_gpt_cells():
+        # Typing a gradient recomputes heads, but the table output must NOT re-render per
+        # keystroke (a re-render remounts the input being typed in and drops focus) — so the
+        # computed cells are patched in place instead (tree.js: hype_gpt_cells). Gated like the
+        # map overlay so heads aren't recomputed while the pane can't show them.
+        if sel_node() != "gw" or str(_safe("bc_mode", BC_QUAL)) != BC_PROFILE:
+            return
+        cells = {r["uid"]: _gpt_cell_text(r) for r in grad_point_heads()}
+        if cells:
+            await session.send_custom_message("hype_gpt_cells", {"cells": cells})
+
     @render.ui
-    def gradient_pts_rows():
-        # STRUCTURAL renderer only (grad_pts + grad_adding): the per-point numerics mount here
-        # once per add/remove; typing routes through _gpt_mirror without re-rendering this output
-        # (a re-render would remount the input being typed in and drop focus).
+    def gradient_pts_table():
+        # STRUCTURAL renderer only (grad_pts + grad_adding): the gradient numerics mount here
+        # once per add/remove. Corner edits are plain reactive input reads elsewhere and point
+        # edits route through _gpt_mirror; the computed cells start from an isolated snapshot
+        # and stay live via _push_gpt_cells. Nothing here may subscribe to heads or input values.
         pts, arm = grad_pts(), grad_adding()
-        rows = []
-        for p in sorted(pts, key=lambda p: (p["side"], p["station"])):
-            rows.append(ui.div(
-                ui.span(f"{p['side'].capitalize()} · {p['station']:.0%}", class_="hype-gpt-tag"),
-                ui.input_numeric(f"gpt_g_{p['id']}", None, value=p["gradient"], step=0.001,
-                                 width="110px"),
+        with reactive.isolate():
+            snap = {r["uid"]: _gpt_cell_text(r) for r in grad_point_heads()}
+
+        def _row(uid, side, stn, iid, val, cap=None):
+            cells = snap.get(uid) or {"wse": "—", "dist": "—", "head": "—"}
+            rm = (ui.tags.td() if cap else ui.tags.td(          # corners are mandatory anchors
                 ui.tags.button("×", type="button", class_="hype-gpt-rm", title="Remove point",
-                               onclick=("Shiny.setInputValue('gpt_rm','" + p["id"]
-                                        + ":'+Date.now(),{priority:'event'})")),
-                class_="hype-gpt-row"))
+                               onclick=("Shiny.setInputValue('gpt_rm','" + uid
+                                        + ":'+Date.now(),{priority:'event'})"))))
+            return ui.tags.tr(
+                ui.tags.td(f"{side.capitalize()} · {stn:.0%}",
+                           (ui.span(f" {cap[0]}", class_="hype-gpt-cap",
+                                    title=f"{cap[1]} corner — required") if cap else None)),
+                ui.tags.td(ui.input_numeric(iid, None, value=val, step=0.001, width="86px")),
+                ui.tags.td(cells["wse"], class_="gpt-wse"),
+                ui.tags.td(cells["dist"], class_="gpt-dist"),
+                ui.tags.td(cells["head"], class_="gpt-head"),
+                rm, data_uid=uid)
+
+        trs = []
+        for side, k0, k1 in (("left", "g_ul", "g_dl"), ("right", "g_ur", "g_dr")):
+            trs.append(_row(k0[2:], side, 0.0, k0, _keep(k0, 0.005), ("↑", "upstream")))
+            for p in sorted(pts, key=lambda p: p["station"]):
+                if p["side"] == side:
+                    trs.append(_row(p["id"], side, float(p["station"]),
+                                    f"gpt_g_{p['id']}", p["gradient"]))
+            trs.append(_row(k1[2:], side, 1.0, k1, _keep(k1, 0.005), ("↓", "downstream")))
+        table = ui.tags.table(
+            ui.tags.thead(ui.tags.tr(*[ui.tags.th(h) for h in
+                                       ("Point", "Gradient", "WSE (m)", "Dist (m)", "Head (m)",
+                                        "")])),
+            ui.tags.tbody(*trs), class_="table table-sm hype-gpt-table")
         if arm:
             tail = ui.div(
                 ui.span(f"Click the {arm} floodplain line on the map…"),
@@ -3550,11 +3593,11 @@ def server(input, output, session):
                     onclick=(f"Shiny.setInputValue('gpt_arm','{side}:'+Date.now(),"
                              + "{priority:'event'})"))
             tail = ui.div(_arm_btn("left"), _arm_btn("right"), class_="hype-actions hype-gpt-add")
-        return ui.TagList(*rows, tail)
+        return ui.TagList(table, tail)
 
     @render.ui
-    def gradient_pts_check():
-        # Heads table + validation warnings; free to re-render (contains no inputs).
+    def gradient_pts_msgs():
+        # Hints + validation warnings only; free to re-render (contains no inputs).
         from hype_app import gradients as grad_mod
         rows = grad_point_heads()
         if not rows:
@@ -3563,17 +3606,6 @@ def server(input, output, session):
         if rows[0]["head"] is None:
             parts.append(ui.div("Run the surface model, draw a wetted extent, or upload a water "
                                 "surface to compute heads.", class_="hype-instr"))
-        else:
-            parts.append(ui.tags.table(
-                ui.tags.thead(ui.tags.tr(*[ui.tags.th(h) for h in
-                                           ("Side", "Station", "Gradient", "WSE", "Dist",
-                                            "Head")])),
-                ui.tags.tbody(*[ui.tags.tr(
-                    ui.tags.td(r["side"]), ui.tags.td(f"{r['station']:.0%}"),
-                    ui.tags.td(f"{r['gradient']:+.4f}"), ui.tags.td(f"{r['wse']:.2f}"),
-                    ui.tags.td(f"{r['dist']:.1f} m"), ui.tags.td(f"{r['head']:.2f} m"))
-                    for r in rows]),
-                class_="table table-sm hype-gpt-table"))
         try:
             parts += [ui.div(w.message, class_="hype-warn")
                       for w in grad_mod.validate_config(_gradient_config())]
@@ -6665,18 +6697,10 @@ def server(input, output, session):
                     ui.output_ui("gradient_qual_preview")),
                 ui.panel_conditional(
                     f"input.bc_mode === '{BC_PROFILE}'",
-                    ui.div(
-                        ui.input_numeric("g_ul", "Upstream · left",
-                                         value=_keep("g_ul", 0.005), step=0.001),
-                        ui.input_numeric("g_ur", "Upstream · right",
-                                         value=_keep("g_ur", 0.005), step=0.001),
-                        ui.input_numeric("g_dl", "Downstream · left",
-                                         value=_keep("g_dl", 0.005), step=0.001),
-                        ui.input_numeric("g_dr", "Downstream · right",
-                                         value=_keep("g_dr", 0.005), step=0.001),
-                        class_="hype-field-row hype-gpt-corners"),
-                    ui.output_ui("gradient_pts_rows"),
-                    ui.output_ui("gradient_pts_check")),
+                    # One table is the whole mode: corner rows (mandatory anchors, no remove)
+                    # + map-added points, gradients editable in place.
+                    ui.output_ui("gradient_pts_table"),
+                    ui.output_ui("gradient_pts_msgs")),
                 ui.div("m/m · + gaining · − losing", class_="hype-instr hype-dim"),
                 ui.accordion(
                     ui.accordion_panel(

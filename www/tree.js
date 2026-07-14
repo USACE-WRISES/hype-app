@@ -298,6 +298,22 @@
     if (window.Shiny && Shiny.addCustomMessageHandler) {
       Shiny.addCustomMessageHandler("hype_tree", onMessage);
       Shiny.addCustomMessageHandler("hype_fly", function (msg) { flyTo(msg && msg.bounds); });
+      // Gradient-points table: patch the computed cells in place. The table output cannot
+      // re-render per keystroke (that would remount the numeric being typed in and drop
+      // focus), so the server pushes fresh WSE/Dist/Head strings instead. Rows not in the
+      // DOM (just removed, or render still in flight) are skipped — the structural render
+      // paints fresh values itself.
+      Shiny.addCustomMessageHandler("hype_gpt_cells", function (msg) {
+        var cells = (msg && msg.cells) || {};
+        Object.keys(cells).forEach(function (uid) {
+          var tr = document.querySelector('.hype-gpt-table tr[data-uid="' + uid + '"]');
+          if (!tr) return;
+          ["wse", "dist", "head"].forEach(function (k) {
+            var td = tr.querySelector(".gpt-" + k);
+            if (td) td.textContent = String(cells[uid][k]);
+          });
+        });
+      });
       return true;
     }
     return false;
