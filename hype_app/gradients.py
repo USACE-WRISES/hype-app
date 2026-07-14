@@ -281,9 +281,29 @@ def migrate_kept_gradients(kept: dict, saved_pts) -> list[dict]:
     return pts
 
 
+def downstream_head_warnings(rows) -> set:
+    """UIDs of gradient-point rows whose computed head is LOWER than the next row
+    downstream on the same side — the boundary water surface rising in the downstream
+    direction is physically suspect (pool, sampling artifact, or a gradient worth a
+    second look). Rows are ``grad_point_heads()``-style dicts (``uid``/``side``/
+    ``station``/``head``); ``None`` heads never flag, nor do equal heads."""
+    flagged: set = set()
+    by_side: dict = {}
+    for r in rows:
+        by_side.setdefault(r["side"], []).append(r)
+    for side_rows in by_side.values():
+        side_rows.sort(key=lambda r: r["station"])
+        for a, b in zip(side_rows, side_rows[1:]):
+            if a["head"] is not None and b["head"] is not None \
+                    and a["head"] < b["head"] - 1e-6:
+                flagged.add(a["uid"])
+    return flagged
+
+
 __all__ = [
     "anchor_head", "ControlGeometry", "interpolate_to_stations", "realized_side_heads",
     "reference_slope_from_samples", "validate_config", "config_from_legacy_corners",
     "parse_control_lines", "serialize_profile", "qualitative_neighbors",
     "signed_multiplier", "apply_default_bounds", "migrate_kept_gradients",
+    "downstream_head_warnings",
 ]

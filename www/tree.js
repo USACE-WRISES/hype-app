@@ -312,6 +312,8 @@
             var td = tr.querySelector(".gpt-" + k);
             if (td) td.textContent = String(cells[uid][k]);
           });
+          var w = tr.querySelector(".gpt-warn");
+          if (w) w.style.display = cells[uid].warn ? "" : "none";
         });
       });
       return true;

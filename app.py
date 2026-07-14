@@ -3353,6 +3353,11 @@ def server(input, output, session):
                                            method="user override")
         return ref_slope_auto()
 
+    def _g4(x):
+        """Gradients are a 4-decimal quantity everywhere they're consumed (input echo, head
+        preview, engine profile) — one convention, no drift between surfaces."""
+        return round(float(x), 4)
+
     def _points_controls(side):
         """GradientControls for one side of the points mode: the corner numerics are the mandatory
         station-0/1 controls, plus the intermediate map points. Where a point carries no explicit
@@ -3363,14 +3368,14 @@ def server(input, output, session):
         grad_ver()                                   # in-place gradient edits invalidate too
         k0, k1 = ("g_ul", "g_dl") if side.value == "left" else ("g_ur", "g_dr")
         ctls = [GradientControl(id=f"{side.value}-0", side=side, station=0.0,
-                                preferred=float(_safe(k0, 0.005)), source="manual"),
+                                preferred=_g4(_safe(k0, 0.005)), source="manual"),
                 GradientControl(id=f"{side.value}-1", side=side, station=1.0,
-                                preferred=float(_safe(k1, 0.005)), source="manual")]
+                                preferred=_g4(_safe(k1, 0.005)), source="manual")]
         for p in grad_pts():
             if p["side"] == side.value:
                 ctls.append(GradientControl(
                     id=f"{side.value}-{p['id']}", side=side, station=float(p["station"]),
-                    preferred=float(p["gradient"]), lower=p.get("lower"), upper=p.get("upper"),
+                    preferred=_g4(p["gradient"]), lower=p.get("lower"), upper=p.get("upper"),
                     source="manual"))
         rs = ref_slope_auto()
         return grad_mod.apply_default_bounds(
@@ -3460,16 +3465,16 @@ def server(input, output, session):
                     continue
                 c4326 = feat["geometry"]["coordinates"]
                 first, last = ln.coords[0], ln.coords[-1]
-                entries = [(0.0, float(_safe(k0, 0.005)), k0[2:],
+                entries = [(0.0, _g4(_safe(k0, 0.005)), k0[2:],
                             (float(c4326[0][0]), float(c4326[0][1])), (first[0], first[1])),
-                           (1.0, float(_safe(k1, 0.005)), k1[2:],
+                           (1.0, _g4(_safe(k1, 0.005)), k1[2:],
                             (float(c4326[-1][0]), float(c4326[-1][1])), (last[0], last[1]))]
                 for p in pts:
                     if p["side"] != side:
                         continue
                     q = ln.interpolate(float(p["station"]) * ln.length)
                     lon, lat = back.transform(q.x, q.y)
-                    entries.append((float(p["station"]), float(p["gradient"]), p["id"],
+                    entries.append((float(p["station"]), _g4(p["gradient"]), p["id"],
                                     (lon, lat), (q.x, q.y)))
                 for stn, g, uid, lonlat, xy in sorted(entries, key=lambda e: e[0]):
                     row = {"uid": uid, "side": side, "station": stn, "gradient": g, "pt": lonlat,
@@ -3533,9 +3538,12 @@ def server(input, output, session):
         # keystroke (a re-render remounts the input being typed in and drops focus) — so the
         # computed cells are patched in place instead (tree.js: hype_gpt_cells). Gated like the
         # map overlay so heads aren't recomputed while the pane can't show them.
+        from hype_app import gradients as grad_mod
         if sel_node() != "gw" or str(_safe("bc_mode", BC_QUAL)) != BC_PROFILE:
             return
-        cells = {r["uid"]: _gpt_cell_text(r) for r in grad_point_heads()}
+        rows = grad_point_heads()
+        warn = grad_mod.downstream_head_warnings(rows)
+        cells = {r["uid"]: {**_gpt_cell_text(r), "warn": r["uid"] in warn} for r in rows}
         if cells:
             await session.send_custom_message("hype_gpt_cells", {"cells": cells})
 
@@ -3545,9 +3553,12 @@ def server(input, output, session):
         # once per add/remove. Corner edits are plain reactive input reads elsewhere and point
         # edits route through _gpt_mirror; the computed cells start from an isolated snapshot
         # and stay live via _push_gpt_cells. Nothing here may subscribe to heads or input values.
+        from hype_app import gradients as grad_mod
         pts, arm = grad_pts(), grad_adding()
         with reactive.isolate():
-            snap = {r["uid"]: _gpt_cell_text(r) for r in grad_point_heads()}
+            hrows = grad_point_heads()
+            snap = {r["uid"]: _gpt_cell_text(r) for r in hrows}
+            warn0 = grad_mod.downstream_head_warnings(hrows)
 
         def _row(uid, side, stn, iid, val, cap=None):
             cells = snap.get(uid) or {"wse": "—", "dist": "—", "head": "—"}
@@ -3559,7 +3570,13 @@ def server(input, output, session):
                 ui.tags.td(f"{side.capitalize()} · {stn:.0%}",
                            (ui.span(f" {cap[0]}", class_="hype-gpt-cap",
                                     title=f"{cap[1]} corner — required") if cap else None)),
-                ui.tags.td(ui.input_numeric(iid, None, value=val, step=0.001, width="86px")),
+                ui.tags.td(ui.div(
+                    ui.input_numeric(iid, None, value=_g4(val), step=0.0001, width="64px"),
+                    ui.span("⚠", class_="hype-gpt-warn gpt-warn",
+                            title="WSE is higher downstream of this point — verify boundary "
+                                  "conditions.",
+                            style=(None if uid in warn0 else "display:none")),
+                    class_="hype-gpt-gcell")),
                 ui.tags.td(cells["wse"], class_="gpt-wse"),
                 ui.tags.td(cells["dist"], class_="gpt-dist"),
                 ui.tags.td(cells["head"], class_="gpt-head"),
@@ -3574,9 +3591,11 @@ def server(input, output, session):
                                     f"gpt_g_{p['id']}", p["gradient"]))
             trs.append(_row(k1[2:], side, 1.0, k1, _keep(k1, 0.005), ("↓", "downstream")))
         table = ui.tags.table(
-            ui.tags.thead(ui.tags.tr(*[ui.tags.th(h) for h in
-                                       ("Point", "Gradient", "WSE (m)", "Dist (m)", "Head (m)",
-                                        "")])),
+            ui.tags.thead(ui.tags.tr(
+                ui.tags.th("Point"),
+                ui.tags.th("Gradient (m/m)", title="+ gaining · − losing"),
+                ui.tags.th("WSE (m)"), ui.tags.th("Dist (m)"), ui.tags.th("Head (m)"),
+                ui.tags.th(""))),
             ui.tags.tbody(*trs), class_="table table-sm hype-gpt-table")
         if arm:
             tail = ui.div(
@@ -5636,7 +5655,7 @@ def server(input, output, session):
             k0, k1 = ("g_ul", "g_dl") if side == "left" else ("g_ur", "g_dr")
             g0, g1 = float(_safe(k0, 0.005)), float(_safe(k1, 0.005))
             pts.append({"id": uuid.uuid4().hex[:8], "side": side, "station": round(st, 4),
-                        "gradient": round(g0 + (g1 - g0) * st, 6)})   # prefill: corner interp
+                        "gradient": round(g0 + (g1 - g0) * st, 4)})   # prefill: corner interp
             pts.sort(key=lambda p: (p["side"], p["station"]))
             _map_ui["map_sel_ts"] = time.monotonic()   # consumed — mapclear must not deselect
             grad_pts.set(pts)
@@ -5678,7 +5697,7 @@ def server(input, output, session):
                 continue
             _gpt_seen[iid] = v
             try:
-                p["gradient"] = float(v)
+                p["gradient"] = _g4(v)
                 changed = True
             except (TypeError, ValueError):
                 pass
@@ -6701,7 +6720,6 @@ def server(input, output, session):
                     # + map-added points, gradients editable in place.
                     ui.output_ui("gradient_pts_table"),
                     ui.output_ui("gradient_pts_msgs")),
-                ui.div("m/m · + gaining · − losing", class_="hype-instr hype-dim"),
                 ui.accordion(
                     ui.accordion_panel(
                         "Particle tracking",

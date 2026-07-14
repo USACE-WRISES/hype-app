@@ -21,6 +21,7 @@ from hype_app.contracts import (
 from hype_app.gradients import (
     anchor_head,
     apply_default_bounds,
+    downstream_head_warnings,
     migrate_kept_gradients,
     signed_multiplier,
 )
@@ -250,3 +251,34 @@ def test_manifest_collapses_without_bounds():
                                         preferred=0.0)])
     manifest = build_manifest(cfg, GeneratorType.linked)
     assert len(manifest.scenarios) == 1
+
+
+# --- downstream-head monotonicity warnings -------------------------------------------------
+
+
+def _hrow(uid, side, station, head):
+    return {"uid": uid, "side": side, "station": station, "head": head}
+
+
+def test_downstream_head_warnings_flags_lower_than_next():
+    # The screenshot scenario: left heads decline 0% → 63% then jump at the downstream corner;
+    # only the 63% row (lower than its downstream neighbour) is flagged.
+    rows = [_hrow("ul", "left", 0.0, 192.72), _hrow("p1", "left", 0.20, 192.03),
+            _hrow("p2", "left", 0.63, 191.44), _hrow("dl", "left", 1.0, 193.12),
+            _hrow("ur", "right", 0.0, 192.10), _hrow("dr", "right", 1.0, 186.86)]
+    assert downstream_head_warnings(rows) == {"p2"}
+
+
+def test_downstream_head_warnings_sides_independent():
+    # A rise on the right never flags left rows (and vice versa), even when the left values
+    # interleave with the right ones globally; unsorted input is sorted per side by station.
+    rows = [_hrow("dr", "right", 1.0, 200.0), _hrow("ul", "left", 0.0, 195.0),
+            _hrow("ur", "right", 0.0, 190.0), _hrow("dl", "left", 1.0, 194.0)]
+    assert downstream_head_warnings(rows) == {"ur"}
+
+
+def test_downstream_head_warnings_none_and_equal_heads():
+    rows = [_hrow("ul", "left", 0.0, None), _hrow("p1", "left", 0.5, 191.0),
+            _hrow("dl", "left", 1.0, None),
+            _hrow("ur", "right", 0.0, 190.0), _hrow("dr", "right", 1.0, 190.0)]
+    assert downstream_head_warnings(rows) == set()
