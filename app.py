@@ -3573,8 +3573,9 @@ def server(input, output, session):
                 ui.tags.td(ui.div(
                     ui.input_numeric(iid, None, value=_g4(val), step=0.0001, width="64px"),
                     ui.span("⚠", class_="hype-gpt-warn gpt-warn",
-                            title="WSE is higher downstream of this point — verify boundary "
-                                  "conditions.",
+                            title="WSE is higher downstream of this point — verify the snapped "
+                                  "WSE cell location (dashed arrow) and the hydraulic-model "
+                                  "water surface here.",
                             style=(None if uid in warn0 else "display:none")),
                     class_="hype-gpt-gcell")),
                 ui.tags.td(cells["wse"], class_="gpt-wse"),
