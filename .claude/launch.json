@@ -11,6 +11,17 @@
         "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    {
+      "name": "hype-app-alt",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "shiny", "run", "--port", "8323", "app.py"],
+      "port": 8323,
+      "env": {
+        "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
+        "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
+        "PYTHONUNBUFFERED": "1"
+      }
     }
   ]
 }

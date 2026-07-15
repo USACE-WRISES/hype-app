@@ -557,6 +557,50 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return lyr
 
+    def _clone_layer(lyr):
+        """Fresh widget (new model id) for ANY map layer — the wedge heal's workhorse
+        (_widget_heal). Same rationale as _clone_vector, per class; a LayerGroup's children
+        are cloned recursively (the wedge kills their models too), rescuing a hidden group's
+        stashed children out of _group_hold (its clone gets a new id, so the old stash would
+        otherwise strand them). Unknown classes return unchanged — better one stale layer
+        than a crashed heal."""
+        if not _HAS_MAP or lyr is None:
+            return lyr
+        if isinstance(lyr, GeoJSON):          # GeoJSON IS-A LayerGroup — test it FIRST
+            return _clone_vector(lyr)
+        if isinstance(lyr, ImageOverlay):
+            try:
+                return ImageOverlay(url=lyr.url, bounds=lyr.bounds,
+                                    opacity=float(getattr(lyr, "opacity", 1.0)),
+                                    visible=bool(getattr(lyr, "visible", True)),
+                                    name=getattr(lyr, "name", "") or "")
+            except Exception:  # noqa: BLE001
+                return lyr
+        if isinstance(lyr, Marker):
+            try:
+                kw = {"location": tuple(lyr.location),
+                      "draggable": bool(getattr(lyr, "draggable", False)),
+                      "visible": bool(getattr(lyr, "visible", True)),
+                      "name": getattr(lyr, "name", "") or ""}
+                ic = getattr(lyr, "icon", None)
+                if isinstance(ic, DivIcon):    # label pills / rotated glyphs live in the html
+                    kw["icon"] = DivIcon(html=ic.html,
+                                         icon_size=list(ic.icon_size or []) or None,
+                                         icon_anchor=list(ic.icon_anchor or []) or None)
+                return Marker(**kw)
+            except Exception:  # noqa: BLE001
+                return lyr
+        if isinstance(lyr, LayerGroup):
+            try:
+                kids = tuple(getattr(lyr, "layers", ()) or ())
+                if not kids:                   # unchecked group: children live in the stash
+                    kids = tuple(_group_hold.pop(id(lyr), ()) or ())
+                return LayerGroup(layers=tuple(_clone_layer(c) for c in kids),
+                                  name=getattr(lyr, "name", "") or "")
+            except Exception:  # noqa: BLE001
+                return lyr
+        return lyr
+
     def _tag_hz(gj, key):
         """Stamp every feature with its layer key — the client-side sweep (hype_map_sweep,
         map_bounds.js) identifies leaflet groups by this property."""
@@ -4825,6 +4869,62 @@ def server(input, output, session):
                     _set_layer(k, _clone_vector(lyr))   # dropped view — second-strike keys only
         if _miss_once:
             _schedule_verify(sorted(_miss_once), 1.75)  # confirm pass — heal on strike two
+
+    # --- whole-channel wedge heal ---------------------------------------------------------
+    # tree.js sniffs the embed manager's "Could not process update msg for model id" console
+    # errors — updates aimed at widgets whose comm-open never materialized. When that wedge
+    # hits (2026-07-15: every layer created after the reach stage was server-alive but
+    # permanently invisible), no re-add of the SAME objects can help; every present layer is
+    # re-materialized as a fresh widget instead. State-preserving by construction: check
+    # state, parks, sliders and result reactives are untouched — only widget identities
+    # change. "head" and "grad_pts" go through their owners so their internal wiring
+    # (_head_img opacity target, pin handlers) stays live.
+    _widget_heal_t = {"t": 0.0}             # rate limiter — an unhealable page must not loop
+
+    @reactive.effect
+    @reactive.event(input.hype_widget_dead)
+    def _widget_heal():
+        if not _HAS_MAP:
+            return
+        now = time.monotonic()
+        if now - _widget_heal_t["t"] < 20.0:
+            return
+        _widget_heal_t["t"] = now
+        print("[map-heal] client reported dead widget models - rebuilding map layers")
+        healed: list = []
+        for k in list(_layers):
+            lyr = _layers.get(k)
+            if lyr is None or k in ("head", "grad_pts"):
+                continue
+            try:
+                fresh = _clone_layer(lyr)
+                if fresh is not lyr:
+                    _set_layer(k, fresh)
+                    healed.append(k)
+            except Exception:  # noqa: BLE001 — one bad layer must not kill the heal
+                pass
+        for k in list(_layer_shadow):       # parked widgets are dead too — swap the parks
+            try:
+                fresh = _clone_layer(_layer_shadow[k])
+                if fresh is not _layer_shadow[k]:
+                    _layer_shadow[k] = fresh
+            except Exception:  # noqa: BLE001
+                pass
+        if _layers.get("head") is not None or _layer_shadow.get("head") is not None:
+            try:
+                _render_head_layer(int(head_layer_v()))   # owner rebuild — keeps _head_img wired
+                healed.append("head")
+            except Exception:  # noqa: BLE001
+                pass
+        if _layers.get("grad_pts") is not None:
+            grad_ver.set(grad_ver() + 1)    # overlay owner rebuilds pins with live wiring
+        if healed:
+            # The rebuild is itself a burst the client can drop from (observed: the DEM
+            # overlay vanished on a second heal pass) — trickle every healed key through the
+            # relayer, which re-adds them one at a time as fresh objects until they stick.
+            _schedule_relayer(healed, 2.0)
+            ui.notification_show(f"Map display recovered — {len(healed)} layer(s) rebuilt "
+                                 f"after a browser sync glitch.", duration=8)
 
     # --- deferred hz reveal: materialize the default-visible Zone layers AFTER the burst -------
     # _hz_done parks every hz layer at creation (no original ever rides the completion burst —

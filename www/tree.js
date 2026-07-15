@@ -36,6 +36,34 @@
     Shiny.setInputValue("tree_event", msg, { priority: "event" });
   }
 
+  // --- dead-widget detector -----------------------------------------------------------
+  // jupyter-widgets' embed manager console.error()s "Could not process update msg for
+  // model id: <id>" when an update targets a widget whose comm-open never materialized —
+  // the wedge that leaves map layers alive server-side but permanently invisible (hit
+  // live 2026-07-15: everything after the reach stage was missing while the run itself
+  // was fine). Sniff that exact message and nudge the server once per cooldown;
+  // app.py's _widget_heal rebuilds the layers as fresh widgets (dead models cannot be
+  // revived). Installed at script load so it precedes the widget libraries.
+  var dwTimer = null;
+  var dwLast = 0;
+  var dwOrigError = console.error;
+  console.error = function () {
+    try {
+      if (String(arguments[0] || "").indexOf(
+            "Could not process update msg for model id") !== -1 &&
+          !dwTimer && Date.now() - dwLast > 30000) {
+        dwTimer = setTimeout(function () {   // debounce: one nudge per error burst
+          dwTimer = null;
+          dwLast = Date.now();
+          if (window.Shiny && Shiny.setInputValue) {
+            Shiny.setInputValue("hype_widget_dead", Date.now(), { priority: "event" });
+          }
+        }, 2000);
+      }
+    } catch (e) { /* the sniffer must never break console.error itself */ }
+    return dwOrigError.apply(console, arguments);
+  };
+
   function body() { return document.getElementById("hype-tree-body"); }
 
   function hiddenByCollapse(n) {
