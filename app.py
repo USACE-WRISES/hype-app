@@ -183,10 +183,10 @@ app_ui = ui.page_fillable(
                    ui.tags.button("3D view", type="button", class_="hype-view-btn",
                                   **{"data-view": "3d"}),
                    class_="hype-view-toggle"),
-            ui.div(ui.output_ui("dl_project"),
-                   ui.input_action_link("nav_new", "New project"),
+            ui.div(ui.input_action_link("nav_new", "New"),
                    ui.input_action_link("nav_open", "Open"),
                    ui.output_ui("save_project"),
+                   ui.tags.span(class_="hype-nav-sep"),
                    ui.input_action_link("nav_about", "About"),
                    ui.input_action_link("nav_help", "Help"), class_="hype-nav"),
             class_="hype-header",
@@ -459,6 +459,11 @@ def server(input, output, session):
     _bnd_shown: dict = {}                    # Boundaries step: per-layer signature (see _bnd_show)
     _map_ui: dict = {}                       # small map-view bookkeeping (last step seen, …)
     _MISSING = object()                      # sentinel: "layer not tracked yet" vs "tracked as None"
+    # Task done-handlers apply a finished result exactly once: armed at launch, consumed by the
+    # first completion firing, cleared by _reset_session_state. Their bodies read other reactives
+    # (layer prefs, domain, CRS), so without the guard any of those writes — project restore in
+    # particular — re-fires the handler and grafts the stale task result onto the fresh session.
+    _task_armed = {"gw": False, "hz": False, "sens": False}
 
     _hidden_keys: set = set()      # layer keys the user unchecked in the tree (the vis funnel)
     _group_hold: dict = {}         # id(LayerGroup) -> stashed children while the group is hidden
@@ -3205,6 +3210,7 @@ def server(input, output, session):
         sens_log_tick.set(0)
         sens_result.set({"manifest": manifest.model_dump(mode="json"),
                          "generator": manifest.generator.value, "running": True})
+        _task_armed["sens"] = True
         sens_task(payload)
 
     @reactive.effect
@@ -3226,6 +3232,9 @@ def server(input, output, session):
     def _sens_done():
         if sens_task.status() in ("initial", "running"):
             return
+        if not _task_armed["sens"]:     # already applied (or session reset) — see _task_armed
+            return
+        _task_armed["sens"] = False
         try:
             res = sens_task.result()
         except Exception:  # noqa: BLE001
@@ -4140,6 +4149,7 @@ def server(input, output, session):
         stage.set("Running MODFLOW 6 + MODPATH 7…")
         _select("gw.run")               # the run row appears in the tree; its pane shows progress
         await _cascade_clear("gw")      # re-running groundwater invalidates the hyporheic results
+        _task_armed["gw"] = True
         run_task(payload)
 
     @reactive.effect
@@ -4189,6 +4199,9 @@ def server(input, output, session):
         status = run_task.status()
         if status in ("initial", "running"):
             return
+        if not _task_armed["gw"]:       # already applied (or session reset) — see _task_armed
+            return
+        _task_armed["gw"] = False
         stage.set("")
         if status == "cancelled":
             return  # the Cancel handler already reset the UI
@@ -4410,6 +4423,7 @@ def server(input, output, session):
         hz_t0.set(time.monotonic())
         hz_elapsed.set(0)
         _select("gw.res.hz")
+        _task_armed["hz"] = True
         hz_task(payload)
 
     @reactive.effect
@@ -4549,6 +4563,9 @@ def server(input, output, session):
         status = hz_task.status()
         if status in ("initial", "running", "cancelled"):
             return
+        if not _task_armed["hz"]:       # already applied (or session reset) — see _task_armed
+            return
+        _task_armed["hz"] = False
         hz_log_tick.set(len(hz_log_lines))
         if status == "error":
             msg = "Hyporheic-zone analysis failed."
@@ -5910,6 +5927,7 @@ def server(input, output, session):
         workspace dir. Shared by New project and Open project (which re-populates after)."""
         # Stop in-flight work first: a straggling done-handler must not repopulate the fresh
         # session, and Windows can't delete files a live child still holds open.
+        _task_armed.update(gw=False, hz=False, sens=False)
         _terminate_child()
         _kill_ras_proc()
         for h, k in ((_mesh_proc, "proc"), (_mesh3d_proc, "p"), (_hz_proc, "p"),
@@ -6004,8 +6022,9 @@ def server(input, output, session):
                 "The water-surface extent becomes the constant-head (CHD) top boundary — from "
                 "the surface model's WSE when available, else the DEM elevations inside the "
                 "drawn extent. Nothing is saved on the server — **Save** (top right) gives you "
-                "a project file you can pick up later with **Open**; **Download project** is "
-                "the full archive for GIS (it reopens the same way)."),
+                "a project file (.hype) to pick up later with **Open**: complete with all "
+                "computed data, or settings-only for a small file. A .hype file is a ZIP "
+                "archive — rename it to .zip to browse the stage folders in GIS."),
             title="Help", easy_close=True))
 
     @reactive.effect
@@ -6022,22 +6041,14 @@ def server(input, output, session):
             title="About", easy_close=True))
 
     # ---- downloads ----
-    # A single "Download project" action (labeled header button) that captures the WHOLE
-    # session — drawn reach + boundaries (serialized from the in-memory reactives), terrain,
-    # the HEC-RAS surface model, and the MODFLOW 6 / MODPATH 7 groundwater model + results — into
-    # one zip organized by pipeline stage (see hype_app/bundle.zip_workspace).
+    # "Save" captures the session into one .hype archive (a zip organized by pipeline stage —
+    # see hype_app/bundle.zip_workspace): drawn reach + boundaries (serialized from the
+    # in-memory reactives) and config always; terrain, the HEC-RAS surface model, and the
+    # MODFLOW 6 / MODPATH 7 groundwater model + results when the "Complete project" scope is
+    # chosen in the save dialog.
     def _has_workspace():
-        # Anything worth downloading yet? (a reach, a DEM, a surface run, a GW run, or a HZ result)
+        # Anything worth saving yet? (a reach, a DEM, a surface run, a GW run, or a HZ result)
         return bool(reach_feat() or dem_path() or ras_result() or run_result() or hz_result())
-
-    @render.ui
-    def dl_project():
-        label = ui.TagList(ui.span(class_="hype-ic"), "Download project")
-        if not _has_workspace():
-            return ui.span(label, class_="hype-header-btn dim",
-                           title="Nothing to download yet")
-        return ui.download_link("dl_workspace", label, class_="hype-header-btn",
-                                title="Download the project (.zip)")
 
     def _run_config():
         # Reproducibility metadata -> config/run_config.json inside the archive.
@@ -6146,15 +6157,16 @@ def server(input, output, session):
                 "sel_node": sel_node(), "current_step": current_step(),
             }
 
-    def _stream_bundle():
-        """Build the archive (identical for Download and Save) and stream it in 1 MiB chunks —
-        flat egress memory even at hundreds of MB."""
+    def _stream_bundle(include_computed=True):
+        """Build the archive and stream it in 1 MiB chunks — flat egress memory even at
+        hundreds of MB."""
         vectors = {"reach": reach_feat(), "upstream": up_feat(), "left": left_feat(),
                    "right": right_feat(), "downstream": down_feat(), "domain": domain_feat(),
                    "wse_extent": wse_extent_feat(), "k_zones": kzone_feats()}
         path = bundle.zip_workspace(work_dir, vectors=vectors, params=params(),
                                     run_config=_run_config(), state=_project_state(),
-                                    assessment_input=input_snapshot())
+                                    assessment_input=input_snapshot(),
+                                    include_computed=include_computed)
         try:
             with open(path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):   # 1 MiB — flat egress memory
@@ -6165,21 +6177,61 @@ def server(input, output, session):
             except OSError:
                 pass
 
-    @render.download(filename=lambda: f"hype_project_{datetime.now():%Y%m%d_%H%M}.zip")
-    def dl_workspace():
-        yield from _stream_bundle()
+    def _save_scope_full():
+        return str(_safe("save_scope", "full")) == "full"
 
     @render.ui
     def save_project():
         if not _has_workspace():
             return ui.span("Save", class_="hype-nav-dim", title="Nothing to save yet")
-        return ui.download_link("dl_save", "Save",
-                                title="Save a project file (.hype) — reopen it with Open to "
-                                      "pick up where you left off")
+        return ui.input_action_link("nav_save", "Save",
+                                    title="Save a project file (.hype) — reopen it with Open "
+                                          "to pick up where you left off")
 
-    @render.download(filename=lambda: f"hype_project_{datetime.now():%Y%m%d_%H%M}.hype")
+    @reactive.effect
+    @reactive.event(input.nav_save)
+    def _save_dialog():
+        ui.modal_show(ui.modal(
+            ui.input_radio_buttons(
+                "save_scope", None,
+                choices={
+                    "full": ui.TagList(
+                        ui.tags.b("Complete project"),
+                        ui.div("Settings plus all computed data (terrain, water surface, "
+                               "groundwater model, results). Reopens exactly where you "
+                               "left off.", class_="hype-dim")),
+                    "light": ui.TagList(
+                        ui.tags.b("Settings only"),
+                        ui.div("Reach, boundaries, and all parameters — small file. Terrain "
+                               "and model runs are re-run after opening.", class_="hype-dim")),
+                },
+                selected=("full" if _save_scope_full() else "light")),
+            ui.div(".hype files are ZIP archives — rename one to .zip to browse its folders "
+                   "in GIS.", class_="hype-instr hype-dim"),
+            footer=ui.TagList(
+                ui.modal_button("Cancel"),
+                # The click starts the download client-side; the nonce just tells the server
+                # to close the dialog (removing the modal doesn't cancel the transfer).
+                ui.download_button("dl_save", "Save project", class_="btn-primary btn-sm",
+                                   onclick="Shiny.setInputValue('save_dl_go', Date.now())")),
+            title="Save project", easy_close=True))
+
+    @reactive.effect
+    @reactive.event(input.save_dl_go)
+    def _save_dialog_close():
+        ui.modal_remove()
+
+    # suspend_when_hidden=False: the link lives inside the save dialog, which doesn't exist at
+    # session start — with the default suspend, the href would only be computed after the
+    # client reports the late-bound output visible, and the button would stay disabled until
+    # then. Computing it eagerly lets shiny.js cache the value and apply it the moment the
+    # modal's element binds. (The filename lambda + generator still run per download request,
+    # so the scope radio is read at click time.)
+    @output(suspend_when_hidden=False)
+    @render.download(filename=lambda: (f"hype_project_{datetime.now():%Y%m%d_%H%M}"
+                                       f"{'' if _save_scope_full() else '_settings'}.hype"))
     def dl_save():
-        yield from _stream_bundle()
+        yield from _stream_bundle(include_computed=_save_scope_full())
 
     # ---- Open project (restore a saved .hype / downloaded project .zip) ----
     _open_seen: dict = {}      # last consumed upload datapath — the file input is re-created
@@ -6201,8 +6253,8 @@ def server(input, output, session):
                 title="Open project", easy_close=True))
             return
         ui.modal_show(ui.modal(
-            ui.p("Open a saved HYPE project — a .hype file from Save, or a project .zip from "
-                 "Download project. This replaces everything in the current session."),
+            ui.p("Open a saved HYPE project (.hype, or a project .zip saved by an older "
+                 "version). This replaces everything in the current session."),
             ui.input_file("open_project", None, accept=[".hype", ".zip"], multiple=False,
                           button_label="Browse…", placeholder="No file selected", width="100%"),
             title="Open project", easy_close=True))
@@ -6331,11 +6383,17 @@ def server(input, output, session):
         soil_snapshot.set(_soil)
         soil_overrides.set(st.get("soil_overrides") or [])
         results_model.set(st.get("results_model"))
-        sens_result.set(st.get("sens_result"))
+        # Settings-only archives carry no model/sensitivity files — those stages come back
+        # not-done rather than "done" with nothing on disk. Gate on what restore_workspace
+        # actually extracted, NOT on a disk probe: right after the session wipe, Windows can
+        # keep just-deleted dirs visible (delete-pending) until their handles drain.
+        _restored = payload.get("restored") or set()
+        sens_result.set(st.get("sens_result")
+                        if any(p.startswith("sensitivity/") for p in _restored) else None)
         if _soil and _HAS_MAP:
             _show_soils_layer(_soil)
         rn = st.get("run_result")
-        if rn:
+        if rn and any(p.startswith("model/gwf_workspace/") for p in _restored):
             run_result.set(rn)
             try:
                 fp_stats.set(results.flowpath_stats(rn, work_dir))
@@ -6825,7 +6883,7 @@ def server(input, output, session):
                                              "btn-primary btn-sm"),
                                     class_="hype-actions"))
             parts.append(ui.div("Results are in temporary storage — use ",
-                                ui.tags.b("Download project"),
+                                ui.tags.b("Save"),
                                 " in the header before you leave.", class_="hype-warn"))
             return ui.TagList(*parts)
 
@@ -7167,8 +7225,8 @@ def server(input, output, session):
                            ui.span("Run the surface and groundwater models, then delineate "
                                    "the hyporheic zone.")),
                 class_="hype-welcome-steps"),
-            ui.div("Work isn't saved on the server — use Download project (top right) before "
-                   "you leave.", class_="hype-welcome-note"),
+            ui.div("Work isn't saved on the server — use Save (top right) before you leave.",
+                   class_="hype-welcome-note"),
             _next_hint("reach", "Start — define your reach →"),
             chrome=False)
 

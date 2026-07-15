@@ -102,13 +102,13 @@ def _write_vectors(zf: zipfile.ZipFile, vectors: dict, seen: set) -> None:
         seen.add(arc)
 
 
-def _readme(run_config: dict | None, seen: set) -> str:
+def _readme(run_config: dict | None, seen: set, include_computed: bool = True) -> str:
     present = sorted({a.split("/", 2)[1] for a in seen if "/" in a})   # top-level stage folders
     rc = run_config or {}
     crs = rc.get("working_crs") or {}
     ts = rc.get("generated_at") or datetime.now().isoformat(timespec="seconds")
     lines = [
-        "HYPE - Download Workspace",
+        "HYPE - Project Archive",
         f"Generated: {ts}",
         f"Working CRS: EPSG:{crs.get('epsg')} ({crs.get('name')})    Vectors: EPSG:4326",
         "",
@@ -136,13 +136,18 @@ def _readme(run_config: dict | None, seen: set) -> str:
         "Included in this archive: " + (", ".join(present) or "config only (nothing run yet)"),
         "",
     ]
+    if not include_computed:
+        lines += ["Saved without computed data (settings only) - reopen and re-run the",
+                  "stages to rebuild terrain, water-surface, and groundwater results.",
+                  ""]
     return "\n".join(lines)
 
 
 def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
                   run_config: dict | None = None, state: dict | None = None,
                   assessment_input: dict | None = None,
-                  scoring_profile: dict | None = None) -> str:
+                  scoring_profile: dict | None = None,
+                  include_computed: bool = True) -> str:
     """Build the organized workspace archive on disk; return the temp-file path.
 
     The archive is built to a temp file (not io.BytesIO) so peak memory stays flat even when the
@@ -155,6 +160,10 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
     state            : session-state manifest          -> config/state.json (restore reads this)
     assessment_input : frozen AssessmentInputSnapshot  -> config/assessment_input.json  (v2)
     scoring_profile  : HFCI scoring profile            -> config/scoring_profile.json   (v2)
+    include_computed : False = settings-only save — vectors + config/ + data_sources/ but none of
+                       the computed/derived trees (2_Terrain, 4_Surface_Water, 5_Groundwater,
+                       sensitivity/, 6_Site_Report). Restore is file-existence-gated per stage,
+                       so such an archive reopens with those stages simply not done yet.
     """
     root = Path(work_dir)
     seen: set = set()
@@ -165,39 +174,43 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
             # 1_Reach_Centerline + 3_Boundaries — serialized from in-memory reactives
             _write_vectors(zf, vectors, seen)
 
-            # 2_Terrain
-            for n in ("dem.tif", "dem_carved.tif", "dem_carve_diff.tif"):
-                _add_file(zf, root / "inputs" / n, _arc("2_Terrain", n), seen)
-            _add_file(zf, root / "model" / "reprojected_terrain_raster.tif",
-                      _arc("2_Terrain", "reprojected_terrain_raster.tif"), seen)
+            if include_computed:
+                # 2_Terrain
+                for n in ("dem.tif", "dem_carved.tif", "dem_carve_diff.tif"):
+                    _add_file(zf, root / "inputs" / n, _arc("2_Terrain", n), seen)
+                _add_file(zf, root / "model" / "reprojected_terrain_raster.tif",
+                          _arc("2_Terrain", "reprojected_terrain_raster.tif"), seen)
 
-            # 4_Surface_Water — whole HEC-RAS project + convenience result tifs + WSE inputs
-            _add_tree(zf, root / "ras", _arc("4_Surface_Water", "HEC-RAS"), seen)
-            for n in ("depth_last.tif", "wse_last.tif"):
-                _add_file(zf, root / "ras" / n, _arc("4_Surface_Water", n), seen)
-            _add_glob(zf, root / "inputs", "wse_*.tif",
-                      _arc("4_Surface_Water", "water_surface_inputs"), seen)
+                # 4_Surface_Water — whole HEC-RAS project + convenience result tifs + WSE inputs
+                _add_tree(zf, root / "ras", _arc("4_Surface_Water", "HEC-RAS"), seen)
+                for n in ("depth_last.tif", "wse_last.tif"):
+                    _add_file(zf, root / "ras" / n, _arc("4_Surface_Water", n), seen)
+                _add_glob(zf, root / "inputs", "wse_*.tif",
+                          _arc("4_Surface_Water", "water_surface_inputs"), seen)
 
-            # 5_Groundwater — MODFLOW6/MODPATH7 workspaces (original names) + GW inputs + Results
-            _add_tree(zf, root / "model" / "gwf_workspace",
-                      _arc("5_Groundwater", "model", "gwf_workspace"), seen)
-            _add_tree(zf, root / "model" / "mp7_workspace",
-                      _arc("5_Groundwater", "model", "mp7_workspace"), seen)
-            for n in ("reprojected_water_surface_raster.tif",
-                      "cropped_water_surface_raster.tif", "grid_points_elevation.csv"):
-                _add_file(zf, root / "model" / n, _arc("5_Groundwater", "inputs", n), seen)
-            _add_tree(zf, root / "summary" / "head",
-                      _arc("5_Groundwater", "Results", "head"), seen)
-            _add_glob(zf, root / "summary", "Forward_*",
-                      _arc("5_Groundwater", "Results", "pathlines"), seen)
-            _add_tree(zf, root / "summary" / "hz",
-                      _arc("5_Groundwater", "Results", "hyporheic_zone"), seen)
+                # 5_Groundwater — MODFLOW6/MODPATH7 workspaces (original names) + GW inputs + Results
+                _add_tree(zf, root / "model" / "gwf_workspace",
+                          _arc("5_Groundwater", "model", "gwf_workspace"), seen)
+                _add_tree(zf, root / "model" / "mp7_workspace",
+                          _arc("5_Groundwater", "model", "mp7_workspace"), seen)
+                for n in ("reprojected_water_surface_raster.tif",
+                          "cropped_water_surface_raster.tif", "grid_points_elevation.csv"):
+                    _add_file(zf, root / "model" / n, _arc("5_Groundwater", "inputs", n), seen)
+                _add_tree(zf, root / "summary" / "head",
+                          _arc("5_Groundwater", "Results", "head"), seen)
+                _add_glob(zf, root / "summary", "Forward_*",
+                          _arc("5_Groundwater", "Results", "pathlines"), seen)
+                _add_tree(zf, root / "summary" / "hz",
+                          _arc("5_Groundwater", "Results", "hyporheic_zone"), seen)
 
-            # v2 trees — recorded external data, sensitivity outputs, and the site report.
-            # Each skips silently when its source dir doesn't exist yet (feature not run).
+                # v2 derived trees — sensitivity outputs and the site report. Each skips
+                # silently when its source dir doesn't exist yet (feature not run).
+                _add_tree(zf, root / "sensitivity", _arc("sensitivity"), seen)
+                _add_tree(zf, root / "report", _arc("6_Site_Report"), seen)
+
+            # data_sources rides along in BOTH scopes — the recorded USGS/NRCS responses are
+            # tiny and they're inputs (provenance), not computed results.
             _add_tree(zf, root / "data_sources", _arc("data_sources"), seen)
-            _add_tree(zf, root / "sensitivity", _arc("sensitivity"), seen)
-            _add_tree(zf, root / "report", _arc("6_Site_Report"), seen)
 
             # config/ + README (writestr => arcname is a str with '/', always portable)
             if params is not None:
@@ -215,7 +228,7 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
             if scoring_profile is not None:
                 zf.writestr(f"{ROOT}/config/scoring_profile.json",
                             json.dumps(scoring_profile, indent=2, default=str))
-            zf.writestr(f"{ROOT}/README.txt", _readme(run_config, seen))
+            zf.writestr(f"{ROOT}/README.txt", _readme(run_config, seen, include_computed))
         return tmp
     except BaseException:
         try:
@@ -279,9 +292,13 @@ def restore_workspace(zip_path, work_dir) -> dict:
 
     Returns {"state": dict, "vectors": {name: Feature | [Feature]}, "params": dict|None,
     "run_config": dict|None, "assessment_input": dict|None, "scoring_profile": dict|None,
-    "extracted": int}. `assessment_input`/`scoring_profile` are None for v1 archives (the legacy
-    adapter — their pieces simply weren't saved). Raises ProjectError with a user-facing message
-    when the file isn't a reopenable HYPE project.
+    "extracted": int, "restored": set[str]}. `restored` holds the workspace-relative posix
+    path of every file this call wrote — the caller should gate "is stage X's data present?"
+    on it rather than re-probing the filesystem (right after a session wipe, Windows can keep
+    just-deleted dirs visible in delete-pending state until their handles drain).
+    `assessment_input`/`scoring_profile` are None for v1 archives (the legacy adapter — their
+    pieces simply weren't saved). Raises ProjectError with a user-facing message when the file
+    isn't a reopenable HYPE project.
     """
     root = Path(work_dir).resolve()
     try:
@@ -342,4 +359,4 @@ def restore_workspace(zip_path, work_dir) -> dict:
 
     return {"state": state, "vectors": vectors, "params": params,
             "run_config": run_config, "assessment_input": assessment_input,
-            "scoring_profile": scoring_profile, "extracted": extracted}
+            "scoring_profile": scoring_profile, "extracted": extracted, "restored": done}

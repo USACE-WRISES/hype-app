@@ -1,5 +1,6 @@
 """Project-archive v2 round-trip + v1 legacy-adapter tests (spec §4.4, §13.5)."""
 import json
+import zipfile
 
 import pytest
 
@@ -20,6 +21,13 @@ def _make_workspace(root):
     (root / "sensitivity" / "manifest.json").write_text('{"scenarios": []}')
     (root / "report").mkdir(parents=True)
     (root / "report" / "report.html").write_text("<html></html>")
+    # heavy computed trees — what the settings-only scope leaves behind
+    (root / "ras").mkdir()
+    (root / "ras" / "project.prj").write_text("RAS")
+    (root / "model" / "gwf_workspace").mkdir(parents=True)
+    (root / "model" / "gwf_workspace" / "sim.nam").write_text("nam")
+    (root / "summary" / "head").mkdir(parents=True)
+    (root / "summary" / "head" / "head_L1.tif").write_bytes(b"FAKE-HEAD")
 
 
 def test_format_version_is_2():
@@ -56,6 +64,10 @@ def test_v2_roundtrip(tmp_path):
     assert (dst / "inputs" / "dem.tif").read_bytes() == b"FAKE-DEM"
     assert (dst / "data_sources" / "usgs" / "delineate.json").exists()
     assert (dst / "sensitivity" / "manifest.json").exists()
+    # the restored-manifest the app gates stage state on
+    assert "inputs/dem.tif" in out["restored"]
+    assert "model/gwf_workspace/sim.nam" in out["restored"]
+    assert any(p.startswith("sensitivity/") for p in out["restored"])
 
 
 def test_site_metadata_survives_roundtrip(tmp_path):
@@ -80,6 +92,56 @@ def test_site_metadata_survives_roundtrip(tmp_path):
     assert site["assessment_date"] == "2026-07-11"
     assert site["reach_length_m"] == 904.7
     assert (dst / "report" / "report.html").exists()
+
+
+def test_full_scope_includes_computed_trees(tmp_path):
+    """Default include_computed=True packs every heavy/derived tree (today's behavior)."""
+    src = tmp_path / "s"
+    src.mkdir()
+    _make_workspace(src)
+    zip_path = bundle.zip_workspace(src, vectors={}, state={"format_version": 2})
+    names = zipfile.ZipFile(zip_path).namelist()
+    for arc in (f"{bundle.ROOT}/2_Terrain/dem.tif",
+                f"{bundle.ROOT}/4_Surface_Water/HEC-RAS/project.prj",
+                f"{bundle.ROOT}/5_Groundwater/model/gwf_workspace/sim.nam",
+                f"{bundle.ROOT}/5_Groundwater/Results/head/head_L1.tif",
+                f"{bundle.ROOT}/sensitivity/manifest.json",
+                f"{bundle.ROOT}/6_Site_Report/report.html"):
+        assert arc in names
+
+
+def test_settings_only_scope(tmp_path):
+    """include_computed=False keeps vectors + config + data_sources (small, provenance) but
+    drops every computed/derived tree — and the light archive still restores cleanly, with
+    the heavy stages simply absent from the new workspace."""
+    src = tmp_path / "s"
+    src.mkdir()
+    _make_workspace(src)
+    state = {"format_version": 2, "app_version": "2026.07"}
+    zip_path = bundle.zip_workspace(src, vectors={"reach": _FEATURE}, params={"kh": 5.0},
+                                    state=state, include_computed=False)
+
+    zf = zipfile.ZipFile(zip_path)
+    names = zf.namelist()
+    assert f"{bundle.ROOT}/config/state.json" in names
+    assert f"{bundle.ROOT}/1_Reach_Centerline/reach_centerline.geojson" in names
+    assert f"{bundle.ROOT}/data_sources/usgs/delineate.json" in names
+    heavy = ("2_Terrain/", "4_Surface_Water/", "5_Groundwater/", "6_Site_Report/",
+             "sensitivity/")
+    assert not [n for n in names if any(f"/{h}" in n for h in heavy)]
+    assert "Saved without computed data" in zf.read(f"{bundle.ROOT}/README.txt").decode()
+
+    dst = tmp_path / "d"
+    dst.mkdir()
+    out = bundle.restore_workspace(zip_path, dst)
+    assert out["state"] == state
+    assert out["params"] == {"kh": 5.0}
+    assert out["vectors"]["reach"] == _FEATURE
+    assert not (dst / "inputs" / "dem.tif").exists()
+    assert not (dst / "model" / "gwf_workspace").exists()
+    # no computed artifacts in the restored-manifest -> the app restores gw/sens as not-done
+    assert not any(p.startswith(("model/gwf_workspace/", "sensitivity/"))
+                   for p in out["restored"])
 
 
 def test_v1_archive_opens_via_legacy_adapter(tmp_path):

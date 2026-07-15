@@ -71,7 +71,6 @@
   --ic-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8h9M8.5 4 12.5 8 8.5 12' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --ic-chev:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --ic-info:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.6' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M8 7.2v3.6' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='4.8' r='.9'/%3E%3C/svg%3E");
-  --ic-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 2v8M4.5 7 8 10.5 11.5 7' fill='none' stroke='%23000' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M3 13h10' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
 /* ============ 2. base + typography ============ */
@@ -104,18 +103,8 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-nav a { color: var(--hype-on-accent-dim); text-decoration: none; font-size: var(--fs-2); cursor: pointer; }
 .hype-nav a:hover { color: #fff; }
 
-/* labeled header button (Download project) — quiet ghost on the navy bar */
-.hype-header-btn { display: inline-flex; align-items: center; gap: 7px; height: 30px;
-  padding: 0 12px; font: 500 var(--fs-1)/1 var(--font-body); color: var(--hype-on-accent-dim);
-  background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .22);
-  border-radius: var(--r-1); cursor: pointer; text-decoration: none; white-space: nowrap; }
-.hype-header-btn:hover { color: #fff; background: rgba(255, 255, 255, .16); text-decoration: none; }
-/* .hype-nav a (higher specificity) would override the button look — pin it back */
-.hype-nav a.hype-header-btn { color: var(--hype-on-accent-dim); font-size: var(--fs-1); }
-.hype-nav a.hype-header-btn:hover { color: #fff; }
-.hype-header-btn.dim { opacity: .45; cursor: default; pointer-events: none; }
-.hype-header-btn .hype-ic { width: 13px; height: 13px; background: currentColor;
-  -webkit-mask: var(--ic-download) center/contain no-repeat; mask: var(--ic-download) center/contain no-repeat; }
+/* thin vertical rule separating the project-file actions (New/Open/Save) from About/Help */
+.hype-nav-sep { width: 1px; height: 14px; background: rgba(255, 255, 255, .35); align-self: center; }
 /* disabled plain nav entry (Save before there's anything to save) — link look, no action */
 .hype-nav .hype-nav-dim { color: var(--hype-on-accent-dim); opacity: .45;
   font-size: var(--fs-2); cursor: default; }
