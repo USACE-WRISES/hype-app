@@ -74,10 +74,25 @@ def footprint_geojson(hz_dir, cls: str) -> dict | None:
         return None
 
 
+def flow_exchange_geojson(hz_dir, direction: str) -> dict | None:
+    """Streambed exchange cells for one direction ("down" = stream water entering the
+    aquifer, "up" = aquifer discharging to the stream) — EPSG:4326 cell rectangles with
+    a q_m3d property. None before the four-way interface pass existed."""
+    p = Path(hz_dir) / f"hz_flow_{direction}.geojson"
+    if not p.exists():
+        return None
+    try:
+        gj = json.loads(p.read_text())
+        return gj if gj.get("features") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def flux_arrays(hz_dir) -> dict | None:
-    """Per-release-particle arrays from the flux-weighted stream-interface pass (§8.3):
-    {source_node, weight (m3/day), cls (0 unresolved / 1 returning / 2 losing),
-    time_days, status, exit_code}. None when the pass didn't run (fully gaining reach)."""
+    """Per-release-particle arrays from the flux-weighted boundary-interface pass (§8.3):
+    {source_node, weight (m3/day), cls (0 unresolved / 1 returning / 2 losing /
+    3 gaining / 4 throughflow), time_days, status, exit_code, origin_code (absent in
+    pre-four-way artifacts)}. None when the pass didn't run (no boundary inflow)."""
     p = Path(hz_dir) / "hz_flux.npz"
     if not p.exists():
         return None

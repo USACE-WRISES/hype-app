@@ -96,8 +96,6 @@ def build_input_snapshot(
     grid = GridSettings(
         cell_size_x=float(params["cell_size_x"]), cell_size_y=float(params["cell_size_y"]),
         gw_mod_depth=float(params["gw_mod_depth"]), layer_thickness=float(params["z"]),
-        particles_per_cell=int(params.get("particles_per_cell", 1)),
-        min_path_mult=float(params.get("min_path_mult", 3.0)),
     )
     if terrain is None:
         terrain = TerrainSource(model_origin_elev=params.get("model_origin_elev"))

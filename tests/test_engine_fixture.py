@@ -107,7 +107,7 @@ def _run_iface(tmp_path, gwf, member):
         gwf, member=member, idomain=np.ones((2, 1, 11), dtype=int),
         head=load_heads(gwf), T=T, B=B, gwf_ws=tmp_path, hz_ws=tmp_path / "hz",
         exe=_exe(env, "mp7"), porosity=0.3, max_time_days=1.0e6,
-        particles_per_cell=4, log=lambda m: None)
+        particles_per_cell=4, cell_area2d=np.ones((1, 11)), log=lambda m: None)
 
 
 def test_interface_pass_returning_loop(tmp_path):
@@ -145,10 +145,19 @@ def test_interface_pass_returning_loop(tmp_path):
     assert acc["returning"] > 0                    # the loop returns stream water
     assert acc["unresolved"] == pytest.approx(0.0, abs=1e-9)
     pp = flux["per_particle"]
-    assert float(pp["weight"].sum()) == pytest.approx(acc["total_downwelling"], rel=1e-6)
+    # side seeds ride the same run since the four-way extension — the downwelling
+    # invariant holds for the stream-origin subset (unreleased is 0 here)
+    top = pp["origin_code"] == MEMBER["top"]
+    assert float(pp["weight"][top].sum()) == pytest.approx(acc["total_downwelling"], rel=1e-6)
     ret = pp["cls"] == 1
     assert ret.any() and (pp["time_days"][ret] > 0).all()
     assert flux["rtd"] is not None and flux["rtd"]["weighted_mean_days"] > 0
+    # active streambed area: only the net-downwelling stream column (col 2) feeds returning paths
+    assert acc["active_streambed_area_m2"] == pytest.approx(1.0)
+    # the optional second (pathline) pass attached a per-particle max penetration depth
+    assert "max_depth_m" in pp
+    md = pp["max_depth_m"][ret]
+    assert np.isfinite(md).any() and (md[np.isfinite(md)] >= 0).all()
 
 
 def test_interface_pass_losing_only(tmp_path):
@@ -175,6 +184,55 @@ def test_interface_pass_losing_only(tmp_path):
     assert acc["losing"] == pytest.approx(acc["total_downwelling"], rel=1e-6)
     assert acc["returning"] == pytest.approx(0.0, abs=1e-9)
     assert acc["mass_balance_error"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_interface_pass_four_way(tmp_path):
+    """§8.3 four-way: a high-head side feeds the domain (gaining + throughflow) while both
+    stream cells are net sinks — the pass must run WITHOUT any downwelling (the old code
+    skipped entirely), the side ledger must close, and the budget identities must hold."""
+    import numpy as np
+
+    from hypetool.functions.hz_analysis import MEMBER, read_boundary_flows
+    env = os.getenv("HYPE_MODFLOW_BIN")
+    gwf = _build_interface_model(
+        tmp_path, _exe(env, "mf6"),
+        river_spd=[[(0, 0, 3), 9.4], [(0, 0, 7), 9.1]],
+        side_spd=[[(0, 0, 0), 9.8], [(1, 0, 0), 9.8],
+                  [(0, 0, 10), 8.9], [(1, 0, 10), 8.9]])
+
+    ncol = 11
+    member = np.zeros(2 * ncol, dtype=np.uint8)
+    member[3] = MEMBER["top"]
+    member[7] = MEMBER["top"]
+    for lay in (0, 1):
+        member[lay * ncol + 0] = MEMBER["left"]
+        member[lay * ncol + 10] = MEMBER["right"]
+
+    flows = read_boundary_flows(tmp_path, member)
+    assert flows["side_in"] and all(q > 0 for q in flows["side_in"].values())
+    assert flows["up_m3d"] > 0 and flows["side_out_m3d"] > 0
+    tin = sum(flows["down"].values()) + sum(flows["side_in"].values())
+    tout = flows["up_m3d"] + flows["side_out_m3d"]
+    assert tin == pytest.approx(tout, rel=1e-6)    # solver closure, straight from the budget
+
+    flux = _run_iface(tmp_path, gwf, member)
+    assert flux is not None
+    acc = flux["accounting"]
+    assert acc["gaining"] > 0                      # the side water discharging to the stream
+    assert acc["throughflow"] >= 0
+    assert acc["returning"] + acc["losing"] + acc["unresolved"] == pytest.approx(
+        acc["total_downwelling"], rel=1e-6, abs=1e-9)
+    assert acc["gaining"] + acc["throughflow"] + acc["side_unresolved"] == pytest.approx(
+        acc["total_side_inflow"], rel=1e-6)
+    assert acc["closure_error_global"] == pytest.approx(0.0, abs=1e-6)
+    assert acc["streambed_area_m2"] == pytest.approx(2.0)   # two stream plan cells × 1 m²
+    # exchange-map payload carries every stream cell with its net signed flow
+    sc = dict(zip(flux["stream_cells"]["node"], flux["stream_cells"]["q_m3d"]))
+    assert set(sc) == {3, 7}
+    assert flux["rtd_by_class"].get("gaining", {}).get("weighted_mean_days", 0) > 0
+    pp = flux["per_particle"]
+    assert set(np.unique(pp["origin_code"])) <= {MEMBER["top"], MEMBER["left"],
+                                                 MEMBER["right"]}
 
 
 def test_forward_particle_exits_downgradient(built):

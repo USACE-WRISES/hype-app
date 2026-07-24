@@ -6,7 +6,7 @@ from hype_app.snapshot import BC_CORNER, BC_PROFILE, build_input_snapshot
 def _corner_params(**o):
     p = dict(
         cell_size_x=10.0, cell_size_y=10.0, gw_mod_depth=6.0, z=0.25,
-        kh=10.0, kv=1.0, porosity=0.3, particles_per_cell=1, min_path_mult=3.0,
+        kh=10.0, kv=1.0, porosity=0.3,
         model_origin_elev=101.5, boundary_condition_mode=BC_CORNER,
         upstream_left_fpl_gw_gradient=0.005, upstream_right_fpl_gw_gradient=0.005,
         downstream_left_fpl_gw_gradient=0.005, downstream_right_fpl_gw_gradient=0.005,

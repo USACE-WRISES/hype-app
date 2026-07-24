@@ -3,7 +3,8 @@ slicing in delineate could leave bend/jog vertices on the caps, and end-plane cl
 lead/tail floodplain vertices lying ON the cap line (they belong to the cap, not the side).
 condition_boundary_sides straightens the caps to 2-point chords and migrates cap-collinear side
 vertices into them; geometry.reach_boundary_issues softly validates that the reach centerline
-meets both caps and never intersects the left/right floodplain lines.
+meets both caps, and geometry.centerline_conflicts is the BLOCKING check that no boundary line
+lies across the centerline (floodplain sides: any intersection; caps: only away from the ends).
 
 Conditioning frame (projected metres): up cap on x=0 spanning y=+100..-100, down cap on x=500;
 left runs upstream→downstream near y=+100, right near y=-100 (the _sides_from_ring convention:
@@ -13,7 +14,7 @@ from math import cos, radians
 from shapely.geometry import LineString
 
 from hype_app.delineate import condition_boundary_sides
-from hype_app.geometry import reach_boundary_issues
+from hype_app.geometry import centerline_conflicts, reach_boundary_issues
 
 
 def _frame(left=None, right=None, up=None, down=None):
@@ -158,15 +159,61 @@ def test_reach_endpoint_beyond_tolerance_flagged():
     assert len(issues) == 1 and "Upstream" in issues[0]
 
 
-def test_reach_crossing_floodplain_side_flagged():
-    b = _bounds()
-    reach = _f([(0.0, 0.0), (250.0, 150.0), (500.0, 0.0)])      # bulges across the left line
-    issues = reach_boundary_issues(reach, b["up"], b["left"], b["right"], b["down"])
-    assert len(issues) == 1 and "Left" in issues[0]
-
-
 def test_missing_inputs_return_empty():
     b = _bounds()
     reach = _f([(0.0, 0.0), (500.0, 0.0)])
     assert reach_boundary_issues(reach, b["up"], b["left"], None, b["down"]) == []
     assert reach_boundary_issues(None, b["up"], b["left"], b["right"], b["down"]) == []
+
+
+# --- centerline_conflicts (blocking) --------------------------------------------------------------
+
+def _conflicts(reach, b):
+    return centerline_conflicts(reach, b["up"], b["left"], b["right"], b["down"])
+
+
+def test_clean_frame_has_no_conflicts():
+    # Endpoints ON both caps — the legitimate generated layout must never block.
+    assert _conflicts(_f([(0.0, 0.0), (500.0, 0.0)]), _bounds()) == []
+
+
+def test_reach_crossing_floodplain_side_is_a_conflict_not_a_soft_issue():
+    b = _bounds()
+    reach = _f([(0.0, 0.0), (250.0, 150.0), (500.0, 0.0)])      # bulges across the left line
+    conflicts = _conflicts(reach, b)
+    assert [c["slot"] for c in conflicts] == ["left"]
+    assert "Left floodplain" in conflicts[0]["msg"]
+    # the check moved out of the soft list — caps are met, so nothing soft remains
+    assert reach_boundary_issues(reach, b["up"], b["left"], b["right"], b["down"]) == []
+
+
+def test_side_lying_along_the_stream_conflicts():
+    b = _bounds()
+    b["right"] = _f([(0.0, 0.0), (500.0, 0.0)])                 # drawn on the centerline
+    conflicts = _conflicts(_f([(0.0, 0.0), (500.0, 0.0)]), b)
+    assert [c["slot"] for c in conflicts] == ["right"]
+
+
+def test_cap_crossing_mid_reach_conflicts_but_end_touch_does_not():
+    b = _bounds()
+    b["down"] = _f([(250.0, 100.0), (250.0, -100.0)])           # dragged across the interior
+    conflicts = _conflicts(_f([(0.0, 0.0), (500.0, 0.0)]), b)
+    assert [c["slot"] for c in conflicts] == ["down"]
+    # reach overshooting the up cap by 10 m still crosses it NEAR the end — allowed
+    assert _conflicts(_f([(-10.0, 0.0), (500.0, 0.0)]), _bounds()) == []
+
+
+def test_cap_gap_is_soft_not_a_conflict():
+    b = _bounds()
+    reach = _f([(30.0, 0.0), (500.0, 0.0)])                     # 30 m short of the up cap
+    assert _conflicts(reach, b) == []                           # no overlap → no block
+    issues = reach_boundary_issues(reach, b["up"], b["left"], b["right"], b["down"])
+    assert len(issues) == 1 and "Upstream" in issues[0]         # the gap stays a soft warning
+
+
+def test_conflicts_check_sides_independently():
+    b = _bounds()
+    reach = _f([(0.0, 0.0), (250.0, 150.0), (500.0, 0.0)])
+    conflicts = centerline_conflicts(reach, None, b["left"], None, None)
+    assert [c["slot"] for c in conflicts] == ["left"]           # half-drawn set still flags
+    assert centerline_conflicts(None, b["up"], b["left"], b["right"], b["down"]) == []

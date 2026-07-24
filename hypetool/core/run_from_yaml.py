@@ -1064,14 +1064,36 @@ def _run_pipeline(cfg: Settings,
             raise ValueError("When boundary_condition_mode='Spatially Varying Gradient', both "
                              "'left_boundary_gradient_profile' and 'right_boundary_gradient_profile' must be provided.")
 
+        # Corner anchors: each up/downstream corner anchors to the WSE along the cap line it
+        # sits on (the valid sample nearest that corner), not the globally nearest wetted edge —
+        # the nearest edge to a corner can be a bank partway down the reach.
+        def _cap_anchor(pt, cap_line, tag):
+            if pt is None or cap_line is None:
+                return None
+            hit = myu.nearest_valid_wse_along_line(
+                cfg.cropped_water_surface_raster, cap_line, pt)
+            if hit is None:
+                log(f"  [{tag}] cap line does not cross valid WSE - falling back to nearest wetted edge")
+                return None
+            d, w, _xy = hit
+            log(f"  [{tag}] cap-line WSE anchor: dist={d:.3f}, WSE={w:.3f}")
+            return (d, w)
+
+        lf0 = _cap_anchor(l_first_pt, upstream_line,   "left f0")
+        lf1 = _cap_anchor(l_last_pt,  downstream_line, "left f1")
+        rf0 = _cap_anchor(r_first_pt, upstream_line,   "right f0")
+        rf1 = _cap_anchor(r_last_pt,  downstream_line, "right f1")
+
         log("  Left boundary profile:")
         gw_left, left_head_f0, left_head_f1 = myu.compute_boundary_heads_from_profile(
-            left_cells_0, grid_x, grid_y, left_line, left_profile, wse_edge_idx, log=log
+            left_cells_0, grid_x, grid_y, left_line, left_profile, wse_edge_idx, log=log,
+            f0_anchor=lf0, f1_anchor=lf1
         ) if left_cells_0 else ([], float("nan"), float("nan"))
 
         log("  Right boundary profile:")
         gw_right, right_head_f0, right_head_f1 = myu.compute_boundary_heads_from_profile(
-            right_cells_0, grid_x, grid_y, right_line, right_profile, wse_edge_idx, log=log
+            right_cells_0, grid_x, grid_y, right_line, right_profile, wse_edge_idx, log=log,
+            f0_anchor=rf0, f1_anchor=rf1
         ) if right_cells_0 else ([], float("nan"), float("nan"))
 
         # Upstream (interpolate between left/right at f=0); Downstream (f=1)
@@ -1104,35 +1126,43 @@ def _run_pipeline(cfg: Settings,
     # -------- Step 6â€“7: Build/run + postprocess --------
     if getattr(cfg, "kh_polygon", False):
         log("KH polygon mapping enabled: per-cell KH (and KV if present) will be used.")
-    log("STEP 5 â€“ Building & running models (MF6 + MP7) â€¦")
+    log("STEP 5 â€“ Building & running models (MF6 + MP7) â€¦"
+        if bool(getattr(cfg, "run_particles", True))
+        else "STEP 5 â€“ Building & running the MF6 model â€¦")
     gwfsim, gwf = myu.scenario(
         cfg, idomain, chd_data, river_cells,
         write=(cfg.write or True), run=(cfg.run or True), plot=False, silent=False
     )
 
-    log("STEP 6 â€” Postâ€‘processing MODPATH7 (Forward) â€¦")
     summary_dir = Path(cfg.output_directory) / "summary"
     summary_dir.mkdir(parents=True, exist_ok=True)
-    artifacts = myu.process_and_export_modpath7_results(
-        workspace=cfg.mp7_ws,
-        workspace_gwf=cfg.gwf_ws,
-        sim_name=cfg.sim_name,
-        gwf_model_name=cfg.gwf_name,
-        hec_ras_crs=cfg.hec_ras_crs,
-        bed_elevation=cfg.bed_elevation,
-        ncol=cfg.ncol, nrow=cfg.nrow, z=cfg.z, nlay=cfg.nlay,
-        river_cells=river_cells, gwf=gwf,
-        xorigin_value=cfg.xmin, yorigin_value=cfg.ymin,
-        output_folder=summary_dir, direction="Forward",
-        export_csv=True,
-        export_shp=True,            # 2D
-        export_shp_3d=True,         # 3D (filtered/hyporheic)
-        export_shp_wgs84=False,
-        export_kml=False, export_kmz=False, export_gpkg=False,
-        export_results_txt=True,
-        include_pngs_in_return=True, export_pngs=True, plots_dpi=150,
-        min_path_mult=float(getattr(cfg, "min_path_mult", 3.0) or 0.0),
-    )
+    # App runs skip the whole per-run MP7 post-processing (Settings.run_particles=False;
+    # scenario() didn't run MODPATH either). artifacts stays empty, so every particle key
+    # in the return dict resolves to None and downstream consumers fall back gracefully.
+    _particles = bool(getattr(cfg, "run_particles", True))
+    artifacts: dict = {}
+    if _particles:
+        log("STEP 6 â€” Postâ€‘processing MODPATH7 (Forward) â€¦")
+        artifacts = myu.process_and_export_modpath7_results(
+            workspace=cfg.mp7_ws,
+            workspace_gwf=cfg.gwf_ws,
+            sim_name=cfg.sim_name,
+            gwf_model_name=cfg.gwf_name,
+            hec_ras_crs=cfg.hec_ras_crs,
+            bed_elevation=cfg.bed_elevation,
+            ncol=cfg.ncol, nrow=cfg.nrow, z=cfg.z, nlay=cfg.nlay,
+            river_cells=river_cells, gwf=gwf,
+            xorigin_value=cfg.xmin, yorigin_value=cfg.ymin,
+            output_folder=summary_dir, direction="Forward",
+            export_csv=True,
+            export_shp=True,            # 2D
+            export_shp_3d=True,         # 3D (filtered/hyporheic)
+            export_shp_wgs84=False,
+            export_kml=False, export_kmz=False, export_gpkg=False,
+            export_results_txt=True,
+            include_pngs_in_return=True, export_pngs=True, plots_dpi=150,
+            min_path_mult=float(getattr(cfg, "min_path_mult", 3.0) or 0.0),
+        )
 
     # --- NEW: Echo the publication-ready stats to the toolbox/console ---
     try:
@@ -1150,21 +1180,22 @@ def _run_pipeline(cfg: Settings,
 
 
     # -------- NEW: Export FULL (unfiltered) 3D pathlines shapefile --------
-    try:
-        full3d = myu.export_full_modpath7_pathlines_3d_shp(
-            workspace=cfg.mp7_ws,
-            workspace_gwf=cfg.gwf_ws,
-            sim_name=cfg.sim_name,
-            gwf_model_name=cfg.gwf_name,
-            hec_ras_crs=cfg.hec_ras_crs,
-            projection_file=getattr(cfg, "projection_file", None),
-            output_folder=summary_dir,
-            direction="Forward",
-        )
-        if full3d:
-            artifacts["lines_shp_3d_full"] = full3d
-    except Exception as e:
-        log(f"[WARN] Full (unfiltered) 3D pathline export skipped: {e}")
+    if _particles:
+        try:
+            full3d = myu.export_full_modpath7_pathlines_3d_shp(
+                workspace=cfg.mp7_ws,
+                workspace_gwf=cfg.gwf_ws,
+                sim_name=cfg.sim_name,
+                gwf_model_name=cfg.gwf_name,
+                hec_ras_crs=cfg.hec_ras_crs,
+                projection_file=getattr(cfg, "projection_file", None),
+                output_folder=summary_dir,
+                direction="Forward",
+            )
+            if full3d:
+                artifacts["lines_shp_3d_full"] = full3d
+        except Exception as e:
+            log(f"[WARN] Full (unfiltered) 3D pathline export skipped: {e}")
 
     # -------- Head exports (GeoTIFFs + netCDF; mosaic) --------
     log("STEP 7 â€” Exporting hydraulic head layers â€¦")

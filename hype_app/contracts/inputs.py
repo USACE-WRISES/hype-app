@@ -71,6 +71,9 @@ class GridSettings(HypeModel):
     gw_mod_depth: float
     layer_thickness: float                        # `z`
     nlay: int | None = None
+    # Legacy compat only (2026-07-18): the per-run stream-seeded MP7 pass was removed — the
+    # app delineates from ALL cells post-run (hz_analysis). Kept with defaults so archived
+    # assessment_input.json files still validate under HypeModel's extra="forbid".
     particles_per_cell: int = 1
     min_path_mult: float = 3.0
 
@@ -110,11 +113,11 @@ class AssessmentInputSnapshot(HypeModel):
                            "source": self.streamflow.provenance.source},
             "soil_k": self.k.model_dump(mode="json"),
             "gradients": self.gradients.model_dump(mode="json"),
+            # legacy particles_per_cell/min_path_mult stay excluded so the grid hash is
+            # stable across the System-A removal (the "particles" group itself is gone —
+            # no run consumes those knobs anymore)
             "grid": {k: v for k, v in self.grid.model_dump(mode="json").items()
                      if k not in ("particles_per_cell", "min_path_mult")},
-            "particles": {"porosity": self.k.porosity,
-                          "particles_per_cell": self.grid.particles_per_cell,
-                          "min_path_mult": self.grid.min_path_mult},
         }
 
     def group_hashes(self) -> dict[str, str]:

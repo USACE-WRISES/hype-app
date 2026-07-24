@@ -326,6 +326,15 @@
     if (window.Shiny && Shiny.addCustomMessageHandler) {
       Shiny.addCustomMessageHandler("hype_tree", onMessage);
       Shiny.addCustomMessageHandler("hype_fly", function (msg) { flyTo(msg && msg.bounds); });
+      // Tab title mirrors the project name; the page's own title returns when unset.
+      // Captured lazily: at script parse the <title> element may not exist yet (this
+      // file loads from head_content, ahead of the title tag), so document.title is "".
+      var baseTitle = null;
+      Shiny.addCustomMessageHandler("hype_doc_title", function (msg) {
+        if (baseTitle === null) baseTitle = document.title;
+        var t = msg && msg.title;
+        document.title = t ? t + " - HYPE" : baseTitle;
+      });
       // Gradient-points table: patch the computed cells in place. The table output cannot
       // re-render per keystroke (that would remount the numeric being typed in and drop
       // focus), so the server pushes fresh WSE/Dist/Head strings instead. Rows not in the

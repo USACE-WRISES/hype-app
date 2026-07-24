@@ -340,13 +340,20 @@ def run_mp7(mp: Modpath7, log: Callable = print) -> None:
 # 1c-bis. Flux-weighted stream-interface pass (HYPE revision §8.3)
 # ---------------------------------------------------------------------------
 
-def read_river_downwelling(gwf_ws: str | Path, member: np.ndarray) -> dict[int, float]:
-    """{0-based node: downwelling inflow, model units (m3/day)} for the stream (top) cells.
+def read_boundary_flows(gwf_ws: str | Path, member: np.ndarray) -> dict:
+    """Every CHD boundary flow from the cell budget, split by node membership.
 
     MF6's cell budget stores only the MODEL name — the split CHD_RIVER/CHD_SIDES packages
-    can't be filtered by name — so river cells are identified by node MEMBERSHIP. The budget's
-    `node` field is 1-BASED (raw MODFLOW); membership nodes are 0-based (flopy zero-bases on
-    read), hence the -1. A CHD flow > 0 is water entering the aquifer = stream downwelling.
+    can't be filtered by name — so cells are identified by node MEMBERSHIP. The budget's
+    `node` field is 1-BASED (raw MODFLOW); membership nodes are 0-based (flopy zero-bases
+    on read), hence the -1. A CHD flow > 0 is water entering the aquifer.
+
+    Returns (model units, m3/day):
+      down         {node: q>0}  stream (top) inflow — downwelling
+      up_m3d       float        Σ|q<0| over stream cells — upwelling
+      side_in      {node: q>0}  side-boundary inflow — underflow in
+      side_out_m3d float        Σ|q<0| over side cells — underflow out
+      stream_net   {node: q}    net q per stream cell (feeds the exchange map)
     """
     from flopy.utils import CellBudgetFile
 
@@ -362,38 +369,128 @@ def read_river_downwelling(gwf_ws: str | Path, member: np.ndarray) -> dict[int, 
 
     member = np.asarray(member)
     river = {int(n) for n in np.nonzero(member == MEMBER["top"])[0]}
-    out: dict[int, float] = {}
+    sides = {int(n) for n in np.nonzero(np.isin(member, list(_SIDE_CODES)))[0]}
+    down: dict[int, float] = {}
+    side_in: dict[int, float] = {}
+    stream_net: dict[int, float] = {}
+    up = side_out = 0.0
     cbc = CellBudgetFile(str(cbb), precision="double")
     for rec in cbc.get_data(text="CHD"):
         for node, q in zip(np.asarray(rec["node"]).ravel(), np.asarray(rec["q"]).ravel()):
             n = int(node) - 1                      # 1-based budget -> 0-based membership
-            if n in river and q > 0:
-                out[n] = out.get(n, 0.0) + float(q)
-    return out
+            q = float(q)
+            if n in river:
+                stream_net[n] = stream_net.get(n, 0.0) + q
+                if q > 0:
+                    down[n] = down.get(n, 0.0) + q
+                else:
+                    up -= q
+            elif n in sides:
+                if q > 0:
+                    side_in[n] = side_in.get(n, 0.0) + q
+                else:
+                    side_out -= q
+    return {"down": down, "up_m3d": up, "side_in": side_in,
+            "side_out_m3d": side_out, "stream_net": stream_net}
+
+
+def read_river_downwelling(gwf_ws: str | Path, member: np.ndarray) -> dict[int, float]:
+    """{0-based node: downwelling inflow (m3/day)} for the stream (top) cells."""
+    return read_boundary_flows(gwf_ws, member)["down"]
 
 
 _IFACE_TEMPLATES: dict[int, tuple[tuple[float, float], ...]] = {
     1: _PLAN_CENTER, 3: _PLAN_TRIANGLE, 4: _PLAN_CENTER + _PLAN_TRIANGLE}
 
+# Interface-pass per-particle class codes (hz_flux.npz "cls"). 1/2 predate the four-way
+# extension and must keep their meaning — the report's transit rows read them.
+FLUX_CLS = {"unresolved": 0, "returning": 1, "losing": 2, "gaining": 3, "throughflow": 4}
+
+
+def side_interior_cell(k: int, i: int, j: int, idomain: np.ndarray,
+                       member3: np.ndarray) -> tuple[int, int, int] | None:
+    """First active interior (non-boundary) cell adjacent to a side CHD cell.
+
+    Same-layer lateral neighbors first (a perimeter cell's inflow crosses its inward
+    face), then straight down (mirrors the downwelling descent for stream cells) —
+    corners with no lateral interior neighbor drain through the column beneath.
+    None = landlocked (the caller reports that inflow as unreleased).
+    """
+    nlay, nrow, ncol = idomain.shape
+    for ii, jj in ((i - 1, j), (i + 1, j), (i, j - 1), (i, j + 1)):
+        if 0 <= ii < nrow and 0 <= jj < ncol \
+                and idomain[k, ii, jj] == 1 and member3[k, ii, jj] == 0:
+            return k, ii, jj
+    for kk in range(k + 1, nlay):
+        if idomain[kk, i, j] == 1 and member3[kk, i, j] == 0:
+            return kk, i, j
+    return None
+
+
+def classify_flux_endpoints(origin_code: np.ndarray, exit_code: np.ndarray,
+                            status: np.ndarray, weights: np.ndarray) -> dict:
+    """Weighted origin→exit split of the interface-pass endpoints (pure, testable).
+
+    origin top → returning (top) / losing (side); origin side → gaining (top) /
+    throughflow (side). Particles with an unresolved MODPATH status, or whose exit
+    lands on no boundary, keep cls 0 — their weight is tallied per origin so both
+    ledgers stay closed. Returns {"cls": per-particle codes (FLUX_CLS), "sums":
+    weighted totals per class + unresolved_stream/unresolved_side}.
+    """
+    origin_code = np.asarray(origin_code)
+    exit_code = np.asarray(exit_code)
+    status = np.asarray(status)
+    w = np.asarray(weights, dtype=float)
+    resolved = np.isin(status, list(RESOLVED_STATUSES))
+    from_top = origin_code == MEMBER["top"]
+    to_top = resolved & (exit_code == MEMBER["top"])
+    to_side = resolved & np.isin(exit_code, list(_SIDE_CODES))
+    cls = np.zeros(origin_code.shape[0], dtype=np.uint8)
+    cls[from_top & to_top] = FLUX_CLS["returning"]
+    cls[from_top & to_side] = FLUX_CLS["losing"]
+    cls[~from_top & to_top] = FLUX_CLS["gaining"]
+    cls[~from_top & to_side] = FLUX_CLS["throughflow"]
+    sums = {name: float(w[cls == code].sum())
+            for name, code in FLUX_CLS.items() if code != 0}
+    sums["unresolved_stream"] = float(w[(cls == 0) & from_top].sum())
+    sums["unresolved_side"] = float(w[(cls == 0) & ~from_top].sum())
+    return {"cls": cls, "sums": sums}
+
+
+def path_max_depth(streambed_top: float, z_along_path: np.ndarray) -> float:
+    """Maximum penetration depth below the streambed for one path (report §7.4): the top-of-cell
+    elevation of the source stream cell minus the deepest z the path reaches, clamped at 0. NaN
+    when the path has no vertices. z is a plain vertical coordinate, so no N-S row flip applies."""
+    z = np.asarray(z_along_path, dtype=float)
+    if z.size == 0:
+        return float("nan")
+    return max(0.0, float(streambed_top) - float(np.nanmin(z)))
+
 
 def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np.ndarray,
                        T: np.ndarray, B: np.ndarray, gwf_ws: str | Path, hz_ws: str | Path,
                        exe: str, porosity: float, max_time_days: float | None,
-                       particles_per_cell: int = 3, log: Callable = print) -> dict | None:
-    """Flux-weighted stream-interface pass (§8.3): where does downwelling stream water GO?
+                       particles_per_cell: int = 3, cell_area2d: np.ndarray | None = None,
+                       with_path_depth: bool = True,
+                       log: Callable = print) -> dict | None:
+    """Flux-weighted boundary-interface pass (§8.3, four-way): where does each parcel of
+    boundary INFLOW go?
 
-    1. Read CHD_RIVER downwelling inflows from the MODFLOW budget.
-    2. Release forward particles in the first active NON-boundary cell under each downwelling
-       stream cell (just below the streambed interface, at the top of the saturated part) —
-       CHD cells themselves can't host seeds because weak sinks are stop_at.
+    1. Read every CHD inflow from the MODFLOW budget — stream (top) downwelling AND
+       side-boundary underflow — plus the outflow totals for the ledger.
+    2. Release forward particles in the first active NON-boundary cell adjacent to each
+       inflow cell (beneath a downwelling stream cell / inward of a side cell) — CHD
+       cells themselves can't host seeds because weak sinks are stop_at.
     3. Give each particle a source-flow weight = its share of that cell's inflow.
-    4. Track to the first terminal boundary and classify the WEIGHTED flow:
-       returning to the stream (top) | leaving through a side | unresolved/censored.
-    5. Verify the weighted mass balance (weights sum to total downwelling by construction;
-       the closure error reports any unreleased inflow, e.g. no active cell below).
+    4. Track to the first terminal boundary and classify the WEIGHTED flow by
+       origin→exit: top→top returning (hyporheic), top→side losing, side→top gaining,
+       side→side throughflow | unresolved/censored per origin.
+    5. Verify closure: each origin's weights sum to its inflow by construction (the
+       error reports unreleased inflow); the budget adds two independent checks —
+       upwelling ≈ returning + gaining, and global inflow = outflow.
 
-    Returns {"accounting": ..., "per_particle": {...arrays...}, "rtd": ...} or None when the
-    model has no downwelling stream cells (fully gaining reach).
+    Returns {"accounting", "per_particle", "rtd", "rtd_by_class", "stream_cells"} or
+    None when the model has no boundary inflow at all.
     """
     tpl = _IFACE_TEMPLATES.get(int(particles_per_cell))
     if tpl is None:
@@ -402,10 +499,12 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
 
     nlay, nrow, ncol = idomain.shape
     member3 = np.asarray(member).reshape(nlay, nrow, ncol)
-    downwelling = read_river_downwelling(gwf_ws, member)
+    flows = read_boundary_flows(gwf_ws, member)
+    downwelling, side_in = flows["down"], flows["side_in"]
     total_down = float(sum(downwelling.values()))
-    if not downwelling:
-        log("Interface pass: no downwelling stream cells (fully gaining reach) — skipped")
+    total_side_in = float(sum(side_in.values()))
+    if not downwelling and not side_in:
+        log("Interface pass: no boundary inflow (stream or sides) — skipped")
         return None
 
     thick = np.maximum(T - B, 1e-9)
@@ -434,14 +533,33 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
             lz.append(0.98 * float(sat[k2, i, j])) # just below the interface, in saturated part
             src_nodes.append(node)
             weights.append(w)
+    side_unreleased = 0.0
+    for node, q in sorted(side_in.items()):
+        k, rem = divmod(node, nrow * ncol)
+        i, j = divmod(rem, ncol)
+        tgt = side_interior_cell(k, i, j, idomain, member3)
+        if tgt is None or sat[tgt] <= 0.01:
+            side_unreleased += q
+            continue
+        w = q / len(tpl)
+        for (x, y) in tpl:
+            kij_rows.append(tgt)
+            lx.append(x)
+            ly.append(y)
+            lz.append(0.5 * float(sat[tgt]))       # mid saturated face for a lateral entry
+            src_nodes.append(node)
+            weights.append(w)
 
     n = len(kij_rows)
     if n == 0:
-        log("Interface pass: no releasable cells under the downwelling stream — skipped")
+        log("Interface pass: no releasable cells adjacent to any inflow boundary — skipped")
         return None
     if unreleased > 0:
-        log(f"Interface pass: {unreleased:.3g} of {total_down:.3g} m3/day inflow had no "
-            f"active cell beneath the stream and is reported as unreleased")
+        log(f"Interface pass: {unreleased:.3g} of {total_down:.3g} m3/day stream inflow had "
+            f"no active cell beneath the stream and is reported as unreleased")
+    if side_unreleased > 0:
+        log(f"Interface pass: {side_unreleased:.3g} of {total_side_in:.3g} m3/day side "
+            f"inflow had no adjacent interior cell and is reported as unreleased")
 
     seeds = {"kij": np.asarray(kij_rows, dtype=np.int32),
              "localx": np.asarray(lx, dtype=np.float32),
@@ -465,37 +583,113 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
     time_days = np.asarray(ep["time"], dtype=float)
     w = np.asarray(weights, dtype=float)
     src = np.asarray(src_nodes, dtype=np.int64)
+    origin_code = member_flat[src].astype(np.uint8)
 
-    resolved = np.isin(status, list(RESOLVED_STATUSES))
-    returning = resolved & (exit_code == MEMBER["top"])
-    losing = resolved & np.isin(exit_code, list(_SIDE_CODES))
-    unresolved = ~(returning | losing)
-
-    ret_w = float(w[returning].sum())
-    los_w = float(w[losing].sum())
-    unres_w = float(w[unresolved].sum()) + unreleased
+    fx = classify_flux_endpoints(origin_code, exit_code, status, w)
+    cls, sums = fx["cls"], fx["sums"]
+    ret_w, los_w = sums["returning"], sums["losing"]
+    gain_w, thru_w = sums["gaining"], sums["throughflow"]
+    unres_w = sums["unresolved_stream"] + unreleased
+    side_unres_w = sums["unresolved_side"] + side_unreleased
     classified = ret_w + los_w + unres_w
     mbe = abs(classified - total_down) / total_down if total_down > 0 else float("nan")
+    up, side_out = flows["up_m3d"], flows["side_out_m3d"]
+    total_in, total_out = total_down + total_side_in, up + side_out
+    closure = abs(total_in - total_out) / total_in if total_in > 0 else float("nan")
+    up_check = abs(up - (ret_w + gain_w)) / up if up > 0 else float("nan")
 
-    cls = np.zeros(n, dtype=np.uint8)              # 0 unresolved, 1 returning, 2 losing
-    cls[returning] = 1
-    cls[losing] = 2
+    def _rtd(mask: np.ndarray) -> dict | None:
+        w_m = w[mask]
+        if not mask.any() or w_m.sum() <= 0:
+            return None
+        t_m = time_days[mask]
+        order = np.argsort(t_m)
+        cw = np.cumsum(w_m[order])
+        return {"weighted_mean_days": round(float((t_m * w_m).sum() / w_m.sum()), 4),
+                "weighted_median_days": round(float(np.interp(0.5 * cw[-1], cw,
+                                                              t_m[order])), 4),
+                "min_days": round(float(t_m.min()), 5),
+                "max_days": round(float(t_m.max()), 3),
+                "n": int(mask.sum())}
 
+    returning_mask = cls == FLUX_CLS["returning"]
     rtd = None
     if ret_w > 0:
-        t_ret, w_ret = time_days[returning], w[returning]
-        order = np.argsort(t_ret)
-        cw = np.cumsum(w_ret[order])
-        med = float(np.interp(0.5 * cw[-1], cw, t_ret[order]))
-        rtd = {"weighted_mean_days": round(float((t_ret * w_ret).sum() / ret_w), 4),
-               "weighted_median_days": round(med, 4),
-               "min_days": round(float(t_ret.min()), 5),
-               "max_days": round(float(t_ret.max()), 3),
-               "n_returning": int(returning.sum())}
+        r = _rtd(returning_mask)
+        rtd = {k: r[k] for k in ("weighted_mean_days", "weighted_median_days",
+                                 "min_days", "max_days")}
+        rtd["n_returning"] = r["n"]                # legacy shape — report reads this
+    rtd_by_class = {}
+    for name, code in FLUX_CLS.items():
+        if code != 0:
+            rc = _rtd(cls == code)
+            if rc is not None:
+                rtd_by_class[name] = rc
 
-    log(f"Interface pass: downwelling {total_down:.3g} m3/day over {len(downwelling)} stream "
-        f"cells -> returning {ret_w:.3g}, losing {los_w:.3g}, unresolved {unres_w:.3g} "
-        f"(mass-balance error {mbe:.2e})")
+    # Streambed plan area (distinct columns of the stream CHD cells) for flux-per-area.
+    streambed_area = None
+    stream_nodes = np.asarray(sorted(flows["stream_net"]), dtype=np.int64)
+    if cell_area2d is not None and stream_nodes.size:
+        _, rem = np.divmod(stream_nodes, nrow * ncol)
+        ii, jj = np.divmod(rem, ncol)
+        plan = np.zeros((nrow, ncol), dtype=bool)
+        plan[ii, jj] = True
+        streambed_area = float(np.asarray(cell_area2d, dtype=float)[plan].sum())
+
+    # Active streambed area: distinct stream columns whose downwelling feeds RETURNING paths.
+    active_streambed_area = None
+    if cell_area2d is not None:
+        ret_src = np.unique(src[returning_mask]) if returning_mask.any() else np.empty(0, np.int64)
+        if ret_src.size:
+            _, rem_a = np.divmod(ret_src, nrow * ncol)
+            iia, jja = np.divmod(rem_a, ncol)
+            plan_a = np.zeros((nrow, ncol), dtype=bool)
+            plan_a[iia, jja] = True
+            active_streambed_area = float(np.asarray(cell_area2d, dtype=float)[plan_a].sum())
+        else:
+            active_streambed_area = 0.0
+
+    # Optional per-particle maximum penetration depth (report §7.4): a SECOND pass in pathline mode
+    # over the SAME seeds. The endpoint pass above has no trajectory, and build_hz_mp7_sim forbids
+    # combined mode. Best-effort: on any failure the depth stays absent and the report degrades.
+    max_depth_m = None
+    if with_path_depth:
+        try:
+            mp_pl = build_hz_mp7_sim(gwf, seeds, mp7_ws=hz_ws, exe=exe, direction="forward",
+                                     mode="pathline", porosity=porosity,
+                                     max_time_days=max_time_days, name="hz_flux_pl")
+            run_mp7(mp_pl, log=log)
+            pl_path = Path(hz_ws) / f"{mp_pl.name}.mppth"
+            by_pid = _pathlines_by_pid(pl_path)
+            pl_path.unlink(missing_ok=True)
+            (Path(hz_ws) / f"{mp_pl.name}.sloc").unlink(missing_ok=True)
+            Tarr = np.asarray(T, dtype=float)
+            depths = np.full(n, np.nan, dtype=np.float32)
+            for m in range(n):                       # flopy zero-bases pids: seed index m == pid m
+                rec = by_pid.get(m)
+                if rec is None or np.asarray(rec).size == 0:
+                    continue
+                k_d, rem_d = divmod(int(src[m]), nrow * ncol)
+                i_d, j_d = divmod(rem_d, ncol)
+                depths[m] = path_max_depth(Tarr[k_d, i_d, j_d], np.asarray(rec["z"], float))
+            max_depth_m = depths
+            log(f"Interface pass: captured max penetration depth for {int(np.isfinite(depths).sum())}"
+                f"/{n} particles")
+        except Exception as e:  # noqa: BLE001 — depth is best-effort; the report renders without it
+            log(f"Interface pass: path-depth pass skipped ({type(e).__name__}: {e})")
+            max_depth_m = None
+
+    per_particle = {"source_node": src, "weight": w, "cls": cls,
+                    "time_days": time_days, "status": status,
+                    "exit_code": exit_code.astype(np.uint8), "origin_code": origin_code}
+    if max_depth_m is not None:
+        per_particle["max_depth_m"] = np.asarray(max_depth_m, dtype=np.float32)
+
+    log(f"Interface pass: stream downwelling {total_down:.3g} -> returning {ret_w:.3g}, "
+        f"losing {los_w:.3g}, unresolved {unres_w:.3g} (mbe {mbe:.2e}); side inflow "
+        f"{total_side_in:.3g} -> gaining {gain_w:.3g}, throughflow {thru_w:.3g}, "
+        f"unresolved {side_unres_w:.3g}; upwelling {up:.3g} (check {up_check:.2e}), "
+        f"side outflow {side_out:.3g} [m3/day]")
     return {
         "accounting": {"units": "m3/day",
                        "total_downwelling": round(total_down, 6),
@@ -504,11 +698,32 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
                        "mass_balance_error": (round(mbe, 8) if mbe == mbe else None),
                        "n_stream_cells_downwelling": len(downwelling),
                        "n_particles": int(n),
-                       "particles_per_cell": int(particles_per_cell)},
-        "per_particle": {"source_node": src, "weight": w, "cls": cls,
-                         "time_days": time_days, "status": status,
-                         "exit_code": exit_code.astype(np.uint8)},
+                       "particles_per_cell": int(particles_per_cell),
+                       # four-way extension: side-origin flows + the budget ledger
+                       "gaining": round(gain_w, 6), "throughflow": round(thru_w, 6),
+                       "total_side_inflow": round(total_side_in, 6),
+                       "side_unresolved": round(side_unres_w, 6),
+                       "side_unreleased": round(side_unreleased, 6),
+                       "total_upwelling": round(up, 6),
+                       "total_side_outflow": round(side_out, 6),
+                       "net_stream_exchange": round(up - total_down, 6),
+                       "upwelling_check_error": (round(up_check, 8)
+                                                 if up_check == up_check else None),
+                       "closure_error_global": (round(closure, 8)
+                                                if closure == closure else None),
+                       "streambed_area_m2": (round(streambed_area, 2)
+                                             if streambed_area is not None else None),
+                       "active_streambed_area_m2": (round(active_streambed_area, 2)
+                                                    if active_streambed_area is not None else None),
+                       "n_stream_cells_upwelling": int(sum(
+                           1 for v in flows["stream_net"].values() if v < 0)),
+                       "n_side_cells_inflow": len(side_in)},
+        "per_particle": per_particle,
         "rtd": rtd,
+        "rtd_by_class": rtd_by_class,
+        "stream_cells": {"node": [int(v) for v in stream_nodes],
+                         "q_m3d": [float(flows["stream_net"][int(v)])
+                                   for v in stream_nodes]},
     }
 
 
@@ -769,6 +984,38 @@ def class_footprint_gdf(mask2d: np.ndarray, *, xe: np.ndarray, ye: np.ndarray, c
         index_parts=False).reset_index(drop=True)
 
 
+def stream_exchange_gdf(nodes, q_m3d, shape3: tuple[int, int, int], *,
+                        xe: np.ndarray, ye: np.ndarray, crs):
+    """Per-cell plan rectangles of the stream CHD cells with their net budget flow.
+
+    nodes are 0-based flat indices into the (nlay,nrow,ncol) grid; each node's plan cell
+    is its (row,col). Rectangles come from the SAME south-first xe/ye edge arrays as
+    class_footprint_gdf, so the exchange map registers exactly with the zone footprints.
+    Positive q_m3d = downwelling (stream to aquifer), negative = upwelling.
+    """
+    import geopandas as gpd
+    import shapely
+
+    nodes = np.asarray(nodes, dtype=np.int64)
+    q = np.asarray(q_m3d, dtype=float)
+    if nodes.size == 0:
+        return gpd.GeoDataFrame({"q_m3d": []}, geometry=[], crs=crs)
+    nlay, nrow, ncol = shape3
+    _, rem = np.divmod(nodes, nrow * ncol)
+    ii, jj = np.divmod(rem, ncol)
+    xe = np.asarray(xe, dtype=float)
+    ye = np.asarray(ye, dtype=float)
+    x0, x1, y0, y1 = xe[jj], xe[jj + 1], ye[ii], ye[ii + 1]
+    rings = np.empty((nodes.size, 5, 2), dtype=float)
+    rings[:, 0, 0], rings[:, 0, 1] = x0, y0
+    rings[:, 1, 0], rings[:, 1, 1] = x1, y0
+    rings[:, 2, 0], rings[:, 2, 1] = x1, y1
+    rings[:, 3, 0], rings[:, 3, 1] = x0, y1
+    rings[:, 4, 0], rings[:, 4, 1] = x0, y0
+    return gpd.GeoDataFrame({"q_m3d": np.round(q, 4)},
+                            geometry=list(shapely.polygons(rings)), crs=crs)
+
+
 # ---------------------------------------------------------------------------
 # 1f. Display pathlines
 # ---------------------------------------------------------------------------
@@ -864,6 +1111,25 @@ def build_display_paths(pl_fwd: Path, pl_bwd: Path, sample: dict, classes: dict,
     if missing:
         log(f"display pathlines: {missing} sampled particles had no pathline records")
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+
+
+def _persist_display_pathlines(pl_paths: dict, hz_dir: Path, *, keep_raw: bool) -> dict:
+    """Persist the sampled display .mppth files into the results dir; the GMS export
+    translates them into GMS particle sets later. Move by default (hz_ws is deleted
+    at the end of the run regardless); copy when keep_raw is set so the raw
+    workspace keeps its files too. Returns artifact-manifest entries."""
+    out: dict[str, str] = {}
+    for direction, src in pl_paths.items():
+        src = Path(src)
+        if not src.is_file():
+            continue
+        dst = Path(hz_dir) / src.name
+        if keep_raw:
+            shutil.copyfile(src, dst)
+        else:
+            shutil.move(str(src), str(dst))
+        out[f"mp7_pathlines_{direction}"] = dst.name
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1257,8 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
     try:
         flux = run_interface_pass(gwf, member=member, idomain=idomain, head=head, T=T, B=B,
                                   gwf_ws=gwf_ws, hz_ws=hz_ws, exe=exe, porosity=porosity,
-                                  max_time_days=max_time_days, log=log)
+                                  max_time_days=max_time_days,
+                                  cell_area2d=np.outer(delc, delr), log=log)
     except Exception as e:  # noqa: BLE001 — the classification results stand on their own
         log(f"Interface pass failed (continuing without flux metrics): {e}")
     runtimes["flux"] = round(time.monotonic() - t0, 2)
@@ -1000,6 +1267,7 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
     t0 = time.monotonic()
     sample_idx = (sample_display_seeds(cls, per_class=int(sample_per_class))
                   if int(sample_per_class) > 0 else np.array([], dtype=np.int64))
+    mp7_artifacts: dict[str, str] = {}
     if sample_idx.size == 0:
         # metrics-only mode (e.g. sensitivity alternatives, §10.4): skip the pathline MP7s
         log("HZ STEP 6/7 - Display pathlines skipped (sample_per_class=0)")
@@ -1020,15 +1288,16 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
             pl_paths[direction] = hz_ws / f"{mp.name}.mppth"
         paths_gdf = build_display_paths(pl_paths["forward"], pl_paths["backward"],
                                         sample, classes, gwf, crs, log=log)
-        if not keep_raw_outputs:
-            for p in pl_paths.values():
-                p.unlink(missing_ok=True)
+        # the sampled .mppth files persist into hz_dir (small; GMS export needs the
+        # per-vertex travel times that the display GeoDataFrame drops)
+        mp7_artifacts = _persist_display_pathlines(pl_paths, hz_dir,
+                                                   keep_raw=keep_raw_outputs)
     runtimes["pathlines"] = round(time.monotonic() - t0, 2)
 
     # ---- STEP 7: export -----------------------------------------------------
     log("HZ STEP 7/7 - Writing artifacts")
     t0 = time.monotonic()
-    artifacts: dict[str, str] = {}
+    artifacts: dict[str, str] = dict(mp7_artifacts)
 
     np.savez_compressed(hz_dir / "hz_classification.npz",
                         pid=seeds["particleids"], seed_node=classes["seed_node"],
@@ -1043,6 +1312,17 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
     if flux is not None:
         np.savez_compressed(hz_dir / "hz_flux.npz", **flux["per_particle"])
         artifacts["flux"] = "hz_flux.npz"
+        # streambed exchange map: one rectangle per stream CHD cell, split by direction
+        sc = flux.get("stream_cells") or {}
+        if sc.get("node"):
+            ex = stream_exchange_gdf(sc["node"], sc["q_m3d"], (nlay, nrow, ncol),
+                                     xe=xe, ye=ye, crs=crs)
+            for dname, sub in (("down", ex[ex["q_m3d"] > 0]),
+                               ("up", ex[ex["q_m3d"] < 0])):
+                if len(sub):
+                    gj_name = f"hz_flow_{dname}.geojson"
+                    sub.to_crs(4326).to_file(hz_dir / gj_name, driver="GeoJSON")
+                    artifacts[f"flow_{dname}"] = gj_name
 
     total_time = classes["bwd_time"].astype(float) + classes["fwd_time"].astype(float)
     for name in HZ_CLASSES:
@@ -1106,7 +1386,8 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
                    "boundary_cells": member_info["counts"]},
         "domain": {"active_saturated_volume_m3": round(domain_volume, 1)},
         "classes": stats_by_class,
-        "flux": ({"accounting": flux["accounting"], "rtd": flux["rtd"]}
+        "flux": ({"accounting": flux["accounting"], "rtd": flux["rtd"],
+                  "rtd_by_class": flux.get("rtd_by_class") or {}}
                  if flux is not None else None),
         "runtimes_s": runtimes,
         "artifacts": artifacts,
@@ -1153,6 +1434,22 @@ def _stats_text(stats: dict) -> str:
             lines.append(f"  residence time  : mean {rt['mean']} d, median {rt['median']} d, "
                          f"max {rt['max']} d")
         lines.append("")
+    fx = (stats.get("flux") or {}).get("accounting")
+    if fx and "gaining" in fx:
+        lines += [
+            "EXCHANGE FLOWS (flux-weighted, m3/day)",
+            f"  hyporheic (returning) : {fx['returning']:.3f}",
+            f"  losing                : {fx['losing']:.3f}",
+            f"  gaining               : {fx['gaining']:.3f}",
+            f"  throughflow           : {fx['throughflow']:.3f}",
+            f"  stream down/up        : {fx['total_downwelling']:.3f} / "
+            f"{fx['total_upwelling']:.3f} (net {fx['net_stream_exchange']:+.3f})",
+            f"  side in/out           : {fx['total_side_inflow']:.3f} / "
+            f"{fx['total_side_outflow']:.3f}",
+            f"  unresolved stream/side: {fx['unresolved']:.3f} / "
+            f"{fx['side_unresolved']:.3f}",
+            "",
+        ]
     lines.append(f"Active saturated domain volume: "
                  f"{stats['domain']['active_saturated_volume_m3']:.1f} m3")
     return "\n".join(lines)

@@ -7,21 +7,19 @@ from pydantic import ValidationError
 from hype_app.contracts import (
     SCHEMA_VERSIONS,
     AssessmentInputSnapshot,
-    CapacityClass,
     FlowCandidate,
     FlowLookupSnapshot,
     GradientBoundaryConfigV2,
     GradientControl,
     GradientQualitative,
     GridSettings,
-    HFCIScoringProfileV1,
     KSettings,
     LatLon,
     ReferenceSlope,
-    ScoreCurve,
     Side,
     StreamflowInput,
     migrate,
+    watershed_display_features,
 )
 from hype_app.provenance import Provenance, Severity
 
@@ -121,37 +119,6 @@ class TestGradients:
             GradientBoundaryConfigV2(mode="nonsense")
 
 
-# --------------------------------------------------------------------------- HFCI
-class TestHFCI:
-    def _curve(self, **o):
-        base = dict(driver="excursions_per_mile", raw_unit="1/mi",
-                    knots_x=[0.0, 1.0, 10.0], knots_y=[0.0, 7.5, 15.0])
-        base.update(o)
-        return ScoreCurve(**base)
-
-    def test_curve_requires_ascending_knots(self):
-        with pytest.raises(ValidationError):
-            self._curve(knots_x=[1.0, 0.0, 2.0])
-
-    def test_curve_score_bounds(self):
-        with pytest.raises(ValidationError):
-            self._curve(knots_y=[0.0, 20.0, 15.0])
-
-    def test_profile_class_for(self):
-        prof = HFCIScoringProfileV1(exchange=self._curve(), storage=self._curve(),
-                                    processing=self._curve())
-        assert prof.class_for(3).name == "Low"
-        assert prof.class_for(8).name == "Moderate"
-        assert prof.class_for(13).name == "High"
-        assert prof.validation_label.startswith("Literature-derived HFCI v1")
-
-    def test_default_class_colors_locked(self):
-        prof = HFCIScoringProfileV1(exchange=self._curve(), storage=self._curve(),
-                                    processing=self._curve())
-        colors = {c.name: c.color for c in prof.classes}
-        assert colors == {"Low": "#d73027", "Moderate": "#fdbf11", "High": "#2c7bb6"}
-
-
 # --------------------------------------------------------------------------- input snapshot
 class TestAssessmentInputSnapshot:
     def test_input_hash_is_stable_hex(self):
@@ -172,13 +139,16 @@ class TestAssessmentInputSnapshot:
         assert ga["geometry"] == gb["geometry"]
         assert ga["gradients"] == gb["gradients"]
 
-    def test_porosity_change_hits_particles_and_soil_k(self):
+    def test_porosity_change_hits_soil_k(self):
         a = _snapshot()
         b = _snapshot(k=KSettings(kh_m_day=10.0, kv_m_day=1.0, porosity=0.4))
         ga, gb = a.group_hashes(), b.group_hashes()
-        assert ga["particles"] != gb["particles"]
         assert ga["soil_k"] != gb["soil_k"]
         assert ga["geometry"] == gb["geometry"]
+        # The per-run MP7 pass (System A) was removed 2026-07-18: no "particles" group,
+        # and the legacy grid fields stay excluded so grid hashes are stable across it.
+        assert "particles" not in ga
+        assert "particles_per_cell" not in ga["grid"]
 
     def test_json_roundtrip(self):
         s = _snapshot()
@@ -191,6 +161,54 @@ def test_schema_versions_present():
     assert SCHEMA_VERSIONS["assessment-results"].startswith("assessment-results/")
 
 
-def test_migrate_is_noop_today():
+def test_migrate_is_noop_for_unregistered_kind():
     data = {"schema_version": "assessment-input-snapshot/2.0", "x": 1}
     assert migrate("assessment-input-snapshot", data) == data
+
+
+def test_results_migration_drops_hfci_2_0_to_2_1():
+    """An older results payload carrying the removed HFCI index still opens: migrate() pops the
+    field and stamps the current schema version so the current model validates it."""
+    from hype_app.contracts import AssessmentResultsV2
+    old = {"schema_version": "assessment-results/2.0", "assessment_id": "A1",
+           "input_hash": "a" * 64, "hfci": {"hfci": 0.67, "hfci_class": "Moderate"}}
+    out = migrate("assessment-results", old)
+    assert "hfci" not in out
+    assert out["schema_version"] == SCHEMA_VERSIONS["assessment-results"]
+    AssessmentResultsV2.model_validate(out)          # no extra="forbid" rejection
+
+
+# --------------------------------------------------------------------------- flow review map
+class TestWatershedDisplayFeatures:
+    """watershed_display_features() feeds the flow modal's review map (never raises)."""
+
+    def _payload(self):
+        import json
+        from pathlib import Path
+        raw = json.loads((Path(__file__).resolve().parent / "fixtures" / "usgs"
+                          / "delineate.json").read_text(encoding="utf-8"))
+        ws = raw["bcrequest"]["wsresp"]
+        # exactly the dict streamstats.lookup_flow stores on the snapshot
+        return {"featurecollection": ws["featurecollection"],
+                "workspace_id": ws.get("workspace_id")}
+
+    def test_nested_fixture_shape(self):
+        ws, pour = watershed_display_features(self._payload())
+        assert ws is not None and ws["type"] == "FeatureCollection"
+        assert ws["features"][0]["geometry"]["type"] == "Polygon"
+        assert pour == pytest.approx((43.686040291133395, -72.23677872156684))
+
+    def test_flat_list_variant(self):
+        p = self._payload()
+        flat = [it for grp in p["featurecollection"] for it in grp]
+        ws, pour = watershed_display_features({"featurecollection": flat})
+        assert ws is not None and pour is not None
+
+    def test_malformed_payloads_yield_none(self):
+        assert watershed_display_features(None) == (None, None)
+        assert watershed_display_features({}) == (None, None)
+        assert watershed_display_features({"featurecollection": [{"name": "globalwatershed"}]}) \
+            == (None, None)
+        assert watershed_display_features(
+            {"featurecollection": [{"name": "globalwatershedpoint",
+                                    "feature": {"features": []}}]}) == (None, None)

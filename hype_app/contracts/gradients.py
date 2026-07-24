@@ -18,7 +18,9 @@ from pydantic import Field, field_validator, model_validator
 from ..provenance import HypeModel, Provenance
 
 GRADIENT_SCHEMA_VERSION = "gradient-boundary-config/2.0"
-GRADIENT_METHOD_VERSION = "head-anchor/1.0"
+# 1.1 (2026-07-15): station-0/1 corner anchors reference the WSE along their own boundary cap
+# (nearest valid sample on the cap line) instead of the globally nearest wetted edge.
+GRADIENT_METHOD_VERSION = "head-anchor/1.1"
 SIGN_CONVENTION = ("positive = higher floodplain head than stream WSE (gaining tendency); "
                    "negative = lower floodplain head (losing tendency)")
 

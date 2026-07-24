@@ -103,12 +103,21 @@
       var i = S.mappers.indexOf(m);
       if (i >= 0) S.mappers.splice(i, 1);
     });
+    if (key === "gw_mesh") {
+      // The basemap drape + labels belong to this layer: drop the handles too, or the
+      // basemap toggle keeps poking an actor that is no longer in the renderer.
+      S.drapeActor = null; S.drapeReady = false;
+      S.drapeTex = null; S.drapeCurTex = null;
+      clearLabels();
+    }
     delete S.layers[key];
     recomputeSceneBounds();
   }
 
   function applyLayerVis(key) {
-    if (key === "basemap") { applyDrapeOpacity(); render(); return; }  // aerial drape (no S.layers entry)
+    if (key === "basemap" || key === "basemap_topo") {   // basemap drape (no S.layers entry)
+      applyDrapeOpacity(); render(); return;
+    }
     var L = S.layers[key];
     if (!L) return;
     var on = S.vis[key] !== false;
@@ -225,15 +234,25 @@
   function applyDrapeOpacity() {
     if (!S.drapeActor) return;
     var v = S.drapeOpacity;
-    // Stay hidden until the aerial texture has actually loaded — a visible untextured
+    // Stay hidden until the picked texture has actually loaded — a visible untextured
     // actor paints as a translucent WHITE sheet that washes out the terrain colours on
-    // the first render (the "initial white-transparency" bug). Also gated by the
-    // gw_mesh layer's tree checkbox, and hidden entirely in wireframe mode (a textured
-    // top would occlude the interior volumes the wireframe exists to reveal).
-    // Gated by BOTH the model-grid checkbox (drape needs the mesh under it) and the Basemaps →
-    // USGS Imagery checkbox (the drape IS that aerial layer); hidden in wireframe mode.
-    var layerOn = S.vis.gw_mesh !== false && S.vis.basemap !== false;
-    S.drapeActor.setVisibility(layerOn && S.drapeReady && v > 0.01 && !S.wireframe);
+    // the first render (the "initial white-transparency" bug). Gated by the model-grid
+    // checkbox (the drape needs the mesh under it) and by the Basemaps radio, which picks
+    // WHICH texture shows (USGS Imagery vs USGS Topo — one actor, two textures); hidden
+    // entirely in wireframe mode (a textured top would occlude the interior volumes).
+    var pick = null;
+    var tx = S.drapeTex || {};
+    if (S.vis.basemap !== false && tx.imagery && tx.imagery.ready) pick = tx.imagery;
+    else if (S.vis.basemap_topo !== false && tx.topo && tx.topo.ready) pick = tx.topo;
+    if (pick && pick.tex !== S.drapeCurTex) {
+      try {
+        if (S.drapeActor.removeAllTextures) S.drapeActor.removeAllTextures();
+        S.drapeActor.addTexture(pick.tex);
+        S.drapeCurTex = pick.tex;
+      } catch (e) { console.error("[mesh3d] drape texture swap failed", e); }
+    }
+    var layerOn = S.vis.gw_mesh !== false && pick !== null;
+    S.drapeActor.setVisibility(layerOn && v > 0.01 && !S.wireframe);
     S.drapeActor.getProperty().setOpacity(v);
   }
 
@@ -697,13 +716,16 @@
     });
   }
 
-  // Drape the aerial basemap onto the TOP faces: same face quads, points lifted slightly and
+  // Drape a USGS basemap onto the TOP faces: same face quads, points lifted slightly and
   // given texture coordinates spanning the basemap's local extent. vtk.js uploads DOM images
-  // with WebGL's Y-flip, so v runs south→north ((y-y0)/Ly).
+  // with WebGL's Y-flip, so v runs south→north ((y-y0)/Ly). ONE actor carries TWO textures
+  // (aerial imagery + topo, same bbox) — the Basemaps radio picks which one shows.
   function buildDrape(vtk, msg, topPolys, ptsData) {
     S.drapeActor = null;
     S.drapeReady = false;
-    var bm = msg.basemap;
+    S.drapeTex = { imagery: null, topo: null };
+    S.drapeCurTex = null;
+    var bm = msg.basemap || msg.basemapTopo;   // identical local extents; either anchors the UVs
     if (!bm || !topPolys.length) return;
     var lift = 0.25;
     var remap = {}, pts2 = [], tc = [], polys2 = [];
@@ -735,20 +757,26 @@
     actor.setMapper(mapper);
     actor.getProperty().setColor(1, 1, 1);
     if (actor.getProperty().setLighting) actor.getProperty().setLighting(false);
-    actor.setVisibility(false);            // revealed only once the texture image is in (below)
-    var texture = vtk.Rendering.Core.vtkTexture.newInstance();
-    texture.setInterpolate(true);
-    var img = new Image();
-    img.onload = function () {
-      try {
-        texture.setImage(img);
-        S.drapeReady = true;               // texture present → the actor's first VISIBLE render
-        applyDrapeOpacity();               // (here) already carries the aerial, never white
-        render();
-      } catch (e) { console.error("[mesh3d] drape texture failed", e); }
-    };
-    img.src = bm.url;
-    actor.addTexture(texture);
+    actor.setVisibility(false);            // revealed only once a texture image is in (below)
+    function mkTex(src) {                  // load one basemap texture; reveal via the picker
+      if (!src || !src.url) return null;
+      var texture = vtk.Rendering.Core.vtkTexture.newInstance();
+      texture.setInterpolate(true);
+      var entry = { tex: texture, ready: false };
+      var img = new Image();
+      img.onload = function () {
+        try {
+          texture.setImage(img);
+          entry.ready = true;              // texture present → eligible for a VISIBLE render
+          applyDrapeOpacity();             // picks imagery/topo by the Basemaps radio
+          render();
+        } catch (e) { console.error("[mesh3d] drape texture failed", e); }
+      };
+      img.src = src.url;
+      return entry;
+    }
+    S.drapeTex.imagery = mkTex(msg.basemap);
+    S.drapeTex.topo = mkTex(msg.basemapTopo);
     S.ren.addActor(actor);
     S.actors.push(actor); S.mappers.push(mapper);
     S.drapeActor = actor;                  // NOT shown yet — no applyDrapeOpacity() until onload
@@ -1332,6 +1360,12 @@
     // While the 3D canvas is hidden (2D mode), stash payloads instead of building — creating a GL
     // context in a display:none overlay wastes memory and has crashed constrained tabs. The shared
     // watcher (armPendingWatch) builds the mesh + all layers on the first reveal.
+    // A gw_mesh CLEAR (empty lines3d — the only gw_mesh payload this channel ever carries)
+    // must also cancel a stashed grid, so arrival order decides (mirror of onMessage).
+    if (msg && msg.key === "gw_mesh" &&
+        !(msg.data && msg.data.polylines && msg.data.polylines.length)) {
+      S.pendingMesh = null;
+    }
     if (!containerVisible()) {
       S.pendingLayers = S.pendingLayers || {};
       S.pendingLayers[msg.key] = msg;
@@ -1355,7 +1389,8 @@
     S.terrainGeom = null; S.pendingDrapes = {}; S.origin = null; S.vis = {};
     S.pendingLayers = {}; S.pendingMesh = null; S.buildFails = 0; S.drapeTexReady = {};
     if (S.pendingWatch) { clearInterval(S.pendingWatch); S.pendingWatch = null; }
-    S.drapeActor = null; S.topMapper = null; S.topCellPts = null; S.topCellElev = null;
+    S.drapeActor = null; S.drapeTex = null; S.drapeCurTex = null;
+    S.topMapper = null; S.topCellPts = null; S.topCellElev = null;
     S.wireframe = false; S.meshSurfActors = [];
     S.projMode = "persp"; S.viewPreset = null;
     if (S.ren) { try { S.ren.getActiveCamera().setParallelProjection(false); } catch (e) { /**/ } }
@@ -1396,6 +1431,10 @@
     // Defer until the 3D canvas is visible/sized. Building against the hidden (0x0) container makes
     // vtk's get3DContext return null and throw; the shared watcher builds it on the first reveal.
     S.buildFails = 0;                          // fresh compute -> fresh retry budget
+    // A fresh grid supersedes any stashed gw_mesh CLEAR (the server clears via an empty
+    // hype3d_layer, a DIFFERENT stash slot than the mesh) — without this, a clear stashed
+    // before the run's auto-grid deletes the grid one frame after the first-reveal build.
+    if (S.pendingLayers) delete S.pendingLayers.gw_mesh;
     if (!containerVisible()) {
       S.pendingMesh = msg;
       armPendingWatch();
@@ -1408,6 +1447,9 @@
   // the live-verification recipes use this; it is NOT part of the app's message flow.
   S.debug = {
     pushLayer: onLayerMessage,
+    pushMesh: onMessage,
+    flush: flushPending,                    // drive the deferred build directly (harness E2E:
+    //                                         the backgrounded pane throttles the 500ms watch)
     vis: onVisMessage,
     clear: onClearMessage,
     setPreset: function (name) { setViewPreset(name); },

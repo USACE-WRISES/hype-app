@@ -42,8 +42,9 @@ _AEP_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*percent\s+AEP", re.IGNORECASE)
 def suggest_region(lat: float, lon: float, *, timeout: float = 8.0) -> str | None:
     """Best-effort 2-letter StreamStats region (US state) for a point via the FCC area API.
 
-    Used only to PREFILL the modal's region field; the user can override (§5.1). Returns None on
-    any failure — never raises, never blocks the workflow.
+    Called by the lookup child (usgs_run.child_run) to resolve the region when the flow
+    modal's Region select is left on Auto-detect; the user can always pick one explicitly
+    (§5.1). Returns None on any failure — never raises, never blocks the workflow.
     """
     import httpx
     try:

@@ -2,8 +2,7 @@
 
 Import site for every Pydantic model that crosses a persistence or process boundary: the frozen
 input snapshot, USGS flow lookup, NRCS soils + derived conductivity, structured gradients,
-sensitivity manifest, canonical results, and the HFCI scoring profile. All are Shiny-independent
-and JSON-round-trippable.
+sensitivity manifest, and canonical results. All are Shiny-independent and JSON-round-trippable.
 
 `migrate(kind, data)` is the single explicit migration entry point — later phases register
 version-upgrade functions here rather than reinterpreting old payloads implicitly (§7.7, §4.4).
@@ -17,6 +16,7 @@ from .flow import (
     FlowCandidate,
     FlowLookupSnapshot,
     LatLon,
+    watershed_display_features,
 )
 from .gradients import (
     GRADIENT_METHOD_VERSION,
@@ -28,14 +28,6 @@ from .gradients import (
     LegacyGradientMeta,
     ReferenceSlope,
     Side,
-)
-from .hfci import (
-    DEFAULT_CLASSES,
-    HFCI_PROFILE_SCHEMA_VERSION,
-    HFCI_VALIDATION_LABEL,
-    CapacityClass,
-    HFCIScoringProfileV1,
-    ScoreCurve,
 )
 from .inputs import (
     INPUT_SNAPSHOT_SCHEMA_VERSION,
@@ -49,10 +41,9 @@ from .inputs import (
 from .results import (
     RESULTS_SCHEMA_VERSION,
     AssessmentResultsV2,
-    ComponentScore,
     ConnectivityMetrics,
-    HFCIResult,
     ResidenceTimeMetrics,
+    ThresholdResult,
     ZoneMetrics,
 )
 from .sensitivity import (
@@ -87,7 +78,6 @@ SCHEMA_VERSIONS: dict[str, str] = {
     "gradient-boundary-config": GRADIENT_SCHEMA_VERSION,
     "sensitivity-scenario-manifest": SENSITIVITY_MANIFEST_SCHEMA_VERSION,
     "assessment-results": RESULTS_SCHEMA_VERSION,
-    "hfci-scoring-profile": HFCI_PROFILE_SCHEMA_VERSION,
 }
 
 # kind -> ordered list of (from_version, upgrade_fn). Registered by later phases as schemas evolve.
@@ -102,7 +92,7 @@ def register_migration(kind: str, from_version: str,
 def migrate(kind: str, data: dict[str, Any]) -> dict[str, Any]:
     """Apply any registered upgrade functions for `kind` until data is at the current version.
 
-    A no-op today (v1 of every contract); the seam exists so version bumps are explicit.
+    The seam exists so version bumps are explicit. Registered upgrades run in order.
     """
     out = dict(data)
     for from_version, fn in _MIGRATIONS.get(kind, []):
@@ -111,9 +101,23 @@ def migrate(kind: str, data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _drop_hfci_2_0(data: dict[str, Any]) -> dict[str, Any]:
+    """assessment-results 2.0 -> 2.1: the HFCI composite index was removed. Drop the field so an
+    older results payload validates under the current model (the report leads with the three
+    hydraulic dimensions; there is no combined score)."""
+    out = dict(data)
+    out.pop("hfci", None)
+    out["schema_version"] = RESULTS_SCHEMA_VERSION
+    return out
+
+
+register_migration("assessment-results", "2.0", _drop_hfci_2_0)
+
+
 __all__ = [
     # flow
     "LatLon", "FlowCandidate", "FlowLookupSnapshot", "FLOW_SNAPSHOT_SCHEMA_VERSION",
+    "watershed_display_features",
     # gradients
     "Side", "GradientQualitative", "QUALITATIVE_MULTIPLIER", "GradientControl",
     "ReferenceSlope", "LegacyGradientMeta", "GradientBoundaryConfigV2",
@@ -126,14 +130,11 @@ __all__ = [
     "SiteMetadata", "TerrainSource", "StreamflowInput", "KSettings", "GridSettings",
     "AssessmentInputSnapshot", "INPUT_SNAPSHOT_SCHEMA_VERSION",
     # results
-    "ConnectivityMetrics", "ResidenceTimeMetrics", "ZoneMetrics", "ComponentScore",
-    "HFCIResult", "AssessmentResultsV2", "RESULTS_SCHEMA_VERSION",
+    "ConnectivityMetrics", "ResidenceTimeMetrics", "ZoneMetrics", "ThresholdResult",
+    "AssessmentResultsV2", "RESULTS_SCHEMA_VERSION",
     # sensitivity
     "GeneratorType", "ScenarioStatus", "ScenarioSpec", "SensitivityScenarioManifest",
     "SENSITIVITY_MANIFEST_SCHEMA_VERSION", "DEFAULT_MAX_SCENARIOS",
-    # hfci
-    "ScoreCurve", "CapacityClass", "DEFAULT_CLASSES", "HFCIScoringProfileV1",
-    "HFCI_PROFILE_SCHEMA_VERSION", "HFCI_VALIDATION_LABEL",
     # registry
     "SCHEMA_VERSIONS", "register_migration", "migrate",
 ]

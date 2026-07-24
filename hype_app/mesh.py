@@ -264,10 +264,13 @@ def _emit_geometry(tops, botm, inside, idomain3d, cell_size: float, x_anchor: fl
     # (the engine's rows run ymin→ymax), i.e. local = (x − x_anchor, y − y_anchor). top0_d above.
     boundaries = _boundary_markers(sides, crs, x_anchor, y_anchor, delr_d, inside_d,
                                    top0_d, z_ref) if sides else []
-    basemap = None
+    basemap = basemap_topo = None
     if want_basemap:
         basemap = _fetch_basemap(crs, x_anchor, y_anchor,
                                  float(ncol_d * delr_d), float(nrow_d * delr_d), log=log)
+        basemap_topo = _fetch_basemap(crs, x_anchor, y_anchor,
+                                      float(ncol_d * delr_d), float(nrow_d * delr_d),
+                                      service="USGSTopo", log=log)
 
     return {
         "points": points, "cells": cells, "cellLayer": cell_layer,
@@ -277,7 +280,7 @@ def _emit_geometry(tops, botm, inside, idomain3d, cell_size: float, x_anchor: fl
         "previewDims": {"nlay": nlay_d, "nrow": nrow_d, "ncol": ncol_d},
         "decimation": f, "layerStride": lf, "nActiveFull": n_active2d * nlay,
         "bounds": [0.0, float(ncol_d * delr_d), 0.0, float(nrow_d * delr_d), 0.0, float(zt_max)],
-        "boundaries": boundaries, "basemap": basemap,
+        "boundaries": boundaries, "basemap": basemap, "basemapTopo": basemap_topo,
         "origin": [x_anchor, y_anchor],    # local-frame anchor in the model CRS (scene align)
         "z0": z_ref,                       # the z datum geometry is relative to
     }
@@ -336,10 +339,11 @@ def _boundary_markers(sides, crs, x_anchor, y_anchor, delr_d, inside_d, top0_d, 
 
 
 def _fetch_basemap(crs, x_anchor, y_anchor, width_m, height_m, *, max_px: int = 1024,
-                   timeout_s: float = 30.0, log=print):
-    """USGS aerial imagery over the preview extent as a base64 JPEG for the 3-D drape:
+                   timeout_s: float = 30.0, service: str = "USGSImageryOnly", log=print):
+    """A USGS basemap export over the preview extent as a base64 JPEG for the 3-D drape:
     {"url", "x0", "y0", "x1", "y1"} in preview-local metres (y0 = south edge; the image's
-    top row is the NORTH edge). None on any failure — the drape is a nice-to-have."""
+    top row is the NORTH edge). `service` picks the ArcGIS service (USGSImageryOnly for the
+    aerial, USGSTopo for the topo drape). None on any failure — drapes are a nice-to-have."""
     import base64
     import urllib.parse
     import urllib.request
@@ -359,17 +363,17 @@ def _fetch_basemap(crs, x_anchor, y_anchor, width_m, height_m, *, max_px: int = 
             "bbox": f"{x_anchor},{y_anchor},{x_anchor + width_m},{y_anchor + height_m}",
             "bboxSR": epsg, "imageSR": epsg, "size": f"{w_px},{h_px}",
             "format": "jpg", "transparent": "false", "f": "image"})
-        url = ("https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/"
+        url = (f"https://basemap.nationalmap.gov/arcgis/rest/services/{service}/"
                "MapServer/export?" + params)
         with urllib.request.urlopen(url, timeout=timeout_s) as r:
             data = r.read()
         if not data or len(data) < 1000:                 # error page / empty tile
             return None
-        log(f"[mesh] basemap drape fetched ({len(data) // 1024} KB, {w_px}x{h_px} px)")
+        log(f"[mesh] {service} drape fetched ({len(data) // 1024} KB, {w_px}x{h_px} px)")
         return {"url": "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"),
                 "x0": 0.0, "y0": 0.0, "x1": float(width_m), "y1": float(height_m)}
     except Exception as e:  # noqa: BLE001
-        log(f"[mesh] basemap drape unavailable: {e}")
+        log(f"[mesh] {service} drape unavailable: {e}")
         return None
 
 

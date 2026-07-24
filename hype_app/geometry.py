@@ -19,6 +19,57 @@ def features_to_gdf(features: Iterable[dict], crs="EPSG:4326") -> gpd.GeoDataFra
     return gpd.GeoDataFrame(geometry=geoms, crs=crs)
 
 
+def _zone_num(props: dict, key: str, default: float) -> float:
+    try:
+        v = float((props or {}).get(key))
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+def normalize_kzone_features(features: Iterable[dict], *, default_kh: float = 50.0,
+                             default_kv: float = 5.0) -> list[dict]:
+    """Ensure every K-zone Feature carries its own {uid, KH, KV, LABEL, src} properties.
+
+    Zones loaded from old saves or freshly drawn arrive as bare geometry; they get a uid and
+    the defaults. Zones that already carry properties pass through untouched (the DrawControl
+    round-trips feature properties, so a shape edit keeps its K). The edit-only
+    ``properties.style`` is stripped. Returns new Feature dicts; never mutates the input."""
+    import uuid
+
+    out = []
+    for i, f in enumerate(features):
+        if not f or not f.get("geometry"):
+            continue
+        p = dict(f.get("properties") or {})
+        p.pop("style", None)
+        if not p.get("uid"):
+            p["uid"] = uuid.uuid4().hex[:8]
+        p["KH"] = _zone_num(p, "KH", default_kh)
+        p["KV"] = _zone_num(p, "KV", default_kv)
+        p.setdefault("LABEL", f"Zone {i + 1}")
+        p.setdefault("src", "drawn")
+        out.append({"type": "Feature", "properties": p, "geometry": f["geometry"]})
+    return out
+
+
+def kzones_to_gdf(features: Iterable[dict], *, fallback_kh: float, fallback_kv: float,
+                  crs="EPSG:4326") -> gpd.GeoDataFrame:
+    """K-zone Features -> GeoDataFrame with per-row KH/KV/ZONE_ID/LABEL columns (the engine's
+    ``_kh_arrays_from_polygon`` contract). Values come from each Feature's own properties;
+    features without them (legacy saves) use the payload-wide fallback pair."""
+    feats = [f for f in features if f and f.get("geometry")]
+    props = [f.get("properties") or {} for f in feats]
+    return gpd.GeoDataFrame(
+        {
+            "ZONE_ID": [str(p.get("uid") or i + 1) for i, p in enumerate(props)],
+            "LABEL": [str(p.get("LABEL") or f"Zone {i + 1}") for i, p in enumerate(props)],
+            "KH": [_zone_num(p, "KH", fallback_kh) for p in props],
+            "KV": [_zone_num(p, "KV", fallback_kv) for p in props],
+        },
+        geometry=[shape(f["geometry"]) for f in feats], crs=crs)
+
+
 def single_feature_gdf(feature: dict, crs="EPSG:4326") -> gpd.GeoDataFrame:
     """A single GeoJSON Feature dict -> 1-row GeoDataFrame in EPSG:4326."""
     return gpd.GeoDataFrame(geometry=[shape(feature["geometry"])], crs=crs)
@@ -140,10 +191,11 @@ def corner_gaps_m(up, left, right, down) -> Optional[float]:
 
 
 def reach_boundary_issues(reach, up, left, right, down, *, touch_tol_m=10.0) -> list:
-    """Soft validation of the reach centerline against the four boundary lines: flow enters and
-    leaves through the upstream/downstream boundaries, so the centerline must meet both of them
-    and must NOT intersect the left/right floodplain lines. Returns human-readable issue strings —
-    empty when everything passes OR when any input is missing (absence is reported elsewhere).
+    """Soft validation of the reach centerline against the boundary caps: flow enters and leaves
+    through the upstream/downstream boundaries, so the centerline must meet both of them. Returns
+    human-readable issue strings — empty when everything passes OR when any input is missing
+    (absence is reported elsewhere). Centerline-overlap errors are the separate, blocking
+    ``centerline_conflicts``.
 
     Same local equirectangular-metres approximation as ``corner_gaps_m`` (affine scaling preserves
     the intersection predicates). Generation places each cap *through* a reach endpoint with up to
@@ -178,8 +230,51 @@ def reach_boundary_issues(reach, up, left, right, down, *, touch_tol_m=10.0) -> 
             issues.append(f"The reach centerline doesn't reach the {label} boundary "
                           f"(gap ≈ {gap:.0f} m) — extend the centerline or move the boundary, "
                           f"then regenerate.")
-    for k, label in (("left", "Left"), ("right", "Right")):
-        if reach_m.intersects(lines[k]):
-            issues.append(f"The reach centerline crosses the {label} floodplain boundary — "
-                          f"it should only cross the upstream/downstream lines.")
     return issues
+
+
+def centerline_conflicts(reach, up, left, right, down, *, cap_tol_m=25.0) -> list:
+    """Blocking validation: boundary lines must not lie across the reach centerline. Returns
+    ``[{"slot", "label", "msg"}, ...]`` — one entry per offending side. Unlike
+    ``reach_boundary_issues`` each side is checked independently, so a half-drawn boundary set
+    still flags the one line that overlaps; only a missing/short reach silences everything.
+
+    Left/right floodplain lines conflict on ANY intersection (the domain edge would run through
+    the channel). The up/down caps legitimately pass *through* a reach endpoint (generation
+    builds them on the end transects; manual cap edits straighten to chords with snapped
+    endpoints), so a cap conflicts only where its intersection with the centerline lies more
+    than ``cap_tol_m`` from BOTH reach endpoints — a cap dragged across the stream interior, or
+    lying along it. Same equirectangular-metres scaling as ``reach_boundary_issues``."""
+    rc = _coords_of(reach) if reach else []
+    if len(rc) < 2:
+        return []
+    lat0 = rc[0][1]
+    kx = 111320.0 * cos(radians(lat0))       # metres per degree lon at this latitude
+    ky = 110540.0                            # metres per degree lat
+
+    def _m(pts):
+        return [(x * kx, y * ky) for x, y in pts]
+
+    reach_m = LineString(_m(rc))
+    end_zone = (Point(reach_m.coords[0]).buffer(cap_tol_m)
+                .union(Point(reach_m.coords[-1]).buffer(cap_tol_m)))
+    conflicts = []
+    for slot, label, f in (("up", "Upstream", up), ("left", "Left floodplain", left),
+                           ("right", "Right floodplain", right), ("down", "Downstream", down)):
+        c = _coords_of(f) if f else []
+        if len(c) < 2:
+            continue
+        line = LineString(_m(c))
+        if not reach_m.intersects(line):
+            continue
+        if slot in ("left", "right"):
+            conflicts.append({"slot": slot, "label": label,
+                              "msg": f"The {label} boundary crosses the stream centerline. "
+                                     "Move the boundary line or redraw the reach centerline "
+                                     "so they don't overlap."})
+        elif not reach_m.intersection(line).difference(end_zone).is_empty:
+            conflicts.append({"slot": slot, "label": label,
+                              "msg": f"The {label} boundary crosses the stream centerline away "
+                                     "from the reach end. Move the boundary line or redraw the "
+                                     "reach centerline."})
+    return conflicts

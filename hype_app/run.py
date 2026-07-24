@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import traceback
 from pathlib import Path
 
@@ -11,11 +12,23 @@ _APP_ROOT = Path(__file__).resolve().parent.parent
 
 
 def modflow_bin_dir() -> str:
-    """Where to find mf6/mp7. The env override HYPE_MODFLOW_BIN wins (handy for local
-    Windows dev — point it at the hype-tool Windows bin); otherwise the bundled Linux
-    binaries in bin/linux (Connect Cloud)."""
-    env = os.environ.get("HYPE_MODFLOW_BIN")
-    return env if env else str(_APP_ROOT / "bin" / "linux")
+    """Where to find mf6/mp7. The env override HYPE_MODFLOW_BIN wins (the desktop
+    payload's tools\\ dir, or a local dev override); a stale/missing override falls
+    through — mirroring ras_cmd — to the platform's bundled dir: bin/win (mf6.exe +
+    mp7.exe) on Windows, bin/linux on Connect Cloud."""
+    override = os.environ.get("HYPE_MODFLOW_BIN")
+    if override and Path(override).is_dir():
+        return override
+    sub = "win" if sys.platform.startswith("win") else "linux"
+    return str(_APP_ROOT / "bin" / sub)
+
+
+def modflow_available() -> bool:
+    """Are mf6 + mp7 plausibly runnable here? Pre-run gate (mirrors ras.ras_available)
+    so a missing solver surfaces as a friendly notification, never a flopy traceback."""
+    d = Path(modflow_bin_dir())
+    ext = ".exe" if sys.platform.startswith("win") else ""
+    return (d / f"mf6{ext}").is_file() and (d / f"mp7{ext}").is_file()
 
 
 def _prepare_linux_bin(bin_dir: str) -> None:
@@ -61,6 +74,8 @@ def execute(*, domain_gdf, left_gdf, right_gdf, crs, dem_path, wse_path, wse_mod
         modflow_bin_dir=modflow_bin_dir(),
         log=log,
         make_figures=False,
+        run_particles=False,   # the app delineates post-run from ALL cells (hz_analysis);
+        #                        the CLI's per-run stream-seeded MP7 pass is skipped
         **params,
     )
 
@@ -104,10 +119,11 @@ def child_run(payload: dict, q) -> None:
         right = geometry.single_feature_gdf(payload["right"]).to_crs(crs)
         khgdf = None
         if payload.get("kzones"):
-            khgdf = geometry.features_to_gdf(payload["kzones"])
-            khgdf["KH"] = float(payload["kzone_kh"])
-            khgdf["KV"] = float(payload["kzone_kv"])
-            khgdf = khgdf.to_crs(crs)
+            # Per-zone KH/KV from each Feature's properties (the engine assigns by dominant
+            # polygon per cell); the payload pair is only the legacy-zone fallback.
+            khgdf = geometry.kzones_to_gdf(
+                payload["kzones"], fallback_kh=float(payload["kzone_kh"]),
+                fallback_kv=float(payload["kzone_kv"])).to_crs(crs)
         builder = None
         if payload.get("soil_k"):
             from hype_app.soil_k import make_cell_k_builder

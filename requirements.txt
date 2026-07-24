@@ -20,7 +20,7 @@ rasterio>=1.3
 rioxarray>=0.15
 xarray>=2024.1
 numpy>=1.26
-pandas>=2.1
+pandas>=2.1,<3     # engine is proven on the 2.x line; 3.x is untested (desktop + cloud resolve fresh)
 scipy>=1.11
 
 # --- MODFLOW 6 / MODPATH 7 orchestration + I/O ---

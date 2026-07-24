@@ -19,7 +19,9 @@ from dataclasses import dataclass, field
 import numpy as np
 
 SECONDS_PER_HOUR = 3600.0
+SECONDS_PER_DAY = 86400.0
 METERS_PER_MILE = 1609.344
+METERS_PER_KM = 1000.0
 
 
 # --------------------------------------------------------------------------- weighted stats
@@ -114,15 +116,23 @@ class Connectivity:
     losing: float
     unresolved: float
     reach_length_m: float
-    excursions_per_mile: float = field(init=False)
+    excursions_per_mile: float = field(init=False)        # supporting (backward compat)
     turnover_length_m: float = field(init=False)
+    turnovers_per_km: float = field(init=False)           # C_1km headline (report §5.1)
+    turnover_length_km: float = field(init=False)         # L_T (report §5.2)
+    gross_exchange_ratio_reach: float = field(init=False)  # E_reach = Q_HEF / Q_stream (§5.5)
 
     def __post_init__(self):
         frac = (self.returning_hyporheic / self.streamflow) if self.streamflow > 0 else float("nan")
+        self.gross_exchange_ratio_reach = frac
         self.excursions_per_mile = (frac * (METERS_PER_MILE / self.reach_length_m)
                                     if self.reach_length_m > 0 else float("nan"))
+        self.turnovers_per_km = (frac * (METERS_PER_KM / self.reach_length_m)
+                                 if self.reach_length_m > 0 else float("nan"))
         self.turnover_length_m = (self.reach_length_m / frac
                                   if frac and frac > 0 else float("inf"))
+        # L_T in km; inf when there is no returning exchange (reciprocal of C_1km holds)
+        self.turnover_length_km = self.turnover_length_m / METERS_PER_KM
 
 
 def connectivity(*, streamflow, returning_hyporheic, total_downwelling, losing, unresolved,
@@ -135,6 +145,50 @@ def connectivity(*, streamflow, returning_hyporheic, total_downwelling, losing, 
     return Connectivity(streamflow=streamflow, total_downwelling=total_downwelling,
                         returning_hyporheic=returning_hyporheic, losing=losing,
                         unresolved=unresolved, reach_length_m=reach_length_m)
+
+
+# --------------------------------------------------------------------------- exchange intensity / depth
+def exchange_flux(returning_hyporheic_m3s, streambed_area_m2) -> dict:
+    """Streambed-area-normalized exchange intensity q_HEF (report §5.4).
+
+    returning_hyporheic in m3/s, area in m2 -> {"m_per_day", "mm_per_day"}. NaN when the area is
+    missing or non-positive (the caller then withholds the metric)."""
+    if (returning_hyporheic_m3s is None or streambed_area_m2 is None
+            or streambed_area_m2 <= 0):
+        return {"m_per_day": float("nan"), "mm_per_day": float("nan")}
+    m_per_day = float(returning_hyporheic_m3s) * SECONDS_PER_DAY / float(streambed_area_m2)
+    return {"m_per_day": m_per_day, "mm_per_day": m_per_day * 1000.0}
+
+
+def path_depth_metrics(max_depths, weights) -> dict:
+    """Flow-weighted maximum-penetration-depth statistics for returning paths (report §7.4).
+
+    {"p50_m","p90_m","max_m"} via the same flow weights as the RTD; {} when there is nothing to
+    summarize (e.g. the optional depth pass did not run)."""
+    d = np.asarray(max_depths, float)
+    w = (np.ones_like(d) if weights is None else np.asarray(weights, float))
+    ok = np.isfinite(d) & np.isfinite(w) & (w > 0)
+    d, w = d[ok], w[ok]
+    if d.size == 0 or w.sum() <= 0:
+        return {}
+    return {"p50_m": weighted_quantile(d, w, 0.5),
+            "p90_m": weighted_quantile(d, w, 0.9),
+            "max_m": float(d.max())}
+
+
+def exceedance_fraction(values, weights, threshold) -> float:
+    """Flux-weighted exceedance P(value >= threshold) (report §6.1). NaN on empty/zero total weight.
+
+    Uses '>=' (the spec's exceedance convention), distinct from the '>' band cuts in
+    residence_time_metrics. Monotone non-increasing in `threshold` by construction."""
+    v = np.asarray(values, float)
+    w = (np.ones_like(v) if weights is None else np.asarray(weights, float))
+    ok = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    v, w = v[ok], w[ok]
+    tot = w.sum()
+    if v.size == 0 or tot <= 0:
+        return float("nan")
+    return float(w[v >= threshold].sum() / tot)
 
 
 # --------------------------------------------------------------------------- residence-time distribution
@@ -204,5 +258,6 @@ def read_chd_downwelling(cbc_path, river_nodes) -> dict:
 __all__ = [
     "weighted_mean", "weighted_quantile", "weighted_ecdf", "ExchangeAccounting",
     "classify_weighted_flux", "Connectivity", "connectivity", "residence_time_metrics",
-    "mobile_pore_storage", "METERS_PER_MILE",
+    "exchange_flux", "path_depth_metrics", "exceedance_fraction", "mobile_pore_storage",
+    "METERS_PER_MILE", "METERS_PER_KM", "SECONDS_PER_DAY",
 ]

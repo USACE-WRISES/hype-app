@@ -172,7 +172,10 @@ def detect_modflow_exes(folder: str | Path) -> dict:
     if not folder.exists():
         return found
 
-    exts = ([".exe", ""] if sys.platform.startswith("win") else [""])
+    # Windows accepts ONLY .exe: an extensionless match would happily select a Linux
+    # ELF (e.g. bin/linux/mf6) and flopy then fails deep inside the run instead of at
+    # the availability gate.
+    exts = ([".exe"] if sys.platform.startswith("win") else [""])
     for p in folder.iterdir():
         if not p.is_file():
             continue

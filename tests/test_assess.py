@@ -33,22 +33,49 @@ def test_full_assembly_computes_all_metrics():
     res = build_results(
         _snapshot(), hz_stats=_HZ_STATS, streamflow_cms=0.736, reach_length_m=500.0,
         exchange=exch, transit_times_days=[0.5, 1.5, 3.0], transit_weights=[1, 1, 1],
-        mobile_pore_storage_m3=2460.0, reference_area_m2=3100.0, porosity=0.3)
+        mobile_pore_storage_m3=2460.0, streambed_area_m2=8000.0,
+        active_streambed_area_m2=4000.0, porosity=0.3)
 
-    # connectivity: (0.028/0.736) * (1609.344/500)
-    assert res.connectivity.excursions_per_mile == pytest.approx(0.028 / 0.736 * 1609.344 / 500)
-    assert res.connectivity.mass_balance_error == pytest.approx(0.0, abs=1e-9)
-    # zone from hz_stats
-    assert res.zone.bulk_saturated_volume_m3 == 8200.0
-    assert res.zone.mobile_pore_storage_m3 == 2460.0
-    # RTD computed
+    c, z = res.connectivity, res.zone
+    # exchange frequency
+    assert c.excursions_per_mile == pytest.approx(0.028 / 0.736 * 1609.344 / 500)
+    assert c.turnovers_per_km == pytest.approx(0.028 / 0.736 * 1000.0 / 500.0)
+    assert c.turnovers_per_km == pytest.approx(1.0 / c.turnover_length_km)   # reciprocal
+    assert c.exchange_flux_mm_day == pytest.approx(0.028 * 86400.0 / 8000.0 * 1000.0)
+    assert c.active_streambed_fraction == pytest.approx(0.5)
+    assert c.mass_balance_error == pytest.approx(0.0, abs=1e-9)
+    # active capacity: D_HZ = V_HZ / A_bed (bulk basis)
+    assert z.bulk_saturated_volume_m3 == 8200.0
+    assert z.equivalent_active_depth_m == pytest.approx(8200.0 / 8000.0)
+    assert z.active_volume_basis == "bulk sediment"
+    assert z.mobile_pore_storage_m3 == 2460.0
+    # exposure duration
     assert res.residence_time.weighted_median_days == pytest.approx(1.5)
-    # HFCI fully computed (all three drivers present)
-    assert res.hfci.hfci is not None and 0.0 <= res.hfci.hfci <= 1.0
-    assert all(0 <= c.score <= 15 for c in (res.hfci.exchange, res.hfci.storage, res.hfci.processing))
     # frozen provenance
     assert res.input_hash == _snapshot().input_hash
     assert set(res.group_hashes)
+
+
+def test_thresholds_monotone_and_functional():
+    """report §10: 4 default scenarios; exceedance non-increasing; functional flow = Q_HEF * P."""
+    exch = ExchangeAccounting(total_downwelling=0.2, returning_hyporheic=0.12,
+                              losing_to_sides=0.08, unresolved=0.0)
+    # returning transit times in days: 0.5 h, 8 h, 30 h -> exceedance drops as threshold rises
+    res = build_results(
+        _snapshot(), hz_stats=_HZ_STATS, streamflow_cms=0.75, reach_length_m=1000.0,
+        exchange=exch, transit_times_days=[0.5 / 24, 8.0 / 24, 30.0 / 24],
+        transit_weights=[1, 1, 1], streambed_area_m2=8000.0, porosity=0.3)
+    ths = {t.threshold_value_h: t for t in res.thresholds}
+    assert set(ths) == {1.0, 6.0, 12.0, 24.0}
+    fracs = [ths[h].flow_exceedance_fraction for h in (1.0, 6.0, 12.0, 24.0)]
+    assert all(a >= b - 1e-9 for a, b in zip(fracs, fracs[1:]))          # monotone non-increasing
+    t6 = ths[6.0]
+    assert t6.functional_exchange_m3_s == pytest.approx(0.12 * t6.flow_exceedance_fraction)
+    assert t6.functional_connectivity_per_km == pytest.approx(
+        res.connectivity.turnovers_per_km * t6.flow_exceedance_fraction)
+    # QC diagnostics recorded, no QC warnings for a clean run
+    assert res.quality_diagnostics.get("residence_order_ok") is True
+    assert not any(w.code == "threshold_monotonicity" for w in res.warnings)
 
 
 def test_connectivity_unavailable_without_exchange():
@@ -57,9 +84,6 @@ def test_connectivity_unavailable_without_exchange():
     assert res.connectivity.excursions_per_mile is None
     assert res.connectivity.unavailable_reason
     assert any(w.code == "connectivity_unavailable" for w in res.warnings)
-    # HFCI exchange component is not computable, so HFCI itself is not computable
-    assert res.hfci.hfci is None
-    assert res.hfci.exchange.score is None
 
 
 def test_report_generation_from_assembled_results(tmp_path):

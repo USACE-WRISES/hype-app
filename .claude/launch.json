@@ -4,9 +4,30 @@
     {
       "name": "hype-app",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "shiny", "run", "--port", "8322", "app.py"],
+      "runtimeArgs": [
+        "-c",
+        "import os; from shiny import run_app; run_app('app.py', host='127.0.0.1', port=int(os.environ.get('PORT', '8322')))"
+      ],
       "port": 8322,
+      "autoPort": true,
       "env": {
+        "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
+        "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "hype-app-desktop",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import os; from shiny import run_app; run_app('app.py', host='127.0.0.1', port=int(os.environ.get('PORT', '8323')))"
+      ],
+      "port": 8323,
+      "autoPort": true,
+      "env": {
+        "HYPE_DESKTOP": "1",
+        "HYPE_DATA_ROOT": "D:\\Code\\Work\\hype-app\\.dev-data",
         "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
         "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
         "PYTHONUNBUFFERED": "1"

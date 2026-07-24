@@ -58,4 +58,60 @@ def nearest_edge(index, x, y):
             float(index["x"][i]), float(index["y"][i]), i)
 
 
-__all__ = ["build_edge_samples", "nearest_edge"]
+def valid_samples_along_line(raster_path, feat_4326, *, extra_nodata=(-9999.0,),
+                             min_n=64, max_n=4001):
+    """Valid WSE samples along a LineString Feature (EPSG:4326) — cap-line corner anchoring.
+
+    Samples the raster every HALF PIXEL along the line (Nyquist against the pixel grid, so a
+    one-cell-wide channel crossing cannot fall between samples; the +1 puts samples exactly at
+    the line's endpoints) and keeps only valid values: the build_edge_samples mask plus the
+    <= -1000 undeclared-sentinel guard from delineate.min_elevation_along_line — cap sampling
+    reads arbitrary interior pixels, where -9999-style uploads bite hardest. Mirrors the
+    engine's `my_utils.nearest_valid_wse_along_line` (same density + validity rules; parity-
+    tested). Returns {"x", "y", "value", "crs"} in the raster's CRS, or None when the geometry
+    is degenerate or nothing valid samples.
+    """
+    import numpy as np
+    import rasterio
+    from pyproj import Transformer
+
+    try:
+        coords = feat_4326["geometry"]["coordinates"]
+    except Exception:  # noqa: BLE001
+        return None
+    if not coords or len(coords) < 2:
+        return None
+    with rasterio.open(raster_path) as src:
+        tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        vx, vy = tr.transform([c[0] for c in coords], [c[1] for c in coords])
+        vx, vy = np.asarray(vx, dtype="float64"), np.asarray(vy, dtype="float64")
+        seg = np.hypot(np.diff(vx), np.diff(vy))
+        length = float(seg.sum())
+        if length <= 0:
+            return None
+        a = src.transform
+        px = float(max(np.hypot(a.a, a.d), np.hypot(a.b, a.e))) or 1.0
+        n = int(np.clip(np.ceil(length / (0.5 * px)) + 1, min_n, max_n))
+        # arc-length-uniform positions along the (possibly multi-vertex) polyline, pure numpy
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        s = np.linspace(0.0, length, n)
+        i = np.clip(np.searchsorted(cum, s, side="right") - 1, 0, seg.size - 1)
+        t = (s - cum[i]) / np.where(seg[i] > 0, seg[i], 1.0)
+        sx = vx[i] + t * (vx[i + 1] - vx[i])
+        sy = vy[i] + t * (vy[i + 1] - vy[i])
+        vals = np.array([v[0] for v in src.sample(np.column_stack([sx, sy]))], dtype="float64")
+        crs, nod = src.crs, src.nodata
+    invalid = ~np.isfinite(vals)
+    if nod is not None:
+        invalid |= np.isclose(vals, float(nod))
+    for v in extra_nodata:
+        invalid |= np.isclose(vals, float(v))
+    invalid |= vals <= -1.0e20
+    invalid |= vals <= -1000.0
+    keep = ~invalid
+    if not keep.any():
+        return None
+    return {"x": sx[keep], "y": sy[keep], "value": vals[keep], "crs": crs}
+
+
+__all__ = ["build_edge_samples", "nearest_edge", "valid_samples_along_line"]

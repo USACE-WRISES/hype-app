@@ -23,10 +23,11 @@ INPUT_GROUPS: tuple[str, ...] = (
     "geometry",     # reach + boundary geometry
     "terrain",      # DEM + WSE
     "streamflow",   # streamflow value + source
-    "soil_k",       # soil / K assignments
+    "soil_k",       # soil / K assignments (incl. porosity)
     "gradients",    # gradient configuration
     "grid",         # grid + model depth
-    "particles",    # porosity + particle settings
+    # "particles" removed 2026-07-18 with the per-run MP7 pass (System A) — hyporheic
+    # delineation runs post-solve from ALL cells (hz_analysis) with its own knobs.
 )
 
 

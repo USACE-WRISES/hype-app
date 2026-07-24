@@ -74,7 +74,9 @@ class Settings(BaseModel):
     gw_offset: PositiveFloat = 0.5
     porosity: PositiveFloat = Field(0.3, le=0.6)
 
-    # Particle tracking
+    # Particle tracking (CLI/yaml only — the HYPE app passes run_particles=False and does its
+    # own all-cell forward+backward delineation post-run instead; see hz_analysis)
+    run_particles: bool = True              # False = skip the per-run MP7 pass + exports
     particles_per_cell: PositiveInt = 1     # per wetted stream cell: 1, 4 (2×2) or 9 (3×3)
     min_path_mult: float = Field(3.0, ge=0.0)   # hyporheic filter: min horizontal path length,
     #                                             as a multiple of the mean cell size

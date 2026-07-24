@@ -630,8 +630,13 @@ def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[f
     the (carved) terrain along the upstream/downstream boundary line and take the min. Also samples
     WSE rasters (reference-slope reporting), so values <= -1000 m are treated as undeclared nodata
     sentinels (-9999 uploads) — no terrestrial elevation goes that low. Returns None when the
-    geometry is empty or nothing valid samples.
+    geometry is empty, nothing valid samples, or the raster cannot be read (a raster that is
+    still being finalized by its writer can serve a truncated tile — observed live 2026-07-16,
+    TIFFReadEncodedTile got 0 bytes right after a terrain fetch and killed the session via an
+    unguarded reactive chain; one short retry rides out the race, then None degrades softly).
     """
+    import time
+
     import numpy as np
     import rasterio
     from pyproj import Transformer
@@ -643,13 +648,24 @@ def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[f
         return None
     if line.is_empty or line.length == 0:
         return None
-    with rasterio.open(dem_path) as src:
-        tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-        fracs = np.linspace(0.0, 1.0, max(2, int(n)))
-        pts = [line.interpolate(float(f), normalized=True) for f in fracs]
-        xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
-        vals = np.array([v[0] for v in src.sample(np.column_stack([xs, ys]))], dtype="float64")
-        nod = src.nodata
+    vals = nod = None
+    for attempt in (0, 1):
+        try:
+            with rasterio.open(dem_path) as src:
+                tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+                fracs = np.linspace(0.0, 1.0, max(2, int(n)))
+                pts = [line.interpolate(float(f), normalized=True) for f in fracs]
+                xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
+                vals = np.array([v[0] for v in src.sample(np.column_stack([xs, ys]))],
+                                dtype="float64")
+                nod = src.nodata
+            break
+        except Exception as e:  # noqa: BLE001 — unreadable raster must never raise out
+            if attempt == 0:
+                time.sleep(0.3)
+                continue
+            print(f"[elev] sampling {dem_path} failed twice: {type(e).__name__}: {e}")
+            return None
     if nod is not None:
         vals = np.where(vals == nod, np.nan, vals)
     vals = np.where(vals <= -1000.0, np.nan, vals)   # undeclared sentinels (e.g. -9999 uploads)

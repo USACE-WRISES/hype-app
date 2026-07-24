@@ -106,6 +106,118 @@ def wetted_extent_feature(depth_tif, thresh: float = DEPTH_THRESH_M,
             "geometry": mapping(poly4326)}
 
 
+def split_wetted_by_connectivity(depth_tif, up_feat, down_feat,
+                                 thresh: float = DEPTH_THRESH_M,
+                                 simplify_px: float = 0.3,
+                                 cap_buffer_px: float = 2.0,
+                                 max_vertices: int = 25_000):
+    """Split the wetted extent into upstream↔downstream-connected parts vs isolated pools.
+
+    Same wet-pixel → connectivity-8 component pipeline as wetted_extent_feature, but each
+    connected component is classified instead of dissolved blindly: KEPT if it intersects
+    BOTH the upstream and the downstream boundary cap (each buffered by `cap_buffer_px`
+    pixels so a ribbon ending within a cell of the domain edge still counts), REMOVED
+    otherwise. Coarse hydraulic cells leave isolated puddles that would otherwise become
+    CHD stream cells; the kept side is the extent the groundwater model should see.
+
+    `up_feat`/`down_feat` are EPSG:4326 LineString Features (the boundary caps). Returns
+    {kept_feat, removed_feat, n_kept, n_removed, removed_m2} — Features in EPSG:4326,
+    `removed_feat` None when nothing was removed — or None when NO component touches both
+    caps (a dry cap, say): callers must treat that as "filter cannot apply" and fall back
+    to the unfiltered extent rather than handing the model an empty water surface.
+    """
+    import rasterio
+    import rasterio.features
+    import shapely.geometry as sg
+    import shapely.ops
+    from pyproj import Transformer
+    from shapely.geometry import mapping
+
+    with rasterio.open(depth_tif) as ds:
+        a = ds.read(1, masked=True)
+        wet = (~a.mask) & (a.data > thresh)
+        if not wet.any():
+            return None
+        shapes = rasterio.features.shapes(wet.astype("uint8"), mask=wet,
+                                          transform=ds.transform, connectivity=8)
+        parts = [sg.shape(s) for s, v in shapes if v == 1]
+        px = abs(ds.transform.a)
+        crs = ds.crs
+
+    to_raster = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    caps = []
+    for feat in (up_feat, down_feat):
+        line = sg.shape(feat["geometry"] if feat.get("type") == "Feature" else feat)
+        caps.append(shapely.ops.transform(to_raster.transform, line)
+                    .buffer(cap_buffer_px * px))
+    kept = [p for p in parts if p.intersects(caps[0]) and p.intersects(caps[1])]
+    if not kept:
+        return None
+    removed = [p for p in parts if not (p.intersects(caps[0]) and p.intersects(caps[1]))]
+
+    to_4326 = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+
+    def _feat(polys, extra):
+        poly = shapely.ops.unary_union(polys)
+        for factor in (simplify_px, 0.75, 1.5):
+            simplified = poly.simplify(factor * px, preserve_topology=True)
+            if _count_vertices(simplified) <= max_vertices:
+                break
+        poly4326 = shapely.ops.transform(to_4326.transform, simplified)
+        props = {"source": "HEC-RAS 2025", "n_parts": len(polys)}
+        props.update(extra)
+        return {"type": "Feature", "properties": props, "geometry": mapping(poly4326)}
+
+    removed_m2 = sum(p.area for p in removed)
+    return {
+        "kept_feat": _feat(kept, {"filter": "upstream-downstream"}),
+        "removed_feat": (_feat(removed, {"filter": "removed-pools",
+                                         "removed_m2": round(removed_m2, 1)})
+                         if removed else None),
+        "n_kept": len(kept),
+        "n_removed": len(removed),
+        "removed_m2": float(removed_m2),
+    }
+
+
+def mask_out_polygons(src_tif, feat_4326, out_path, nodata: float = -9999.0) -> str:
+    """Copy a raster with pixels INSIDE the given polygons set to nodata.
+
+    The inverse of dem.clip_dem_to_polygon: everything outside the polygons stays
+    byte-identical; inside becomes nodata. all_touched=True also nulls the pixels the
+    polygon outline merely straddles — that absorbs the sub-pixel grid shift between the
+    depth raster the polygons came from and this raster, and can never reach a KEPT wet
+    pixel (edge- or corner-adjacency to a removed pool would have made it the same
+    connectivity-8 component). Used to null the isolated-pool regions out of the
+    groundwater WSE raster so they never become CHD cells.
+    """
+    import numpy as np
+    import rasterio
+    import rasterio.features
+    import shapely.geometry as sg
+    import shapely.ops
+    from pyproj import Transformer
+
+    geom = sg.shape(feat_4326["geometry"] if feat_4326.get("type") == "Feature"
+                    else feat_4326)
+    with rasterio.open(src_tif) as src:
+        arr = src.read(1)
+        meta = src.meta.copy()
+        tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        g = shapely.ops.transform(tr.transform, geom)
+        inside = rasterio.features.geometry_mask([g.__geo_interface__],
+                                                 out_shape=arr.shape,
+                                                 transform=src.transform, invert=True,
+                                                 all_touched=True)
+    out = np.where(inside, np.float32(nodata), arr).astype("float32")
+    meta.update(dtype="float32", nodata=nodata, compress="deflate")
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(out, 1)
+    return str(out_path)
+
+
 def wetted_area_m2(depth_tif, thresh: float = DEPTH_THRESH_M) -> float:
     import rasterio
 

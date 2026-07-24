@@ -38,8 +38,11 @@ def _apply(config: GradientBoundaryConfigV2, *, left_which: str, right_which: st
 
 
 def canonical_scenario_hash(config: GradientBoundaryConfigV2) -> str:
-    """Stable hash of the gradient values that define a scenario (for dedup, §10.2)."""
+    """Stable hash of the gradient values that define a scenario (for dedup, §10.2). The method
+    version is part of the key: the same gradients under a different head-anchor rule are a
+    different scenario, so restored results never mix anchor semantics with fresh runs."""
     key = {
+        "method": config.method_version,
         "left": [(c.station, c.preferred) for c in sorted(config.left_controls,
                                                           key=lambda c: c.station)],
         "right": [(c.station, c.preferred) for c in sorted(config.right_controls,
@@ -135,20 +138,7 @@ def aggregate_metric(scenarios: list[ScenarioSpec], key: str, preferred_id: str)
     return out
 
 
-def dominant_capacity_contributor(scenarios: list[ScenarioSpec]) -> str | None:
-    """Component (exchange/storage/processing) with the largest 0–15 score range (§10.5)."""
-    ranges = {}
-    for comp in ("exchange_score", "storage_score", "processing_score"):
-        vals = [s.metrics.get(comp) for s in scenarios
-                if s.status.value == "completed" and isinstance(s.metrics.get(comp), (int, float))]
-        if vals:
-            ranges[comp] = max(vals) - min(vals)
-    if not ranges:
-        return None
-    return max(ranges, key=ranges.get).replace("_score", "")
-
-
 __all__ = [
     "canonical_scenario_hash", "generate_scenarios", "build_manifest", "plan_execution_order",
-    "aggregate_metric", "dominant_capacity_contributor",
+    "aggregate_metric",
 ]

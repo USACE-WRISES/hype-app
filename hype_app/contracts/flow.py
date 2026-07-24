@@ -110,4 +110,32 @@ class FlowLookupSnapshot(HypeModel):
         return next((c for c in self.candidates if c.id == self.selected_candidate_id), None)
 
 
-__all__ = ["LatLon", "FlowCandidate", "FlowLookupSnapshot", "FLOW_SNAPSHOT_SCHEMA_VERSION"]
+def watershed_display_features(
+        watershed_geojson: dict | None) -> tuple[dict | None, tuple[float, float] | None]:
+    """(watershed FeatureCollection | None, pour-point (lat, lon) | None) for the review map.
+
+    `FlowLookupSnapshot.watershed_geojson` stores the raw ss-delineate `featurecollection`
+    list, whose items sometimes arrive nested one list deep — flatten one level, then match
+    the documented member names ("globalwatershed" / "globalwatershedpoint"). Never raises:
+    a malformed payload just yields (None, None).
+    """
+    items: list = []
+    for it in ((watershed_geojson or {}).get("featurecollection") or []):
+        items.extend(it if isinstance(it, list) else [it])
+    ws = pour = None
+    for it in items:
+        if not isinstance(it, dict) or not isinstance(it.get("feature"), dict):
+            continue
+        if it.get("name") == "globalwatershed":
+            ws = it["feature"]
+        elif it.get("name") == "globalwatershedpoint":
+            try:
+                lon, lat = it["feature"]["features"][0]["geometry"]["coordinates"][:2]
+                pour = (float(lat), float(lon))
+            except Exception:  # noqa: BLE001
+                pour = None
+    return ws, pour
+
+
+__all__ = ["LatLon", "FlowCandidate", "FlowLookupSnapshot", "FLOW_SNAPSHOT_SCHEMA_VERSION",
+           "watershed_display_features"]

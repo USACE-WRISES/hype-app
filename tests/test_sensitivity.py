@@ -12,7 +12,6 @@ from hype_app.sensitivity import (
     aggregate_metric,
     build_manifest,
     canonical_scenario_hash,
-    dominant_capacity_contributor,
     generate_scenarios,
     plan_execution_order,
 )
@@ -73,29 +72,26 @@ def test_scenario_cap():
     assert any(w.code == "scenario_cap" for w in m.warnings)
 
 
-def test_aggregate_metric_and_dominant():
+def test_aggregate_metric_over_primary_metric():
     specs = generate_scenarios(_base(), GeneratorType.linked)
-    # attach synthetic completed metrics
-    for s, hfci, ex in zip(specs, (0.5, 0.3, 0.7), (10, 6, 12)):
+    # attach synthetic completed metrics keyed by a primary hydraulic metric
+    for s, c1km in zip(specs, (0.5, 0.3, 0.7)):
         s.status = ScenarioStatus.completed
-        s.metrics = {"hfci": hfci, "exchange_score": ex, "storage_score": 8,
-                     "processing_score": 9}
-    agg = aggregate_metric(specs, "hfci", specs[0].id)
+        s.metrics = {"turnovers_per_km": c1km, "equivalent_active_depth_m": 1.2}
+    agg = aggregate_metric(specs, "turnovers_per_km", specs[0].id)
     assert agg["preferred"] == 0.5
     assert agg["min"] == 0.3 and agg["max"] == 0.7
     assert agg["range"] == pytest.approx(0.4)
     assert agg["n_success"] == 3
-    # exchange varies 6..12 (range 6), storage/processing flat -> exchange dominates
-    assert dominant_capacity_contributor(specs) == "exchange"
 
 
 def test_failed_scenarios_excluded_from_aggregation():
     """§14.16: a failed alternative doesn't corrupt the aggregation."""
     specs = generate_scenarios(_base(), GeneratorType.linked)
     specs[0].status = ScenarioStatus.completed
-    specs[0].metrics = {"hfci": 0.5}
+    specs[0].metrics = {"turnovers_per_km": 0.5}
     specs[1].status = ScenarioStatus.failed          # no metrics
     specs[2].status = ScenarioStatus.completed
-    specs[2].metrics = {"hfci": 0.7}
-    agg = aggregate_metric(specs, "hfci", specs[0].id)
+    specs[2].metrics = {"turnovers_per_km": 0.7}
+    agg = aggregate_metric(specs, "turnovers_per_km", specs[0].id)
     assert agg["n_success"] == 2 and agg["max"] == 0.7

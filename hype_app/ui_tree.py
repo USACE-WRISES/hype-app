@@ -21,6 +21,10 @@ _REACH, _DEM, _BOUNDARIES, _SURFACE, _K, _MESH, _RUN, _RESULTS = (
 # its own box AND every checkbox ancestor's box are ticked (the parent toggle overrides the
 # children without erasing their state) — see app.py `_eff_checked`/`_apply_check_effective`.
 NODES: list[dict] = [
+    # Project: identity/info node (name, location, units, save actions) — no checkbox,
+    # no map layers, never gated. Sits above the workflow nodes in both run modes.
+    {"id": "project", "label": "Project", "parent": None, "group": False,
+     "check": False, "layers": ()},
     {"id": "reach", "label": "Reach centerline", "parent": None, "group": False,
      "check": True, "layers": ("Reach",)},
     {"id": "terrain", "label": "Terrain", "parent": None, "group": True,
@@ -44,19 +48,19 @@ NODES: list[dict] = [
      "check": True, "layers": ()},
     {"id": "sw.mesh", "label": "2D mesh", "parent": "sw", "group": False,
      "check": True, "layers": ("RAS mesh",)},
-    {"id": "sw.wetted", "label": "Wetted extent", "parent": "sw", "group": False,
-     "check": True, "layers": ("Water-surface extent", "Modeled extent")},
     {"id": "sw.wse", "label": "Water surface (raster)", "parent": "sw", "group": False,
      "check": True, "layers": ("wse_raster", "sw_wse")},   # wse_raster = today's consumed-WSE
      #                                                        overlay; sw_wse arrives at step 7
     {"id": "sw.depth", "label": "Depth (raster)", "parent": "sw", "group": False,
      "check": True, "layers": ("sw_depth",)},
+    {"id": "sw.wetted", "label": "Wetted extent (GW model)", "parent": "sw", "group": False,
+     "check": True, "layers": ("Water-surface extent", "Modeled extent", "Removed pools")},
     {"id": "gw", "label": "Groundwater", "parent": None, "group": True,
      "check": True, "layers": ()},
     {"id": "gw.k", "label": "Subsurface properties", "parent": "gw", "group": False,
      "check": True, "layers": ("K-zones",)},
-    {"id": "gw.soils", "label": "NRCS soils", "parent": "gw", "group": False,
-     "check": True, "layers": ("soils",)},   # SSURGO review layer (revision §6.3)
+    # NRCS soils (SSURGO) review lives in a modal off the Subsurface-properties pane since
+    # 2026-07-16 — no tree node, no main-map layer.
     {"id": "gw.mesh", "label": "Model grid", "parent": "gw", "group": False,
      "check": True, "layers": ("grid",)},
     {"id": "gw.run", "label": "Model run", "parent": "gw", "group": False,
@@ -99,6 +103,10 @@ NODES: list[dict] = [
      "check": True, "layers": ("hz_foot_gaining",)},
     {"id": "gw.res.hz.thru", "label": "Throughflow", "parent": "gw.res.hz.vols", "group": False,
      "check": True, "layers": ("hz_foot_throughflow",)},
+    # Flows: flux-weighted exchange-flow accounting (pane) + the streambed exchange map
+    # (checkbox toggles the downwelling/upwelling cell overlays together).
+    {"id": "gw.res.hz.flows", "label": "Flows", "parent": "gw.res.hz", "group": False,
+     "check": True, "layers": ("hz_flow_down", "hz_flow_up")},
     {"id": "base", "label": "Basemaps", "parent": None, "group": True,
      "check": True, "layers": ()},
     {"id": "base.imagery", "label": "USGS Imagery", "parent": "base", "group": False,
@@ -106,7 +114,7 @@ NODES: list[dict] = [
     {"id": "base.topo", "label": "USGS Topo", "parent": "base", "group": False,   # startup checked
      "check": True, "layers": ()},                        # state is set in _CHECK_DEFAULTS (topo default)
     {"id": "base.hydro", "label": "NHD Hydrography", "parent": "base", "group": False,
-     "check": True, "layers": ()},
+     "check": True, "layers": ("NHD streams",)},  # the flowline vectors reach picks snap to
 ]
 
 NODE: dict[str, dict] = {n["id"]: n for n in NODES}
@@ -115,6 +123,7 @@ NODE_LAYERS: dict[str, tuple] = {n["id"]: tuple(n["layers"]) for n in NODES if n
 # node id -> wizard step whose machinery drives it (None = leave the step alone: basemaps).
 # Behavioral mapping — see module docstring for why sw.wetted lives on the boundaries step.
 NODE_STEP: dict[str, str | None] = {
+    "project": None,
     "reach": _REACH,
     "terrain": _DEM, "terrain.dem": _DEM, "terrain.chanmod": _DEM,
     "bnd": _BOUNDARIES, "bnd.up": _BOUNDARIES, "bnd.left": _BOUNDARIES,
@@ -122,7 +131,7 @@ NODE_STEP: dict[str, str | None] = {
     "sw": _SURFACE, "sw.mesh": _SURFACE,
     "sw.wetted": _BOUNDARIES,
     "sw.wse": _SURFACE, "sw.depth": _SURFACE,
-    "gw": _MESH, "gw.k": _K, "gw.soils": _K, "gw.mesh": _MESH, "gw.run": _RUN,
+    "gw": _MESH, "gw.k": _K, "gw.mesh": _MESH, "gw.run": _RUN,
     "gw.sens": _RUN,
     "gw.res": _RESULTS, "gw.res.head": _RESULTS, "gw.res.paths": _RESULTS,
     "gw.res.paths.hyp": _RESULTS, "gw.res.paths.los": _RESULTS,
@@ -130,6 +139,7 @@ NODE_STEP: dict[str, str | None] = {
     "gw.res.hz": _RESULTS, "gw.res.hz.vols": _RESULTS,
     "gw.res.hz.hyp": _RESULTS, "gw.res.hz.los": _RESULTS,
     "gw.res.hz.gain": _RESULTS, "gw.res.hz.thru": _RESULTS,
+    "gw.res.hz.flows": _RESULTS,
     "base": None, "base.imagery": None, "base.topo": None, "base.hydro": None,
 }
 
@@ -170,7 +180,8 @@ NODE_SLOT = {v: k for k, v in SLOT_NODE.items()}
 # here simply have no 3D representation).
 NODE_3D = {
     "terrain.dem": "terrain",
-    "base.imagery": "basemap",     # aerial drape on the 3-D mesh top (USGS Imagery)
+    "base.imagery": "basemap",       # aerial drape on the 3-D mesh top (USGS Imagery)
+    "base.topo": "basemap_topo",     # topo drape (same actor, second texture; radio picks one)
     "gw.mesh": "gw_mesh",
     "gw.res.head": "head",
     "sw.wse": "wse",

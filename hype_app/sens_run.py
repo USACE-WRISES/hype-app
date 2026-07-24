@@ -33,10 +33,9 @@ def child_run(payload: dict, q) -> None:
                  for k in ("left", "right", "up", "down")}
         khgdf = None
         if payload.get("kzones"):
-            khgdf = geometry.features_to_gdf(payload["kzones"])
-            khgdf["KH"] = float(payload["kzone_kh"])
-            khgdf["KV"] = float(payload["kzone_kv"])
-            khgdf = khgdf.to_crs(crs)
+            khgdf = geometry.kzones_to_gdf(
+                payload["kzones"], fallback_kh=float(payload["kzone_kh"]),
+                fallback_kv=float(payload["kzone_kv"])).to_crs(crs)
         builder = None
         if payload.get("soil_k"):
             from hype_app.soil_k import make_cell_k_builder

@@ -387,6 +387,8 @@ def compute_boundary_heads_from_profile(
     wse_edge_index: dict,
     *,
     log: callable = print,
+    f0_anchor: tuple[float, float] | None = None,
+    f1_anchor: tuple[float, float] | None = None,
 ) -> tuple[list[float], float, float]:
     """
     From a 'fraction,gradient' profile for a boundary LineString:
@@ -401,6 +403,10 @@ def compute_boundary_heads_from_profile(
     * 'first_layer_cells' must be sorted by distance along line (caller should sort).
     * Uses nearest edge of *valid* WSE area for distance/value via
       `nearest_wse_edge_distance_and_value`.
+    * 'f0_anchor'/'f1_anchor' are precomputed (distance, wse) pairs for the corner stations
+      0 and 1 — the cap-line anchors from `nearest_valid_wse_along_line` — used instead of
+      the nearest-edge lookup when given, so the corners reference the WSE where the stream
+      crosses their own boundary cap.
     """
     if not first_layer_cells or line is None:
         return [], float("nan"), float("nan")
@@ -415,7 +421,16 @@ def compute_boundary_heads_from_profile(
     if L <= 0:
         raise ValueError("Boundary line has zero length; cannot evaluate fractions.")
     anchor_heads: list[float] = []
-    for f, g in zip(fracs, grads):
+    for i, (f, g) in enumerate(zip(fracs, grads)):
+        pre = (f0_anchor if (i == 0 and f0_anchor is not None) else
+               f1_anchor if (i == len(fracs) - 1 and f1_anchor is not None) else None)
+        if pre is not None:
+            dist, wse = float(pre[0]), float(pre[1])
+            head = wse + float(g) * dist
+            anchor_heads.append(head)
+            log(f"    profile f={f:g}: dist_to_WSE={dist:.3f}, WSE={wse:.3f} (cap-line anchor), "
+                f"grad={g:g} -> head={head:.3f}")
+            continue
         s = float(np.clip(f, 0.0, 1.0)) * L
         pt = line.interpolate(s)
         dist, wse, _edge_xy, _border_xy = nearest_wse_edge_distance_and_value(wse_edge_index, pt)
@@ -828,6 +843,53 @@ def nearest_wse_edge_distance_and_value(
         (float(ex[idx]), float(ey[idx])),
         (float(nearest_on_border.x), float(nearest_on_border.y)),
     )
+
+
+def nearest_valid_wse_along_line(
+    raster_path,
+    line: LineString | None,
+    ref_pt: Point | None,
+    *,
+    extra_nodata: Sequence[float] = (-9999.0,),
+    min_n: int = 64,
+    max_n: int = 4001,
+) -> Optional[tuple[float, float, tuple[float, float]]]:
+    """Nearest valid WSE sample to `ref_pt` along `line` — corner anchoring on a boundary cap.
+
+    Samples the raster every HALF PIXEL along the line (so a one-cell-wide channel crossing
+    cannot fall between samples), masks invalid values (non-finite, declared nodata,
+    `extra_nodata`, <= -1e20, and the <= -1000 undeclared-sentinel guard for -9999-style
+    uploads), and returns (distance, wse, (x, y)) of the surviving sample nearest `ref_pt` —
+    all in the raster's CRS, assumed to be the metric model CRS. None when the line never
+    crosses valid WSE (callers fall back to the nearest-wetted-edge anchor). Mirrors the app
+    preview's `wse_index.valid_samples_along_line` (same density + validity rules).
+    """
+    if line is None or ref_pt is None or line.is_empty or float(line.length) <= 0:
+        return None
+    with rasterio.open(raster_path) as src:
+        a = src.transform
+        px = float(max(np.hypot(a.a, a.d), np.hypot(a.b, a.e))) or 1.0
+        n = int(np.clip(np.ceil(float(line.length) / (0.5 * px)) + 1, min_n, max_n))
+        pts = [line.interpolate(float(f), normalized=True) for f in np.linspace(0.0, 1.0, n)]
+        sx = np.asarray([p.x for p in pts], dtype="float64")
+        sy = np.asarray([p.y for p in pts], dtype="float64")
+        vals = np.array([v[0] for v in src.sample(np.column_stack([sx, sy]))], dtype="float64")
+        nod = src.nodata
+    invalid = ~np.isfinite(vals)
+    if nod is not None:
+        invalid |= np.isclose(vals, float(nod))
+    for v in extra_nodata:
+        invalid |= np.isclose(vals, float(v))
+    invalid |= vals <= -1.0e20
+    invalid |= vals <= -1000.0
+    keep = ~invalid
+    if not keep.any():
+        return None
+    kx, ky, kv = sx[keep], sy[keep], vals[keep]
+    dx = kx - float(ref_pt.x)
+    dy = ky - float(ref_pt.y)
+    i = int(np.argmin(dx * dx + dy * dy))
+    return (float(np.hypot(dx[i], dy[i])), float(kv[i]), (float(kx[i]), float(ky[i])))
 
 
 # ----------------------------
@@ -4325,17 +4387,22 @@ def scenario(
         print("Running MODFLOW 6...")
         run_models(gwfsim, silent=False)
 
-        print("Building MODPATH 7 forward")
-        # particles_per_cell ∈ {1, 4, 9} → an n×n local grid per wetted cell
-        n_side = max(1, int(round(float(getattr(cfg, "particles_per_cell", 1) or 1) ** 0.5)))
-        mp_fwd, _mp_bwd = build_particle_models(
-            cfg.sim_name, gwf, river_cells, mp7_ws=cfg.mp7_ws, exe_path=cfg.md7_exe_path,
-            porosity=float(getattr(cfg, "porosity", 0.3) or 0.3),
-            nx=n_side, ny=n_side,
-        )
-        if write:
-            write_models(mp_fwd, silent=silent)
-        print("Running MODPATH 7 forward...")
-        run_models(mp_fwd, silent=silent)
+        # Per-run MODPATH pass (CLI/yaml only). The HYPE app sets run_particles=False:
+        # its hyporheic delineation (hz_analysis) seeds ALL active cells forward+backward
+        # on the finished solution instead, so a stream-seeded forward pass here would be
+        # pure wasted wall-time.
+        if bool(getattr(cfg, "run_particles", True)):
+            print("Building MODPATH 7 forward")
+            # particles_per_cell ∈ {1, 4, 9} → an n×n local grid per wetted cell
+            n_side = max(1, int(round(float(getattr(cfg, "particles_per_cell", 1) or 1) ** 0.5)))
+            mp_fwd, _mp_bwd = build_particle_models(
+                cfg.sim_name, gwf, river_cells, mp7_ws=cfg.mp7_ws, exe_path=cfg.md7_exe_path,
+                porosity=float(getattr(cfg, "porosity", 0.3) or 0.3),
+                nx=n_side, ny=n_side,
+            )
+            if write:
+                write_models(mp_fwd, silent=silent)
+            print("Running MODPATH 7 forward...")
+            run_models(mp_fwd, silent=silent)
 
     return gwfsim, gwf

@@ -71,6 +71,8 @@
   --ic-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8h9M8.5 4 12.5 8 8.5 12' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --ic-chev:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6 3.5 10.5 8 6 12.5' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --ic-info:  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6.6' fill='none' stroke='%23000' stroke-width='1.6'/%3E%3Cpath d='M8 7.2v3.6' stroke='%23000' stroke-width='1.8' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='4.8' r='.9'/%3E%3C/svg%3E");
+  --ic-cloud: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --ic-monitor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2' y='3' width='20' height='14' rx='2'/%3E%3Cline x1='8' y1='21' x2='16' y2='21'/%3E%3Cline x1='12' y1='17' x2='12' y2='21'/%3E%3C/svg%3E");
 }
 
 /* ============ 2. base + typography ============ */
@@ -93,13 +95,44 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .modal-backdrop { z-index: 1490; }
 .modal { z-index: 1500; }
 
+/* Site Summary Report modal (EASI/SFARI pattern): a full-height popup whose report iframe is the
+   ONLY scroll region. The full-height DIALOG sizing is injected inline with the report modal (scoped
+   to #shiny-modal while it is open, in _report_modal) because .modal-dialog/.modal-body are generic
+   Bootstrap classes shared by the other size="xl" modals (USGS, NRCS); here we style only the
+   report's own iframe + footer action row. The app shell already locks the background scroll. */
+.hype-report-frame { flex: 1 1 auto; width: 100%; border: 0; display: block; background: #fff; }
+.hype-report-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end;
+  align-items: center; width: 100%; }
+
 /* ============ 3. header + stage bar ============ */
+/* Three fixed zones — left (brand+badge) · center (2D/3D toggle) · right (nav). The
+   equal minmax(0,1fr) side columns keep the toggle at TRUE window center at any width
+   (the old space-between flex let the badge/toggle drift as the window widened);
+   minmax(0,…) so the sides compress (badge ellipsis) instead of pushing the toggle. */
 .hype-header { position: absolute; top: 0; left: 0; right: 0; height: var(--hype-header-h); z-index: 1200;
-  display: flex; align-items: center; justify-content: space-between; padding: 0 16px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  column-gap: 12px; align-items: center; padding: 0 16px;
   background: var(--hype-accent-dark); color: #fff; }
-.hype-brand { font-family: var(--font-head); font-weight: 700; font-size: var(--fs-4); letter-spacing: .3px; }
+.hype-header-left { display: flex; align-items: center; min-width: 0; }
+.hype-brand { font-family: var(--font-head); font-weight: 700; font-size: var(--fs-4); letter-spacing: .3px;
+  white-space: nowrap; }
 .hype-brand small { font-weight: 400; opacity: .82; font-size: var(--fs-1); margin-left: 10px; }
-.hype-nav { display: flex; align-items: center; gap: 18px; }
+/* Desktop project badge — the open project's name next to the brand (title = folder path).
+   min-width:0 on the Shiny output wrapper + max-width:min(…,100%) let the badge shrink
+   with the left column so its ellipsis engages instead of overflowing the toggle. */
+#project_badge { min-width: 0; }
+.hype-project-badge { display: inline-block; margin-left: 14px; padding: 2px 10px; border-radius: 999px;
+  background: rgba(255, 255, 255, .14); border: 1px solid rgba(255, 255, 255, .25);
+  font-size: var(--fs-1); font-weight: 500; white-space: nowrap; max-width: min(220px, 100%);
+  overflow: hidden; text-overflow: ellipsis; cursor: default; }
+
+/* Project pane metadata rows (Name / Location / Units / Created) */
+.hype-proj-row { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px;
+  padding: 5px 0; font-size: var(--fs-1); border-bottom: 1px solid var(--hype-rule); }
+.hype-proj-row:last-of-type { border-bottom: 0; }
+.hype-proj-k { color: var(--hype-text-muted); font-weight: 500; }
+.hype-proj-v { color: var(--hype-text); overflow-wrap: anywhere; }
+.hype-nav { display: flex; align-items: center; gap: 18px; justify-self: end; white-space: nowrap; }
 .hype-nav a { color: var(--hype-on-accent-dim); text-decoration: none; font-size: var(--fs-2); cursor: pointer; }
 .hype-nav a:hover { color: #fff; }
 
@@ -114,8 +147,10 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
    clicks through the ordinary tree_event select channel. */
 .hype-stagebar { position: absolute; top: var(--hype-header-h); left: 0; right: 0;
   height: var(--hype-stage-h); z-index: 1190; display: flex; align-items: center;
-  gap: 2px; padding: 0 10px; background: #fff; border-bottom: 1px solid var(--hype-rule);
-  overflow-x: auto; overflow-y: hidden; }
+  gap: 10px; padding: 0 10px; background: #fff; border-bottom: 1px solid var(--hype-rule);
+  overflow: visible; }   /* chips scroll in the strip below; visible so the run-mode popover can escape */
+.hype-stagebar-scroll { display: flex; align-items: center; gap: 2px; flex: 1 1 auto;
+  min-width: 0; height: 100%; overflow-x: auto; overflow-y: hidden; }
 .hype-stage { display: inline-flex; align-items: center; gap: 7px; height: 28px; flex: none;
   padding: 0 10px; border: 0; background: transparent; border-radius: var(--r-1);
   cursor: pointer; font: 500 var(--fs-1)/1 var(--font-body); color: var(--hype-text-muted); }
@@ -152,6 +187,34 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-stage.active .hype-stage-num::after { display: none; }
 .hype-stage.active.st-running .hype-stage-num { border: 2px solid var(--hype-accent);
   border-top-color: transparent; background: #fff; color: transparent; }
+
+/* run-mode indicator — right-justified pill at the end of the stage bar. Cloud Run =
+   accent outline + restriction summary on hover; Desktop Run = grayed (no limits).
+   A plain div (no data-jump) so tree.js's delegated click handler ignores it. */
+.hype-runmode { position: relative; margin-left: auto; flex: none; display: inline-flex;
+  align-items: center; gap: 6px; height: 22px; padding: 0 10px; border-radius: 999px;
+  border: 1px solid var(--hype-accent); color: var(--hype-accent-dark);
+  background: var(--hype-accent-soft); font: 600 var(--fs-0)/1 var(--font-body);
+  cursor: default; white-space: nowrap; }
+.hype-runmode.desktop { border-color: var(--hype-border); color: var(--hype-text-muted);
+  background: var(--hype-surface-soft); }
+.hype-runmode:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-runmode-glyph { width: 13px; height: 13px; flex: none; background: currentColor;
+  -webkit-mask: var(--ic-cloud) center/contain no-repeat;
+  mask: var(--ic-cloud) center/contain no-repeat; }
+.hype-runmode.desktop .hype-runmode-glyph {
+  -webkit-mask-image: var(--ic-monitor); mask-image: var(--ic-monitor); }
+.hype-runmode-pop { position: absolute; top: calc(100% + 8px); right: 0; width: 330px;
+  padding: 10px 12px; background: #fff; border: 1px solid var(--hype-border);
+  border-radius: var(--r-2); box-shadow: var(--shadow-3); display: none; cursor: auto;
+  font: 400 var(--fs-1)/1.5 var(--font-body); color: var(--hype-text);
+  text-align: left; white-space: normal; }
+.hype-runmode:hover .hype-runmode-pop,
+.hype-runmode:focus-within .hype-runmode-pop { display: block; }
+.hype-runmode-pop ul { margin: 6px 0 0; padding-left: 16px; }
+.hype-runmode-pop li { margin: 2px 0; }
+.hype-runmode-lead { font-weight: 600; color: var(--hype-text-strong); }
+.hype-runmode-note { color: var(--hype-text-muted); margin-top: 4px; }
 
 /* ============ 4. floating panels (layer tree left · properties right) ============ */
 .hype-tree-panel, .hype-props-panel { position: absolute; top: calc(var(--hype-chrome-h) + 12px);
@@ -226,6 +289,12 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-tree-row.selected.disabled { color: rgba(255, 255, 255, .62); }
 .hype-tree-row.hidden { display: none; }
 .hype-tree-row.group .hype-tree-label { font-weight: 600; }
+/* Project row reads as the parent object (Stream Corridor style): flush-left label,
+   no caret/checkbox/status columns; every other row keeps them for alignment. */
+.hype-tree-row[data-node="project"] .hype-tree-caret,
+.hype-tree-row[data-node="project"] .hype-tree-nocheck,
+.hype-tree-row[data-node="project"] .hype-tree-status { display: none; }
+.hype-tree-row[data-node="project"] .hype-tree-label { font-weight: 600; }
 .hype-tree-caret { width: 20px; flex: none; align-self: stretch; display: inline-flex;
   align-items: center; justify-content: center; color: var(--hype-text-muted); cursor: pointer; }
 .hype-tree-caret.is-group::before { content: ""; width: 8px; height: 8px;
@@ -473,6 +542,22 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-gpt-cap { opacity: 0.55; }
 .hype-gpt-gcell { display: flex; align-items: center; gap: 4px; }
 .hype-gpt-warn { color: var(--hype-warn); font-size: 12px; line-height: 1; }
+
+/* K-zones (Subsurface properties): per-zone editable KH/KV rows — values are written into
+   the zone Feature's properties in place, so rows never re-render mid-keystroke. */
+.hype-kz-table { margin: 6px 0 2px; }
+.hype-kz-row { display: grid; grid-template-columns: minmax(0, 1.3fr) 1fr 1fr auto;
+  gap: 0 6px; align-items: center; }
+.hype-kz-row > * { min-width: 0; }
+.hype-kz-row .form-group, .hype-kz-row .shiny-input-container { margin: 0; }
+.hype-kz-row input.form-control { padding: 2px 6px; height: auto; font-size: var(--fs-0); }
+.hype-kz-row + .hype-kz-row { margin-top: 4px; }
+.hype-kz-head { font-size: var(--fs-0); color: var(--hype-text-muted); font-weight: 600; }
+.hype-kz-name { font-size: var(--fs-0); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+.hype-kz-src { display: inline-block; margin-left: 5px; padding: 0 4px; border-radius: 3px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em; color: var(--hype-accent);
+  background: var(--hype-accent-soft); border: 1px solid var(--hype-accent-border); }
 .hype-link { border: 0; background: none; padding: 0 4px; color: var(--hype-accent);
   cursor: pointer; font-size: var(--fs-0); text-decoration: underline; }
 .hype-dim { opacity: 0.75; }
@@ -660,6 +745,9 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-fpsel-band { position: absolute; z-index: 1150; pointer-events: none;
   border: 2px dashed var(--hype-sel); background: rgba(255, 149, 0, .1); border-radius: 2px; }
 .hype-map-wrap path.hype-fp-sel { pointer-events: none; }  /* decorative highlight only */
+/* streambed exchange cells (Flows node): informational overlay — clicks fall through to
+   the flow paths and dots beneath */
+.hype-map-wrap path.hype-flow-ex { pointer-events: none; }
 
 /* 2-D length ruler (www/measure2d.js; always available on the map) */
 .hype-map-wrap .hype-measure2d a { font-size: 15px; line-height: 26px; color: var(--hype-text); }
@@ -743,11 +831,91 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   padding: 3px 9px; border-radius: var(--r-1); background: var(--hype-dark-chip);
   color: var(--hype-sel-text); border: 1px solid var(--hype-sel); }
 
+/* ============ 11b. USGS flow-review modal ============ */
+.hype-subhead { font-family: var(--font-head); font-weight: 600; font-size: var(--fs-2);
+  color: var(--hype-text-strong); margin: 2px 0 var(--sp-2); }
+/* Streamflow block (Water-surface pane): the subhead below it is the section separator, so
+   the block itself carries the inter-section gap. */
+.hype-flow-input { margin: 0 0 var(--sp-4); }
+.hype-usgs-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0 var(--sp-3); align-items: end; }
+.hype-usgs-controls > * { min-width: 0; }
+.hype-service-map-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(13rem, 1fr);
+  gap: var(--sp-3); margin: var(--sp-3) 0 var(--sp-4); align-items: stretch; }
+.hype-service-map-grid .jupyter-widgets, .hype-service-map-grid .leaflet-container {
+  min-height: 320px; border-radius: var(--r-1); }
+.hype-service-map-legend { padding: var(--sp-3); border: 1px solid var(--hype-border);
+  border-radius: var(--r-1); background: var(--hype-surface-soft); font-size: var(--fs-1); }
+.hype-map-key { position: relative; margin: var(--sp-2) 0; padding-left: 1.4rem; }
+.hype-map-key::before { content: ""; position: absolute; left: 0; top: .3rem; width: .9rem;
+  height: .42rem; border: 2px solid #667; border-radius: 2px; }
+.hype-map-key.reach::before { border-color: #ff2d95; }        /* REACH_STYLE */
+.hype-map-key.domain::before { border-color: #caa700; }       /* DOMAIN_STYLE */
+.hype-map-key.requested::before { background: #dc2626; border-color: #7f1d1d;
+  border-radius: 50%; width: .55rem; height: .55rem; }
+.hype-map-key.watershed::before { background: rgba(94, 234, 212, .35); border-color: #0f766e; }
+.hype-service-marker { display: block; width: 16px; height: 16px; border: 2px solid #fff;
+  border-radius: 50%; box-shadow: 0 0 0 2px rgba(15, 23, 42, .7), 0 1px 4px rgba(0, 0, 0, .5); }
+.hype-service-marker.requested { background: #dc2626; cursor: grab; }
+.hype-service-marker.snapped { background: #2563eb; }
+.hype-flow-table { margin-top: var(--sp-2); font-size: var(--fs-1); }
+.hype-flow-table th { white-space: nowrap; }
+.hype-flow-table tr.hype-flow-row { cursor: pointer; }
+.hype-flow-table tr.hype-flow-row:hover td { background: var(--hype-accent-soft); }
+.hype-flow-table tr.hype-flow-row.sel td { background: var(--hype-accent-soft);
+  box-shadow: inset 0 2px 0 -1px var(--hype-accent-border), inset 0 -2px 0 -1px var(--hype-accent-border); }
+.hype-flow-table tr.hype-flow-row.sel td:first-child { box-shadow: inset 3px 0 0 var(--hype-accent),
+  inset 0 2px 0 -1px var(--hype-accent-border), inset 0 -2px 0 -1px var(--hype-accent-border); }
+.hype-flow-table tr.hype-flow-row.disabled { cursor: default; color: var(--hype-text-faint); }
+.hype-flow-table tr.hype-flow-row.disabled:hover td { background: transparent; }
+
+/* ============ 11c. NRCS soils-review modal ============ */
+.hype-map-key.soils::before { background: rgba(210, 180, 140, .4); border-color: #8a6d3b; }
+.hype-map-key.soilsel::before { background: rgba(94, 234, 212, .45); border-color: #1f6feb; }
+.hype-soil-units td.hype-soil-pick { width: 1.4rem; text-align: center; font-size: 1rem; }
+.hype-soil-units td { vertical-align: middle; }
+.hype-soil-decide { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 0 var(--sp-3); align-items: start; margin-top: var(--sp-3); }
+.hype-soil-decide > * { min-width: 0; }
+@media (max-width: 760px) { .hype-soil-decide { grid-template-columns: 1fr; } }
+
+/* ============ 11.x desktop welcome dialog (startup gate) ============ */
+/* Minimal splash: centered wordmark + two actions + recents (only when non-empty).
+   No modal title bar (title=None) and zero body copy by design. */
+.hype-welcome { padding: 14px 8px 6px; }
+.hype-welcome-brand { text-align: center; margin: 4px 0 22px; }
+.hype-welcome-mark { font-family: var(--font-head); font-weight: 700; font-size: 34px;
+  letter-spacing: .5px; color: var(--hype-accent-dark); }
+.hype-welcome-sub { color: var(--hype-text-muted); font-size: var(--fs-1); margin-top: 2px; }
+.hype-welcome-actions { display: flex; justify-content: center; gap: 12px; margin: 0 0 8px; }
+.hype-welcome-actions .btn { padding: 8px 22px; }
+.hype-welcome-list { display: flex; flex-direction: column; gap: 2px; max-height: 300px;
+  overflow-y: auto; margin: 2px -6px 0; }
+.hype-welcome-row { display: grid; grid-template-columns: minmax(90px, auto) minmax(0, 1fr) auto;
+  gap: 12px; align-items: baseline; width: 100%; padding: 7px 10px; border: 0;
+  border-radius: var(--r-1); background: transparent; text-align: left; cursor: pointer;
+  font: inherit; }
+.hype-welcome-row:hover { background: var(--hype-surface-soft); }
+.hype-welcome-row:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-welcome-name { font-weight: 600; color: var(--hype-text-strong); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.hype-welcome-dir { color: var(--hype-text-muted); font-size: var(--fs-1); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.hype-welcome-when { color: var(--hype-text-faint); font-size: var(--fs-0); white-space: nowrap; }
+
 /* ============ 12. responsive guards ============ */
 @media (max-width: 980px) {
   .hype-brand small { display: none; }
 }
+@media (max-width: 900px) {
+  /* Tight header: the nav's six links + toggle + brand near the shell's 780px floor.
+     The badge goes first (the OS window title still shows the project name). */
+  .hype-project-badge { display: none; }
+  .hype-nav { gap: 12px; }
+}
 @media (max-width: 760px) {
   .hype-stage-name { display: none; }        /* number-only chips on narrow screens */
+  .hype-runmode-name { display: none; }      /* glyph-only run-mode pill to match */
   .hype-props-panel { width: 320px; }
+  .hype-usgs-controls, .hype-service-map-grid { grid-template-columns: 1fr; }
 }

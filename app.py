@@ -9,6 +9,7 @@ and explore flow paths, volumes, and heads. Download the whole project as a zip.
 """
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import queue as _queue
@@ -17,7 +18,7 @@ import shutil
 import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # 3DEP/HyRiver cache -> ephemeral /tmp (set before py3dep import, which happens in hype_app.dem)
@@ -37,14 +38,17 @@ import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
 from hype_app import (assess, bieger, bundle, carve, delineate, dem, estimate, geocode,  # noqa: E402
-                      geometry, hydro, hz_results, mesh, ras_results, report as report_mod,
-                      results, scene, snapshot, ui_tree)
+                      geometry, gms, hydro, hz_results, mesh, project_meta, ras_results,
+                      recents, report as report_mod, results, runmode, scene, snapshot,
+                      ui_tree)
 from hype_app import hz_run  # noqa: E402
 from hype_app import sens_run  # noqa: E402
 from hype_app import soil_run  # noqa: E402
 from hype_app import usgs_run  # noqa: E402
 from hype_app import ras as ras_engine  # noqa: E402
 from hype_app import run as runner  # noqa: E402
+from hype_app.contracts.flow import watershed_display_features  # noqa: E402
+from hype_app.services.regions import region_choices  # noqa: E402
 
 try:
     from ipyleaflet import (DivIcon, DrawControl, GeoJSON, ImageOverlay, LayerGroup,
@@ -57,7 +61,6 @@ except Exception:  # pragma: no cover
 
 USGS_IMAGERY = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
 USGS_TOPO = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}"
-USGS_HYDRO = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSHydroCached/MapServer/tile/{z}/{y}/{x}"
 USGS_ATTR = "USGS The National Map"
 
 # Flow-path layers carry classNames so map_edit_style can route pointer events to THEM on the
@@ -79,16 +82,24 @@ CONTOUR_STYLE = {"color": "#11161c", "weight": 1, "opacity": 0.85, "fillOpacity"
 # drawn inputs — thin outlines / minimal fill so they never hide the head raster underneath
 DOMAIN_STYLE = {"color": "#caa700", "weight": 2, "opacity": 0.95, "fill": False}
 WSE_STYLE = {"color": "#1aa6a6", "weight": 2, "opacity": 0.95, "fillColor": "#1aa6a6", "fillOpacity": 0.12}
+# isolated pools the upstream–downstream connectivity filter removed from the GW extent
+REMOVED_STYLE = {"color": "#dc2626", "weight": 1.5, "opacity": 0.9, "dashArray": "4 4",
+                 "fillColor": "#dc2626", "fillOpacity": 0.08}
 LEFT_STYLE = {"color": "#1f6feb", "weight": 3, "opacity": 0.95}      # Left FPL (blue)
 RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}     # Right FPL (red)
 UP_STYLE = {"color": "#f08c00", "weight": 3, "opacity": 0.95}        # Upstream boundary (orange)
 DOWN_STYLE = {"color": "#9b59b6", "weight": 3, "opacity": 0.95}      # Downstream boundary (purple)
 KZONE_STYLE = {"color": "#7b3fa0", "weight": 2, "opacity": 0.95, "fill": False}
 SOILS_STYLE = {"color": "#8a6d3b", "weight": 1, "opacity": 0.9,        # NRCS SSURGO polygons (tan)
-               "fillColor": "#d2b48c", "fillOpacity": 0.22}
+               "fillColor": "#d2b48c", "fillOpacity": 0.22}            # (soils modal review map)
+SOILS_SEL_STYLE = {"color": "#1f6feb", "weight": 2, "opacity": 1.0,    # soils modal: units picked
+                   "fillColor": "#5eead4", "fillOpacity": 0.35}        # for K-zone import
 NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable NHD flowlines (bold)
+NHD_MIN_ZOOM = 16   # flowlines fetch/draw only at this zoom or deeper — wider views stay clean
 REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
+USGS_WATERSHED_STYLE = {"color": "#0f766e", "weight": 2, "opacity": 0.9,
+                        "fillColor": "#5eead4", "fillOpacity": 0.25}   # flow modal: delineated basin
 
 # An empty FeatureCollection — used by _decor_show to CLEAR a layer's rendered children before a
 # visible False→True reveal, so the reveal's addData renders nothing and the following data-set is
@@ -102,6 +113,10 @@ RAS_UNAVAILABLE_MSG = (
     "The HEC-RAS 2025 engine isn't available here — on Windows set HYPE_RAS_BIN to a "
     "HEC-RAS 2025 install (the folder containing ras.exe); on Linux the bundled "
     "bin/ras2025 runtime is used.")
+
+MODFLOW_UNAVAILABLE_MSG = (
+    "MODFLOW 6 / MODPATH 7 not found — expected mf6 and mp7 in the bundled bin/win "
+    "(Windows) or bin/linux folder, or set HYPE_MODFLOW_BIN to a folder containing them.")
 
 APP_VERSION = "2026.07"        # About dialog + run_config.json + the project-file manifest
 
@@ -117,12 +132,21 @@ HZ_PATH_STYLE = {cls: {"color": HZ_COLORS[cls], "weight": 2, "opacity": 0.9,
                        "className": "hype-fp-line"} for cls in HZ_CLASSES}
 HZ_FOOT_STYLE = {cls: {"color": HZ_COLORS[cls], "weight": 1.5, "opacity": 0.9,
                        "fillColor": HZ_COLORS[cls], "fillOpacity": 0.18} for cls in HZ_CLASSES}
+# streambed exchange map (Flows node): downwelling cells share the losing red, upwelling
+# cells the gaining blue — the same direction semantics as the class colors. The className
+# makes them click-through (styles.css) so they never smother flow-path selection.
+FLOW_DOWN_STYLE = {"color": "#991b1b", "weight": 0.5, "opacity": 0.8,
+                   "fillColor": HZ_COLORS["losing"], "fillOpacity": 0.45,
+                   "className": "hype-flow-ex"}
+FLOW_UP_STYLE = {"color": "#1e40af", "weight": 0.5, "opacity": 0.8,
+                 "fillColor": HZ_COLORS["gaining"], "fillOpacity": 0.45,
+                 "className": "hype-flow-ex"}
 HZ_TOTAL = 7
 HZ_STEPS = {0: "Preparing…", 1: "Loading the flow solution", 2: "Seeding particles",
             3: "Tracking forward (endpoints)", 4: "Tracking backward (endpoints)",
             5: "Classifying + delineating volumes", 6: "Tracing display pathlines",
             7: "Writing artifacts"}
-HZ_MAX_PARTICLES = int(os.environ.get("HYPE_HZ_MAX_PARTICLES", "2000000"))
+HZ_MAX_PARTICLES = runmode.hz_particle_cap()
 
 BC_CORNER = "4 Corner Gradients"   # legacy value: no UI mode anymore; restores migrate to points
 BC_PROFILE = "Spatially Varying Gradient"
@@ -172,12 +196,22 @@ app_ui = ui.page_fillable(
         ui.tags.script(src=_asset("xsection.js")),   # terrain cross-section (shown while DEM on)
         ui.tags.script(src=_asset("mesh3d.js")),     # lazy-loads vtk.js from a CDN on first Compute
         ui.tags.script(src=_asset("tree.js")),       # layer tree (left panel) + panel chrome
+        # Desktop-only shell bridge (native pickers, window title). Served only when the
+        # process runs in desktop mode so the cloud page stays byte-identical; the script
+        # itself also no-ops without WebView2 (plain dev browser).
+        *([ui.tags.script(src=_asset("desktop_bridge.js"))] if runmode.IS_DESKTOP else []),
     ),
     ui.div(
         ui.div(
-            ui.span("HYPE", ui.tags.small("Hyporheic Exchange Explorer"), class_="hype-brand"),
+            # Left zone: brand + project badge (both modes), grouped so the badge stays
+            # snug against the wordmark at any window width (empty until a project exists).
+            ui.div(ui.span("HYPE", ui.tags.small("Hyporheic Exchange Explorer"),
+                           class_="hype-brand"),
+                   ui.output_ui("project_badge", inline=True),
+                   class_="hype-header-left"),
             # 2D/3D canvas toggle — plain buttons, delegated via www/tree.js (data-view),
-            # active states synced from the hype_tree payload's `view` field.
+            # active states synced from the hype_tree payload's `view` field. Middle grid
+            # column, so it sits at true window center (the map below is full-bleed).
             ui.div(ui.tags.button("2D map", type="button", class_="hype-view-btn active",
                                   **{"data-view": "2d"}),
                    ui.tags.button("3D view", type="button", class_="hype-view-btn",
@@ -227,6 +261,26 @@ app_ui = ui.page_fillable(
 
 def server(input, output, session):
     work_dir = Path(tempfile.mkdtemp(prefix="hype_session_"))
+    # Desktop project-folder mode: when a project is open, work_dir IS the folder holding the
+    # main .hype and nothing here may delete it. _ws is a plain mirror of project_file readable
+    # from teardown (session.on_ended must not touch reactives); project_file drives the UI.
+    _ws: dict = {"project_file": None,       # str | None — absolute path of the main .hype
+                 "project_name": None}       # str | None — display name (desktop: file stem)
+    project_file = reactive.value(None)
+    # Project identity metadata: name + locked units token + created stamp. Rides
+    # config/state.json as first-class keys (additive), so BOTH bundle kinds round-trip
+    # it. The _ws mirror lets non-reactive readers (teardown, _gated, filename lambdas)
+    # see the name; the reactive drives the badge, pane, and tab title.
+    project_meta_v = reactive.value({"name": None, "units": project_meta.UNITS_METRIC,
+                                     "created": None})
+
+    def _set_project_meta(name, created, units: str = project_meta.UNITS_METRIC):
+        name = (str(name).strip() if name else "") or None
+        _ws["project_name"] = name
+        project_meta_v.set({"name": name, "units": units or project_meta.UNITS_METRIC,
+                            "created": created})
+
+    _autosave: dict = {"restoring": False}   # suppresses the autosave effect during restores
 
     current_step = reactive.value(STEP_REACH)
     # ---- layer-tree selection (the tree is the navigation; current_step stays the machinery
@@ -246,21 +300,9 @@ def server(input, output, session):
     dem_gen = reactive.value(0)
     _chain: dict = {"dem": None, "bnd": None}
 
-    @reactive.effect
-    def _auto_view_mode():
-        # Preserve the old Mesh-step UX for the Model-grid NODE only: selecting gw.mesh flips to
-        # 3D, leaving flips back — the header toggle overrides either way until the next crossing.
-        # The Groundwater hub shares STEP_MESH but stays on the 2-D map: its boundary-condition
-        # gradient points are placed by clicking the boundary lines there.
-        want3d = current_step() == STEP_MESH and sel_node() == "gw.mesh"
-        prev = _map_ui.get("view_want3d")
-        _map_ui["view_want3d"] = want3d
-        if prev == want3d:
-            return
-        if want3d:
-            view_mode_v.set("3d")
-        elif prev:                     # crossed OUT of the 3-D context (not the first run)
-            view_mode_v.set("2d")
+    # Selecting a tree node never switches the 2-D/3-D canvas (2026-07-17: the gw.mesh
+    # auto-flip was removed at the user's request) — only the header toggle and an explicit
+    # "Build grid" completion change the view.
 
     @reactive.effect
     def _step_from_sel():
@@ -342,9 +384,7 @@ def server(input, output, session):
     soil_overrides = reactive.value([])     # list[SoilOverride dict] applied by the analyst
     results_model = reactive.value(None)    # AssessmentResultsV2 (dict) — the canonical report model
     report_paths = reactive.value(None)     # {format: path} of the last generated report
-    fp_stats = reactive.value(None)         # per-particle flow-path metrics DataFrame (Results)
-    fp_gdf = reactive.value(None)           # 4326 pathlines gdf — the drawn = selectable set
-    sel_pids = reactive.value(())           # selected flow-path particleids (tuple)
+    _report_shown_for = reactive.value(None)  # input_hash of the run whose report auto-opened
     head_tifs = reactive.value([])          # per-layer head GeoTIFF paths (index 0 = top layer)
     head_rng = reactive.value(None)         # global (vmin, vmax) for consistent head coloring
     head_layer_v = reactive.value(1)        # persisted slider state (survives pane re-renders)
@@ -365,6 +405,9 @@ def server(input, output, session):
     _proc: dict = {"p": None}              # handle to the running child process (for cancel)
     # ---- surface-water (HEC-RAS 2025) model state ----
     ras_result = reactive.value(None)      # dict from ras_engine.run_surface_model (or None)
+    wetted_filter_res = reactive.value(None)  # upstream–downstream connectivity split of the
+    #   wetted extent: {kept_feat, removed_feat, n_removed, removed_m2, wse_path} from
+    #   _wetted_filter_sync; {"failed": True} when no part spans both caps; None = filter off
     ras_log_lines: list[str] = []
     ras_log_tick = reactive.value(0)
     ras_t0 = reactive.value(0.0)
@@ -379,7 +422,13 @@ def server(input, output, session):
     ras_stage_t0 = reactive.value(0.0)     # monotonic start of the current stage (for ETA)
     ras_mesh_prev = reactive.value(None)   # dict from ras_engine.build_mesh_preview (or None)
     _mesh_proc: dict = {"proc": None}      # RAS mesh-preview subprocess (independent of the run)
+    _mesh_auto = {"on": False}             # current mesh_prev_task launched by _ras_done, not
+    #                                        the button — its done-handler stays quiet
+    _ras_mesh_payload: dict = {}           # launch-time snapshot of the run's mesh inputs, so
+    #                                        _ras_done can auto-mesh without reactive reads
     _mesh3d_proc: dict = {"p": None}       # 3-D grid-preview child process (Mesh step; cancellable)
+    _grid_auto = {"on": False}             # current mesh_task launched by _run_done, not the
+    #                                        button — store + push the grid, but never force 3-D
     _ras_overlays: dict = {}               # "depth"/"wse" -> ImageOverlay payloads (big data URIs)
     ras_opacity_v = reactive.value(0.7)    # shared opacity for the surface-result rasters
     # ---- hyporheic-zone delineation (post-run analysis; spawned-child task family) ----
@@ -429,7 +478,17 @@ def server(input, output, session):
                 p.kill()
             except Exception:  # noqa: BLE001
                 pass
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # Teardown reads the plain _ws mirror, never a reactive. A project folder is the
+        # user's data: parting-save the settings, drop only the transient 3-D drape, and
+        # leave everything else in place. Temp sessions are wiped exactly as before.
+        if _ws["project_file"]:
+            try:
+                _save_project_file()
+            except Exception:  # noqa: BLE001
+                pass
+            shutil.rmtree(work_dir / "scene", ignore_errors=True)
+        else:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     session.on_ended(_on_session_end)
 
@@ -682,6 +741,13 @@ def server(input, output, session):
         return b["domain"] if b else None
 
     @reactive.calc
+    def bnd_conflicts():
+        """Blocking boundary-vs-centerline overlaps ({slot,label,msg} per offending side).
+        Non-empty gates the surface run + mesh preview; the Boundaries pane shows the details."""
+        return geometry.centerline_conflicts(reach_feat(), up_feat(), left_feat(),
+                                             right_feat(), down_feat())
+
+    @reactive.calc
     def streambed_elevs():
         """Min (thalweg) elevation of the CARVED terrain along the upstream and downstream boundary
         caps → {"up", "down"} in metres, or None until the boundaries + terrain exist. The upstream
@@ -691,8 +757,12 @@ def server(input, output, session):
         dem_p = active_dem()
         if not build or not dem_p:
             return None
-        up = delineate.min_elevation_along_line(build["up"], dem_p)
-        down = delineate.min_elevation_along_line(build["down"], dem_p)
+        try:
+            up = delineate.min_elevation_along_line(build["up"], dem_p)
+            down = delineate.min_elevation_along_line(build["down"], dem_p)
+        except Exception as e:  # noqa: BLE001 — a raster hiccup must degrade, never raise:
+            print(f"[elev] streambed sampling failed: {e}")   # a calc error propagates into
+            return None                                       # effects and KILLS the session
         if up is None and down is None:
             return None
         return {"up": up, "down": down}
@@ -775,15 +845,25 @@ def server(input, output, session):
 
     @reactive.calc
     def wse_cap_elevs():
-        """Min WSE-raster value touching each boundary cap → {"up","down"} in m, or None."""
+        """Min WSE-raster value touching each boundary cap → {"up","down"} in m, or None. Sampled
+        at half-pixel density (the cap-anchor sampler) — the wetted crossing at a cap can be a
+        pixel or two wide, and a fixed-count sampler steps right over it (observed: a 2-px
+        downstream crossing left the water-surface slope reading n/a on every RAS run)."""
+        from hype_app import wse_index
         build, p = _domain_build(), wse_preview_path()
         if not build or not p:
             return None
-        up = delineate.min_elevation_along_line(build["up"], p)
-        down = delineate.min_elevation_along_line(build["down"], p)
-        if up is None or down is None:
+        try:
+            out = {}
+            for k in ("up", "down"):
+                raw = wse_index.valid_samples_along_line(p, build[k])
+                if raw is None:
+                    return None
+                out[k] = float(raw["value"].min())
+            return out
+        except Exception as e:  # noqa: BLE001 — same soft-degrade rule as streambed_elevs
+            print(f"[elev] WSE cap sampling failed: {e}")
             return None
-        return {"up": up, "down": down}
 
     @reactive.calc
     def wse_slope_centerline():
@@ -826,9 +906,14 @@ def server(input, output, session):
     def _track_ref_slope_auto():
         # Keep the numeric showing the LIVE auto value while no override is set (no-op when the
         # pane is unmounted). Sends round(…, 6) so _capture_ref_slope recognizes it as auto.
-        a = ref_slope_auto()
-        if a is not None and ref_slope_override() is None:
-            ui.update_numeric("g_ref_slope", value=round(a.value, 6))
+        # try/except is load-bearing: an error raised out of an EFFECT destroys the whole
+        # session (the 2026-07-16 terrain-race crash escaped through exactly this effect).
+        try:
+            a = ref_slope_auto()
+            if a is not None and ref_slope_override() is None:
+                ui.update_numeric("g_ref_slope", value=round(a.value, 6))
+        except Exception as e:  # noqa: BLE001
+            print(f"[slope] auto tracking skipped: {type(e).__name__}: {e}")
 
     @reactive.effect
     @reactive.event(input.g_ref_auto_evt)
@@ -847,33 +932,8 @@ def server(input, output, session):
         g = _domain_gdf_4326()
         proj_crs.set(g.estimate_utm_crs() if g is not None else None)
 
-    @reactive.effect
-    def _sync_wse_mode():
-        # Mirror the WSE-mode radio into a reactive.value so the (non-reactive) draw callback and
-        # the run handler can read it. Ignore unset/None reads: while the radio remounts (props-
-        # pane re-render or selection change) the input transiently reads None — writing that
-        # through would clobber the persisted mode back to the default and snap the radio back.
-        try:
-            v = input.wse_mode()
-        except Exception:  # noqa: BLE001
-            return
-        if v:
-            wse_mode_v.set(v)
-
-    @reactive.effect
-    def _push_wse_mode_to_radio():
-        # Reverse sync: when the SERVER changes the mode (a completed surface run switches to
-        # "model"; regen / stale-invalidation falls back to "draw"), patch the mounted radio in
-        # place. update_radio_buttons does not remount the input, so this cannot re-enter the
-        # clobber loop the pane-re-render approach had (the pane reads the mode isolated).
-        v = wse_mode_v()
-        with reactive.isolate():
-            try:
-                cur = input.wse_mode()
-            except Exception:  # noqa: BLE001
-                return
-        if v and cur and v != cur:
-            ui.update_radio_buttons("wse_mode", selected=v)
+    # wse_mode_v stays pinned to "model": the draw/upload water-surface paths were removed from
+    # the UI (no radio to sync), but the mode-guarded consumers remain so old saves stay inert.
 
     @reactive.effect
     def _sync_delineate_mode():
@@ -1131,13 +1191,14 @@ def server(input, output, session):
 
     @reactive.effect
     def _sync_grad_overlay():
-        # Gradient-point overlay (points mode on the Groundwater hub only): ONE LayerGroup under
-        # "grad_pts" added once via _set_layer, then children swapped by assigning grp.layers —
-        # group-internal mutation, never bursty map add/removes (the ipyleaflet drop gotcha).
-        # Hidden state = empty children. Not tree-checkbox wired: mode+node scoping IS the story.
+        # Gradient overlay (Groundwater hub, BOTH BC modes — qualitative shows the four corner
+        # rows): ONE LayerGroup under "grad_pts" added once via _set_layer, then children swapped
+        # by assigning grp.layers — group-internal mutation, never bursty map add/removes (the
+        # ipyleaflet drop gotcha). Hidden state = empty children. Mode scoping lives inside
+        # grad_point_heads; not tree-checkbox wired: node scoping IS the story.
         if not _HAS_MAP:
             return
-        on = sel_node() == "gw" and str(_safe("bc_mode", BC_QUAL)) == BC_PROFILE
+        on = sel_node() == "gw"
         rows = grad_point_heads() if on else []
         grp = _layers.get("grad_pts")
         if not rows:
@@ -1204,8 +1265,6 @@ def server(input, output, session):
                 _mirror_show(nm, feats[slot], style)
             _render_boundary_labels(feats, None)
             _load_into_drawcontrol(kz)
-            with reactive.isolate():               # keep the SSURGO review layer on the K/soils step
-                _show_soils_layer(soil_snapshot())
         elif step == STEP_BOUNDARIES:
             pass                                   # _sync_bnd_slot owns the Boundaries display
         else:
@@ -1458,7 +1517,10 @@ def server(input, output, session):
                     reach_gen.set(reach_gen() + 1)        # manual (re)commit → auto-chain marker
             return
         if step == STEP_K:
-            kzone_feats.set([f for f in data_feats if (f.get("geometry") or {}).get("type") == "Polygon"])
+            # Fresh draws get a uid + default KH/KV; zones already carrying properties pass
+            # through (the DrawControl round-trips them, so shape edits keep per-zone K).
+            polys = [f for f in data_feats if (f.get("geometry") or {}).get("type") == "Polygon"]
+            kzone_feats.set(geometry.normalize_kzone_features(polys, **_kz_defaults()))
             kz_adding.set(False)             # a guided "Add K-zone" draw just completed
             return
         if step != STEP_BOUNDARIES:
@@ -1509,7 +1571,7 @@ def server(input, output, session):
             pass
 
     # ---- persistent map + draw control ----
-    _base_layers: dict = {}                  # "imagery"/"topo"/"hydro" -> TileLayer handles
+    _base_layers: dict = {}                  # "imagery"/"topo" -> TileLayer handles
 
     if _HAS_MAP:
         def _build_map():
@@ -1526,9 +1588,8 @@ def server(input, output, session):
             _base_layers["topo"] = TileLayer(
                 url=USGS_TOPO, name="USGS Topo", base=True, attribution=USGS_ATTR,
                 max_native_zoom=16, max_zoom=19)
-            _base_layers["hydro"] = TileLayer(
-                url=USGS_HYDRO, name="NHD Hydrography", base=False, opacity=0.85,
-                attribution=USGS_ATTR, max_native_zoom=16, max_zoom=19, visible=False)
+            # NHD Hydrography is no longer a raster overlay: the base.hydro checkbox now
+            # drives the "NHD streams" flowline VECTORS (see ui_tree layers tuple).
             for lyr in _base_layers.values():
                 m.add(lyr)
             dc = DrawControl(
@@ -1851,7 +1912,7 @@ def server(input, output, session):
         if not _HAS_MAP:
             return
         z, c = _view()
-        if not c or z is None or int(z) < 12:
+        if not c or z is None or int(z) < NHD_MIN_ZOOM:
             nhd_status.set("Zoom in to load streams.")
             return
         lat, lon = float(c[0]), float(c[1])
@@ -1883,7 +1944,7 @@ def server(input, output, session):
         if lat is None or lon is None:
             return
         _MAP.center = (float(lat), float(lon))
-        _MAP.zoom = 15
+        _MAP.zoom = NHD_MIN_ZOOM   # land deep enough that the stream fetch actually fires
 
     @reactive.effect
     def _find_address():
@@ -1895,7 +1956,7 @@ def server(input, output, session):
         hit = geocode.geocode_address(_safe("address", ""))
         if hit:
             _MAP.center = (float(hit[0]), float(hit[1]))
-            _MAP.zoom = 15
+            _MAP.zoom = NHD_MIN_ZOOM
         else:
             ui.notification_show("Place not found — try a city, address, or stream name.",
                                  type="warning", duration=5)
@@ -2180,8 +2241,6 @@ def server(input, output, session):
             model_origin_elev=model_origin_effective(),
             kh=float(_safe("kh", 10.0)), kv=float(_safe("kv", 1.0)),
             porosity=float(_safe("porosity", 0.3)),
-            particles_per_cell=int(_safe("pt_per_cell", 1)),
-            min_path_mult=float(_safe("pt_min_mult", 3.0)),
             length_units="meters", time_units="days",
             # steady hyporheic screening defaults — no stress-period fields in the UI
             nper=1, nstp=1, perlen=1.0, tsmult=1.0, sim_name="hyporheic",
@@ -2275,6 +2334,7 @@ def server(input, output, session):
             return
         stage.set("Building the 3D mesh…")
         _origin, _z0 = _scene_frame()          # shared z datum → vexag-safe layer alignment
+        _grid_auto["on"] = False               # button build — full notifications + 3-D flip
         mesh_task({
             "domain": build["domain"],
             "sides": {k: build[k] for k in ("up", "left", "right", "down")},
@@ -2317,12 +2377,18 @@ def server(input, output, session):
     async def _mesh_done():
         if mesh_task.status() in ("initial", "running"):
             return
+        auto = _grid_auto["on"]          # run-triggered rebuild: quiet, and never force 3-D
+        _grid_auto["on"] = False
         stage.set("")
         if mesh_task.status() == "error":
             try:
                 mesh_task.result()
             except Exception as e:  # noqa: BLE001
-                ui.notification_show(f"Mesh build failed: {e}", type="error", duration=8)
+                if auto:                 # the run itself succeeded — log, don't toast
+                    log_lines.append("[auto grid] failed: " + str(e)[:300])
+                    log_tick.set(len(log_lines))
+                else:
+                    ui.notification_show(f"Mesh build failed: {e}", type="error", duration=8)
             return
         try:
             g = mesh_task.result()
@@ -2331,15 +2397,23 @@ def server(input, output, session):
         if g.get("cancelled"):
             return
         if g.get("error"):
-            ui.notification_show(f"Mesh build failed: {g['error']}", type="error", duration=10)
+            if auto:
+                log_lines.append("[auto grid] failed: " + str(g["error"])[:300])
+                log_tick.set(len(log_lines))
+            else:
+                ui.notification_show(f"Mesh build failed: {g['error']}", type="error", duration=10)
             return
         mesh_geom.set(g)
-        view_mode_v.set("3d")            # show the 3-D preview (the client defers the build until visible)
+        if not auto:                     # the run must not yank the user out of the 2-D map;
+            view_mode_v.set("3d")        # the client stashes a hidden build until 3-D opens
         await session.send_custom_message("hype_mesh", g)
-        # Sync the aerial drape to the Basemaps → USGS Imagery checkbox (its own 3-D key), so a fresh
-        # mesh honors the current basemap choice instead of always showing the imagery.
+        # Sync the basemap drape to the Basemaps radio (imagery and topo are two textures on
+        # one actor), so a fresh mesh honors the current choice instead of always showing
+        # the imagery.
         await session.send_custom_message(
             "hype3d_vis", {"key": "basemap", "on": _eff_checked("base.imagery")})
+        await session.send_custom_message(
+            "hype3d_vis", {"key": "basemap_topo", "on": _eff_checked("base.topo")})
 
     def _wse_path():
         """Resolve the WSE raster the engine will use: the surface-model result, the uploaded
@@ -2347,6 +2421,10 @@ def server(input, output, session):
         if wse_mode_v() == "model":
             res = ras_result()
             p = (res or {}).get("wse_for_gw")
+            if p and _safe("wetted_filter", True):
+                fp = (wetted_filter_res() or {}).get("wse_path")
+                if fp and Path(fp).exists():   # isolated pools nulled out for the GW model
+                    p = fp
             return p if p and Path(p).exists() else None
         if wse_mode_v() == "upload":
             up = _safe("wse_upload", None)
@@ -2419,11 +2497,12 @@ def server(input, output, session):
                  "g_qual_left", "g_qual_right", "g_ref_slope",
                  "g_mult_slight", "g_mult_strong",
                  "usgs_region", "usgs_lat", "usgs_lon", "usgs_national",
-                 "soil_policy", "use_soil_k", "sens_design",
+                 "soil_policy", "use_soil_k", "soil_use_mode", "sens_design",
                  "site_name", "site_analyst", "site_org", "site_date", "site_notes",
                  "ras_flow", "ras_slope", "ras_n", "ras_cell", "ras_hours", "ras_dt",
-                 "ras_out_min", "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
-                 "cell_size", "gw_mod_depth", "z", "pt_per_cell", "pt_min_mult",
+                 "ras_out_min", "wetted_filter", "show_removed_pools",
+                 "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
+                 "cell_size", "gw_mod_depth", "z",
                  "grid_wireframe",
                  "carve_bw", "carve_depth", "carve_slope", "hz_ppc", "hz_sample")
     _KEEP_SET = frozenset(_KEEP_IDS)
@@ -2514,130 +2593,232 @@ def server(input, output, session):
             onclick=f"Shiny.setInputValue('{evt_id}', Date.now() + Math.random(), "
                     "{priority: 'event'})")
 
-    # The lookup UI renders INLINE in the Water-surface pane (never in a modal): outputs
-    # inside ui.modal wedge this app's session flush — panes are the proven dynamic surface.
-    usgs_panel_open = reactive.value(False)
-
-    def _usgs_section():
-        """The flow-lookup section of the Water-surface pane (§5.1). Plain TagList — the pane
-        itself re-renders on task-status / flow_lookup changes, so no nested outputs."""
-        if not usgs_panel_open():
-            return None
-        lat0, lon0 = (_usgs_outlet_latlon() or (43.686, -72.237))
-        head = ui.TagList(
-            ui.tags.hr(),
-            ui.p("USGS StreamStats — regional peak-flow statistics for the reach outlet. "
-                 "National estimates are queried only when no regional discharge is usable, "
-                 "or on request.", class_="hype-instr"),
-            ui.div(
-                ui.input_numeric("usgs_lat", "Outlet latitude",
-                                 value=_keep("usgs_lat", round(lat0, 6)), step=0.0001),
-                ui.input_numeric("usgs_lon", "Outlet longitude",
-                                 value=_keep("usgs_lon", round(lon0, 6)), step=0.0001),
-                ui.input_text("usgs_region", "Region (blank = auto)",
-                              value=_keep("usgs_region", "")),
-                class_="hype-field-row"),
-            ui.input_checkbox("usgs_national",
-                              "Also request national estimates for comparison",
-                              value=bool(_keep("usgs_national", False))))
-        if usgs_flow_task.status() == "running":
-            return ui.TagList(head,
-                              ui.div(ui.div(class_="hype-spinner"),
-                                     ui.span("Contacting USGS StreamStats… watershed "
-                                             "delineation can take ~30 s."), class_="hype-busy"),
-                              ui.div(_evt_btn("usgs_cancel_evt", "Cancel fetch",
-                                              "btn-sm btn-outline-danger"),
-                                     class_="hype-actions"))
-        body = [ui.div(_evt_btn("usgs_fetch_evt", "Fetch statistics", "btn-primary btn-sm"),
-                       _evt_btn("usgs_close_evt", "Hide", "btn-sm btn-outline-secondary"),
-                       class_="hype-actions")]
-        fl = flow_lookup()
-        if fl:
-            bits = []
-            if fl.get("selected_region"):
-                bits.append(f"Region {fl['selected_region']}")
-            if fl.get("basin_characteristics", {}).get("DRNAREA") is not None:
-                bits.append(f"drainage area {fl['basin_characteristics']['DRNAREA']:g} mi²")
-            if bits:
-                body.append(ui.div(" · ".join(bits), class_="hype-instr"))
-            warns = [w.get("message", "") for w in (fl.get("warnings") or [])]
-            for w in warns[:4]:
-                body.append(ui.div(w, class_="hype-warn"))
-            cands = fl.get("candidates") or []
-            choices = {}
-            rows = []
-            for c in cands:
-                cfs, cms = c.get("value_cfs"), c.get("value_cms")
-                recur = c.get("recurrence_years")
-                flags = [f for f, on in (("national", c.get("is_national")),
-                                         ("extrapolated", c.get("is_extrapolated")),
-                                         ("not insertable", not c.get("insertable"))) if on]
-                if c.get("insertable"):
-                    label = f"{c.get('description') or c['id']} — {cfs:.1f} cfs"
-                    if flags:
-                        label += f"  [{', '.join(flags)}]"
-                    choices[c["id"]] = label
-                rows.append(ui.tags.tr(
-                    ui.tags.td(c.get("description") or c.get("statistic_code") or c["id"]),
-                    ui.tags.td(f"{cfs:.1f}" if isinstance(cfs, (int, float)) else "—"),
-                    ui.tags.td(f"{cms:.3f}" if isinstance(cms, (int, float)) else "—"),
-                    ui.tags.td(f"{recur:g}-yr" if isinstance(recur, (int, float)) else "—"),
-                    ui.tags.td(", ".join(flags) or "ok")))
-            if not cands:
-                body.append(ui.div("No flow statistics returned for this point.",
-                                   class_="hype-instr"))
-            if choices:
-                body.append(ui.input_radio_buttons("usgs_pick", "Select a statistic to insert",
-                                                   choices))
-                body.append(ui.div(_evt_btn("usgs_insert_evt", "Insert selected flow",
-                                            "btn-success btn-sm"),
-                                   class_="hype-actions"))
-            elif cands:
-                body.append(ui.div("No insertable discharge — see the warnings above.",
-                                   class_="hype-instr"))
-            if rows:
-                body.append(ui.tags.table(
-                    ui.tags.thead(ui.tags.tr(
-                        ui.tags.th("Statistic"), ui.tags.th("cfs"), ui.tags.th("m³/s"),
-                        ui.tags.th("Recurrence"), ui.tags.th("Status"))),
-                    ui.tags.tbody(*rows), class_="table table-sm hype-flow-table"))
-        return ui.TagList(head, *body)
+    # The lookup UI is a MODAL. Its dynamic outputs (usgs_flow_body, usgs_review_map) must
+    # render with @output(suspend_when_hidden=False): they live inside a late-bound ui.modal,
+    # and with default suspension a hidden-at-registration output is never computed — the
+    # session flush then wedges on it ("recalculating" forever). Commit 3d2f140 moved the old
+    # flow UI inline for exactly that, before the dl_save/propspane eager-render fix was found.
+    usgs_pick_v = reactive.value(None)      # candidate id picked by a table-row click
+    usgs_flow_err = reactive.value(None)    # last lookup failure line, shown in the modal body
+    usgs_modal_gen = reactive.value(0)      # bumped per modal open — rebuilds the review map
+    _USGS_REGION_CHOICES = {"": "Auto-detect (from the point)", **region_choices()}
 
     @reactive.effect
     def _usgs_open():
-        if _clicked_dynamic("get_usgs_flow"):
-            usgs_panel_open.set(True)
+        if not _clicked_dynamic("get_usgs_flow"):
+            return
+        pt = _usgs_outlet_latlon()
+        if pt is None:
+            ui.notification_show("Define the reach before looking up USGS flow statistics.",
+                                 type="warning", duration=6)
+            return
+        with reactive.isolate():
+            usgs_modal_gen.set(usgs_modal_gen() + 1)   # fresh map build for this open
+        lat0, lon0 = pt
+        sel0 = str(_keep("usgs_region", "") or "").strip().upper()
+        if sel0 not in _USGS_REGION_CHOICES:
+            sel0 = ""
+        ui.modal_show(ui.modal(
+            ui.div(
+                ui.input_numeric("usgs_lat", "Outlet latitude",
+                                 value=_keep("usgs_lat", round(lat0, 6)),
+                                 min=-90, max=90, step=0.0001),
+                ui.input_numeric("usgs_lon", "Outlet longitude",
+                                 value=_keep("usgs_lon", round(lon0, 6)),
+                                 min=-180, max=180, step=0.0001),
+                ui.input_select("usgs_region", "StreamStats region",
+                                choices=_USGS_REGION_CHOICES, selected=sel0),
+                class_="hype-usgs-controls"),
+            ui.input_checkbox("usgs_national",
+                              "Also request national estimates for comparison",
+                              value=bool(_keep("usgs_national", False))),
+            ui.div(
+                (output_widget("usgs_review_map", height="320px") if _HAS_MAP
+                 else ui.div("Map preview unavailable.", class_="hype-instr")),
+                ui.div(
+                    ui.tags.strong("Review map"),
+                    ui.div("Analysis reach", class_="hype-map-key reach"),
+                    ui.div("Model domain", class_="hype-map-key domain"),
+                    ui.div("Requested point (drag, then Fetch)",
+                           class_="hype-map-key requested"),
+                    ui.div("Delineated watershed + pour point",
+                           class_="hype-map-key watershed"),
+                    class_="hype-service-map-legend"),
+                class_="hype-service-map-grid"),
+            ui.output_ui("usgs_flow_body"),
+            # Leaflet measures a zero/partial container when the widget mounts during the
+            # modal fade-in and then draws a single tile — nudge it once the modal is fully
+            # shown (plus a fallback tick; Leaflet re-measures on window resize).
+            ui.tags.script(
+                "(function(){var f=function(){window.dispatchEvent(new Event('resize'))};"
+                "document.addEventListener('shown.bs.modal', f, {once: true});"
+                "setTimeout(f, 400);})();"),
+            title="USGS StreamStats flow review", size="xl", easy_close=False,
+            footer=ui.TagList(
+                # Recreated per modal_show — _clicked_dynamic guards (never @reactive.event;
+                # the counter resets on every open, see confirm_new_project).
+                ui.input_action_button("usgs_fetch", "Fetch statistics", class_="btn-primary"),
+                ui.input_action_button("usgs_use", "Select and Close", class_="btn-success"),
+                ui.input_action_button("usgs_modal_cancel", "Cancel",
+                                       class_="btn-outline-secondary"))))
+
+    if _HAS_MAP:
+        @output(suspend_when_hidden=False)   # late-bound modal output — see the note above
+        @render_widget
+        def usgs_review_map():
+            # ipyleaflet layer mutation is unreliable in this app — REBUILD the whole Map per
+            # change instead of touching layers. Re-renders ONLY per modal open (the gen nonce;
+            # the eager first render at session start predates any reach) and on flow_lookup
+            # changes; the point/reach/domain are read isolated so typing or marker drags never
+            # rebuild the map under the user (the dragged marker already moved client-side).
+            usgs_modal_gen()
+            fl = flow_lookup()
+            with reactive.isolate():
+                try:
+                    pt = (float(input.usgs_lat()), float(input.usgs_lon()))
+                except Exception:  # noqa: BLE001
+                    pt = _usgs_outlet_latlon()
+                lat, lon = pt or (39.5, -98.35)
+                rch, dom = reach_feat(), domain_feat()
+            m = Map(center=(lat, lon), zoom=13, scroll_wheel_zoom=True, zoom_control=False,
+                    max_zoom=19, layout=Layout(height="320px"))
+            m.clear()
+            m.add(TileLayer(url=USGS_TOPO, name="USGS Topo", base=True, attribution=USGS_ATTR,
+                            max_native_zoom=16, max_zoom=19))
+            m.add(ZoomControl(position="topright"))
+            m.add(ScaleControl(position="bottomright"))
+            ws, pour = watershed_display_features((fl or {}).get("watershed_geojson"))
+            if ws:
+                m.add(GeoJSON(data=ws, style=USGS_WATERSHED_STYLE, name="Delineated watershed"))
+            if dom:
+                m.add(GeoJSON(data={"type": "FeatureCollection", "features": [dom]},
+                              style=DOMAIN_STYLE, name="Model domain"))
+            if rch:
+                m.add(GeoJSON(data={"type": "FeatureCollection", "features": [rch]},
+                              style=REACH_STYLE, name="Analysis reach"))
+            if pour:
+                m.add(Marker(location=pour, draggable=False, name="Pour point",
+                             icon=DivIcon(html='<span class="hype-service-marker snapped" '
+                                               'title="Delineated pour point"></span>',
+                                          icon_size=[18, 18], icon_anchor=[9, 9])))
+            mk = Marker(location=(lat, lon), draggable=True, name="Requested point",
+                        icon=DivIcon(html='<span class="hype-service-marker requested" '
+                                          'title="Requested point — drag, then Fetch"></span>',
+                                     icon_size=[18, 18], icon_anchor=[9, 9]))
+
+            def _dragged(change):
+                # Runs server-side (shinywidgets dispatches widget comms inside a reactive
+                # effect — same mechanism as the main map's click capture). Update the
+                # numerics ONLY; the refetch stays manual.
+                if change.get("name") != "location" or not change.get("new"):
+                    return
+                try:
+                    nlat, nlon = (float(v) for v in change["new"])
+                except Exception:  # noqa: BLE001
+                    return
+                ui.update_numeric("usgs_lat", value=round(nlat, 6))
+                ui.update_numeric("usgs_lon", value=round(nlon, 6))
+
+            mk.observe(_dragged, names="location")
+            m.add(mk)
+            return m
+
+    @output(suspend_when_hidden=False)       # late-bound modal output — see the note above
+    @render.ui
+    def usgs_flow_body():
+        if usgs_flow_task.status() == "running":
+            return ui.TagList(
+                ui.div(ui.div(class_="hype-spinner"),
+                       ui.span("Contacting USGS StreamStats… watershed delineation can "
+                               "take ~30 s."), class_="hype-busy"),
+                # Nonce button, NOT input_action_button: it re-renders with this output, so a
+                # plain button's click counter would reset (see _evt_btn).
+                ui.div(_evt_btn("usgs_cancel_evt", "Cancel lookup", "btn-sm btn-outline-danger"),
+                       class_="hype-actions"))
+        err = usgs_flow_err()
+        if err:
+            return ui.div(f"USGS lookup failed: {err}", class_="hype-warn")
+        fl = flow_lookup()
+        if not fl:
+            return ui.div("Fetch to review peak-flow statistics for this outlet.",
+                          class_="hype-instr")
+        import json as _json
+        body = []
+        bits = []
+        if fl.get("selected_region"):
+            bits.append(f"Region {fl['selected_region']}")
+        if fl.get("basin_characteristics", {}).get("DRNAREA") is not None:
+            bits.append(f"drainage area {fl['basin_characteristics']['DRNAREA']:g} mi²")
+        if bits:
+            body.append(ui.div(" · ".join(bits), class_="hype-instr"))
+        for w in [w.get("message", "") for w in (fl.get("warnings") or [])][:4]:
+            body.append(ui.div(w, class_="hype-warn"))
+        cands = fl.get("candidates") or []
+        if not cands:
+            body.append(ui.div("No flow statistics returned for this point.",
+                               class_="hype-instr"))
+            return ui.TagList(*body)
+        pick = usgs_pick_v()
+        region_lbl = fl.get("selected_region") or "Regional"
+        rows = []
+        for c in cands:
+            cid = c["id"]
+            cfs, cms, recur = c.get("value_cfs"), c.get("value_cms"), c.get("recurrence_years")
+            ok = bool(c.get("insertable"))
+            flags = [f for f, on in (("national", c.get("is_national")),
+                                     ("extrapolated", c.get("is_extrapolated"))) if on]
+            status = ", ".join(flags + ([] if ok else ["not insertable"])) or "ok"
+            attrs = {"class_": "hype-flow-row"
+                               + ((" sel" if cid == pick else "") if ok else " disabled")}
+            if ok:   # the click only posts the id — the .sel highlight is server-re-rendered
+                attrs["onclick"] = ("Shiny.setInputValue('usgs_row_pick', "
+                                    f"{_json.dumps(cid)}, {{priority: 'event'}})")
+            rows.append(ui.tags.tr(
+                ui.tags.td(c.get("description") or c.get("statistic_code") or cid),
+                ui.tags.td(f"{recur:g}-yr" if isinstance(recur, (int, float)) else "—"),
+                ui.tags.td(f"{cfs:.1f}" if isinstance(cfs, (int, float)) else "—"),
+                ui.tags.td(f"{cms:.3f}" if isinstance(cms, (int, float)) else "—"),
+                ui.tags.td("National" if c.get("is_national") else region_lbl),
+                ui.tags.td(status), **attrs))
+        body.append(ui.div("Click a row to choose the discharge to insert; greyed rows can't "
+                           "populate the flow input.", class_="hype-instr"))
+        body.append(ui.tags.table(
+            ui.tags.thead(ui.tags.tr(*[ui.tags.th(h) for h in
+                ("Statistic", "Recurrence", "Flow (cfs)", "Flow (m³/s)", "Source", "Status")])),
+            ui.tags.tbody(*rows), class_="table table-sm hype-flow-table"))
+        return ui.TagList(*body)
 
     @reactive.effect
-    @reactive.event(input.usgs_close_evt)
-    def _usgs_close():
-        usgs_panel_open.set(False)
+    @reactive.event(input.usgs_row_pick)
+    def _usgs_row_pick():
+        usgs_pick_v.set(str(input.usgs_row_pick()))
 
     @reactive.effect
-    @reactive.event(input.usgs_fetch_evt)
     def _usgs_fetch():
-        print("[usgs] fetch clicked")
+        if not _clicked_dynamic("usgs_fetch"):
+            return
+        if usgs_flow_task.status() == "running":
+            ui.notification_show("A lookup is already running — cancel it first.",
+                                 type="warning")
+            return
         try:
             lat, lon = float(input.usgs_lat()), float(input.usgs_lon())
-            region = (input.usgs_region() or "").strip().upper()
         except Exception:  # noqa: BLE001
             ui.notification_show("Enter a valid latitude and longitude.", type="warning")
             return
-        if region and (not region.isalpha() or len(region) != 2):
-            ui.notification_show("Enter the 2-letter state/region code (e.g. NH), or leave it "
-                                 "blank to auto-detect.", type="warning")
-            return
+        region = str(input.usgs_region() or "").strip().upper()   # select: "" = auto-detect
         if region:
             _kept["usgs_region"] = region
         try:
             want_nat = bool(input.usgs_national())
         except Exception:  # noqa: BLE001
             want_nat = False
-        flow_lookup.set(None)                 # clear prior result while the new lookup runs
+        usgs_flow_err.set(None)
+        usgs_pick_v.set(None)
+        flow_lookup.set(None)     # clears the stale table AND rebuilds the review map bare
         print("[usgs] invoking lookup task")
         usgs_flow_task({"region": region, "lat": lat, "lon": lon, "want_national": want_nat,
                         "cache_dir": str(work_dir / "data_sources" / "usgs")})
-        print("[usgs] task invoked (non-blocking)")
 
     @reactive.effect
     @reactive.event(input.usgs_cancel_evt)
@@ -2648,10 +2829,22 @@ def server(input, output, session):
             p.kill()
 
     @reactive.effect
+    def _usgs_modal_cancel():
+        if not _clicked_dynamic("usgs_modal_cancel"):
+            return
+        print("[usgs] modal cancel clicked")
+        p = _usgs_proc.get("p")
+        if p is not None and p.is_alive():
+            _usgs_proc["cancelled"] = True
+            p.kill()
+        ui.modal_remove()
+
+    @reactive.effect
     def _usgs_done():
         if usgs_flow_task.status() in ("initial", "running"):
             return
         if usgs_flow_task.status() == "error":
+            usgs_flow_err.set("service error — check the point/region and try again.")
             ui.notification_show("USGS lookup failed — check the point/region and try again.",
                                  type="error", duration=8)
             return
@@ -2660,26 +2853,34 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return
         if isinstance(res, dict) and res.get("cancelled"):
+            usgs_flow_err.set(None)
             return
         if isinstance(res, dict) and res.get("error"):
+            usgs_flow_err.set(str(res["error"]))
             ui.notification_show(f"USGS lookup failed: {res['error']}", type="error", duration=8)
             return
         flow_lookup.set(res)
+        resolved = str(res.get("selected_region") or "").upper()
+        if resolved and resolved in _USGS_REGION_CHOICES:
+            # Reflect the auto-detected region in the (possibly open) modal + the kept mirror,
+            # so a reopened modal renders it server-side even if the update landed while closed.
+            _kept["usgs_region"] = resolved
+            ui.update_select("usgs_region", selected=resolved)
 
     @reactive.effect
-    @reactive.event(input.usgs_insert_evt)
-    def _usgs_insert():
+    def _usgs_use():
+        if not _clicked_dynamic("usgs_use"):
+            return
         fl = flow_lookup()
         if not fl:
             ui.notification_show("Fetch flow statistics first.", type="warning")
             return
-        try:
-            pick = input.usgs_pick()
-        except Exception:  # noqa: BLE001
-            pick = None
+        pick = usgs_pick_v()
+        print(f"[usgs] use clicked, pick={pick!r}")
         cand = next((c for c in (fl.get("candidates") or []) if c.get("id") == pick), None)
         if not cand or not isinstance(cand.get("value_cfs"), (int, float)):
-            ui.notification_show("Select an insertable discharge statistic.", type="warning")
+            ui.notification_show("Click a row to select an insertable discharge statistic "
+                                 "first.", type="warning")
             return
         cfs = round(float(cand["value_cfs"]), 2)
         ui.update_numeric("ras_flow", value=cfs)
@@ -2694,21 +2895,11 @@ def server(input, output, session):
             (d / "flow_lookup.json").write_text(_json.dumps(fl, indent=2), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
-        usgs_panel_open.set(False)
+        ui.modal_remove()
         ui.notification_show(f"Inserted {cfs:g} cfs from USGS StreamStats.", duration=6)
 
-    @render.ui
-    def flow_source_note():
-        fs = flow_source()
-        if not fs:
-            return None
-        try:
-            cur = float(input.ras_flow())
-        except Exception:  # noqa: BLE001
-            cur = None
-        edited = cur is not None and abs(cur - float(fs.get("inserted_cfs", cur))) > 1e-6
-        return ui.div(f"Source: {fs['source']}" + (" (edited since insert)" if edited else ""),
-                      class_="hype-instr hype-flow-source")
+    # (No pane note for the flow source — flow_source still feeds the frozen run snapshot;
+    # the modal's notification is the only insert feedback.)
 
     # ------------------------------------------------------------------
     # NRCS soils fetch + review (revision §6.1–6.3): SSURGO layer + attributes
@@ -2753,21 +2944,221 @@ def server(input, output, session):
             return result or {"error": "The soils fetch stopped unexpectedly."}
         return await anyio.to_thread.run_sync(_work)
 
-    def _show_soils_layer(snap):
-        """Draw the clipped SSURGO polygons as the 'soils' decor layer (§6.3)."""
-        try:
-            polys = (snap or {}).get("polygons") or []
-            feats = [{"type": "Feature", "geometry": p["geometry"],
-                      "properties": {"mukey": p.get("mukey")}}
-                     for p in polys if p.get("geometry")]
-            _decor_show("soils", {"type": "FeatureCollection", "features": feats} if feats else None,
-                        SOILS_STYLE)
-        except Exception as e:  # noqa: BLE001
-            print(f"[soils] layer draw failed: {e}")
+    # ---- NRCS soils review MODAL (opened from the Subsurface-properties pane) ----
+    # Same skeleton as the USGS flow modal: gen-nonce rebuilt review map, late-bound outputs
+    # with suspend_when_hidden=False, footer buttons guarded by _clicked_dynamic. The soils
+    # never touch the main map — the modal's own map is the review surface.
+    soil_modal_gen = reactive.value(0)         # bumped per modal open — rebuilds the review map
+    soil_sel_units = reactive.value(frozenset())   # mukeys ticked for K-zone import
+    soil_source = reactive.value(None)         # {"mode","policy","units"} — the applied decision
+
+    def _soil_unit_k(mu, policy, depth_m, aniso, fallback_kh, fallback_kv):
+        """Representative (KH, KV, derived?) for one map unit over the top `depth_m` of the
+        profile — the same horizon-intersection math the run's K builder uses, collapsed to a
+        single layer, so the review table shows the model-ready number a zone import commits."""
+        from hype_app import soil_profile as sp
+        comps = (mu or {}).get("components") or []
+        if not comps:
+            return fallback_kh, fallback_kv, False
+        if policy == "weighted":
+            tot = sum((c.get("comppct_r") or 0.0) for c in comps) or 1.0
+            pairs = [(c, (c.get("comppct_r") or 0.0) / tot)
+                     for c in comps if (c.get("comppct_r") or 0.0) > 0] or [(comps[0], 1.0)]
+        else:
+            majors = [c for c in comps if c.get("major")] or comps
+            pairs = [(max(majors, key=lambda c: c.get("comppct_r") or 0.0), 1.0)]
+        kh_acc, kv_inv, derived = 0.0, 0.0, False
+        for c, w in pairs:
+            horizons = [{"top_cm": h.get("top_cm"), "bottom_cm": h.get("bottom_cm"),
+                         "ksat_um_s": h.get("ksat_um_s")} for h in (c.get("horizons") or [])]
+            segs = sp.intersect_layer_horizons(0.0, -float(depth_m), 0.0, horizons, aniso,
+                                               fallback_kh=fallback_kh, fallback_kv=fallback_kv)
+            if segs:
+                kh_c, kv_c, origin = sp.aggregate_segments(segs)
+                if getattr(origin, "value", str(origin)) == "derived":
+                    derived = True
+            else:
+                kh_c, kv_c = fallback_kh, fallback_kv
+            kh_acc += w * kh_c                             # arithmetic across components
+            if kv_c > 0:
+                kv_inv += w / kv_c                         # harmonic across components
+        kv = (1.0 / kv_inv) if kv_inv > 0 else fallback_kv
+        return kh_acc, kv, derived
+
+    def _soil_k_inputs():
+        """(policy, depth_m, aniso, fallback_kh, fallback_kv) from the live pane values."""
+        kv0 = float(_safe("kv", 1.0)) or 1.0
+        kh0 = float(_safe("kh", 10.0))
+        return (str(_safe("soil_policy", "dominant")), float(_safe("gw_mod_depth", 6.0)),
+                kh0 / kv0, kh0, kv0)
 
     @reactive.effect
-    @reactive.event(input.fetch_soils_evt)
-    def _start_soil():
+    def _soils_open():
+        if not _clicked_dynamic("get_nrcs_soils"):
+            return
+        if not domain_feat():
+            ui.notification_show("Generate the domain boundaries first.", type="warning",
+                                 duration=6)
+            return
+        with reactive.isolate():
+            soil_modal_gen.set(soil_modal_gen() + 1)   # fresh map build for this open
+        ui.modal_show(ui.modal(
+            ui.div("SSURGO soils for the model domain, from NRCS Soil Data Access. Fetch, "
+                   "review the map units, then choose how they set the model K.",
+                   class_="hype-instr"),
+            ui.div(
+                (output_widget("soils_review_map", height="320px") if _HAS_MAP
+                 else ui.div("Map preview unavailable.", class_="hype-instr")),
+                ui.div(
+                    ui.tags.strong("Review map"),
+                    ui.div("Analysis reach", class_="hype-map-key reach"),
+                    ui.div("Model domain", class_="hype-map-key domain"),
+                    ui.div("SSURGO soils", class_="hype-map-key soils"),
+                    ui.div("Selected for import", class_="hype-map-key soilsel"),
+                    class_="hype-service-map-legend"),
+                class_="hype-service-map-grid"),
+            ui.output_ui("soils_modal_body"),
+            # Leaflet measures a zero/partial container during the modal fade-in — nudge it
+            # once fully shown (same fix as the flow modal).
+            ui.tags.script(
+                "(function(){var f=function(){window.dispatchEvent(new Event('resize'))};"
+                "document.addEventListener('shown.bs.modal', f, {once: true});"
+                "setTimeout(f, 400);})();"),
+            title="NRCS soils review (SSURGO)", size="xl", easy_close=False,
+            footer=ui.TagList(
+                # Recreated per modal_show — _clicked_dynamic guards (never @reactive.event).
+                ui.input_action_button("soils_fetch", "Fetch NRCS soils", class_="btn-primary"),
+                ui.input_action_button("soils_apply", "Apply and Close", class_="btn-success"),
+                ui.input_action_button("soils_modal_cancel", "Cancel",
+                                       class_="btn-outline-secondary"))))
+
+    if _HAS_MAP:
+        @output(suspend_when_hidden=False)   # late-bound modal output (see the flow-modal note)
+        @render_widget
+        def soils_review_map():
+            # Full rebuild per change, like usgs_review_map: per open (gen nonce), on fetch
+            # results, and on import-selection changes (restyles the picked units).
+            soil_modal_gen()
+            snap = soil_snapshot()
+            sel = soil_sel_units()
+            with reactive.isolate():
+                rch, dom = reach_feat(), domain_feat()
+            center = (39.5, -98.35)
+            try:
+                ring = ((dom or rch).get("geometry") or {}).get("coordinates")
+                while ring and isinstance(ring[0][0], (list, tuple)):
+                    ring = ring[0]
+                xs = [c[0] for c in ring]
+                ys = [c[1] for c in ring]
+                center = (sum(ys) / len(ys), sum(xs) / len(xs))
+            except Exception:  # noqa: BLE001
+                pass
+            m = Map(center=center, zoom=14, scroll_wheel_zoom=True, zoom_control=False,
+                    max_zoom=19, layout=Layout(height="320px"))
+            m.clear()
+            m.add(TileLayer(url=USGS_TOPO, name="USGS Topo", base=True, attribution=USGS_ATTR,
+                            max_native_zoom=16, max_zoom=19))
+            m.add(ZoomControl(position="topright"))
+            m.add(ScaleControl(position="bottomright"))
+            polys = (snap or {}).get("polygons") or []
+            if polys:
+                feats = [{"type": "Feature", "geometry": p["geometry"],
+                          "properties": {"mukey": p.get("mukey"),
+                                         "style": (SOILS_SEL_STYLE if p.get("mukey") in sel
+                                                   else SOILS_STYLE)}}
+                         for p in polys if p.get("geometry")]
+                m.add(GeoJSON(data={"type": "FeatureCollection", "features": feats},
+                              style=SOILS_STYLE, name="SSURGO soils"))
+            if dom:
+                m.add(GeoJSON(data={"type": "FeatureCollection", "features": [dom]},
+                              style=DOMAIN_STYLE, name="Model domain"))
+            if rch:
+                m.add(GeoJSON(data={"type": "FeatureCollection", "features": [rch]},
+                              style=REACH_STYLE, name="Analysis reach"))
+            return m
+
+    @output(suspend_when_hidden=False)       # late-bound modal output (see the flow-modal note)
+    @render.ui
+    def soils_modal_body():
+        import json as _json
+        snap = soil_snapshot()
+        sel = soil_sel_units()
+        if soil_task.status() == "running":
+            return ui.div(ui.div(class_="hype-spinner"),
+                          ui.span("Querying NRCS Soil Data Access…", class_="hype-run-label"),
+                          class_="hype-run-head")
+        if not snap:
+            return ui.div("No soils fetched yet. Click Fetch NRCS soils below.",
+                          class_="hype-instr")
+        polys, mus = snap.get("polygons") or [], snap.get("map_units") or []
+        cols = snap.get("source_columns_used") or {}
+        policy, depth_m, aniso, kh0, kv0 = _soil_k_inputs()
+        n_by_mu: dict = {}
+        for p in polys:
+            n_by_mu[p.get("mukey")] = n_by_mu.get(p.get("mukey"), 0) + 1
+        rows = []
+        for mu in mus:
+            mk = str(mu.get("mukey"))
+            zkh, zkv, derived = _soil_unit_k(mu, policy, depth_m, aniso, kh0, kv0)
+            picked = mk in sel
+            rows.append(ui.tags.tr(
+                ui.tags.td("☑" if picked else "☐", class_="hype-soil-pick"),
+                ui.tags.td(f"{mu.get('musym') or mk} — {mu.get('name') or ''}"),
+                ui.tags.td(str(n_by_mu.get(mu.get("mukey"), 0))),
+                ui.tags.td(f"{zkh:.2f}" + ("" if derived else " *")),
+                ui.tags.td(f"{zkv:.3f}" + ("" if derived else " *")),
+                class_="hype-flow-row" + (" sel" if picked else ""),
+                onclick=("Shiny.setInputValue('soil_unit_pick', "
+                         f"{_json.dumps(mk)}, {{priority: 'event'}})")))
+        units = ui.tags.table(
+            ui.tags.thead(ui.tags.tr(
+                ui.tags.th(""), ui.tags.th("Map unit"), ui.tags.th("Polygons"),
+                ui.tags.th(f"KH m/d (top {depth_m:g} m)"), ui.tags.th("KV m/d"))),
+            ui.tags.tbody(*rows), class_="table table-sm hype-flow-table hype-soil-units")
+        choices = {mu["mukey"]: f"{mu.get('musym') or mu['mukey']} — {mu.get('name') or ''}"
+                   for mu in mus}
+        return ui.TagList(
+            ui.div(ui.tags.strong(f"{len(polys)} polygons · {len(mus)} map units"), ui.br(),
+                   "Columns used: " + (", ".join(f"{k}={v}" for k, v in cols.items()) or "—"),
+                   class_="hype-instr"),
+            ui.div("Click a map unit to select it for K-zone import. Values marked * fall "
+                   "back to the pane KH/KV where the profile has no data.",
+                   class_="hype-instr hype-dim"),
+            units,
+            ui.output_ui("soil_k_coverage_note"),
+            ui.div(
+                ui.input_radio_buttons(
+                    "soil_use_mode", "How should these soils set the model K?",
+                    {"none": "Not used (keep the uniform pane K)",
+                     "aggregated": "Aggregated soils K over the whole domain",
+                     "zones": "Import the selected map units as K-zones"},
+                    selected=str(_keep("soil_use_mode",
+                                       "aggregated" if bool(_kept.get("use_soil_k"))
+                                       else "none"))),
+                ui.input_select("soil_policy", "Aggregation method",
+                                {"dominant": "Dominant component (largest %, its horizons)",
+                                 "weighted": "Weighted (component % · arithmetic KH / "
+                                             "harmonic KV)"},
+                                selected=str(_keep("soil_policy", "dominant"))),
+                class_="hype-soil-decide"),
+            ui.div("Hand-drawn K-zones always override the soils where they overlap.",
+                   class_="hype-instr hype-dim"),
+            (ui.input_select("soil_mukey", "Horizon detail (map unit)", choices)
+             if choices else None),
+            ui.output_ui("soil_detail"))
+
+    @reactive.effect
+    @reactive.event(input.soil_unit_pick)
+    def _soil_unit_pick():
+        mk = str(input.soil_unit_pick())
+        cur = set(soil_sel_units())
+        cur.symmetric_difference_update({mk})
+        soil_sel_units.set(frozenset(cur))
+
+    @reactive.effect
+    def _soils_fetch():
+        if not _clicked_dynamic("soils_fetch"):
+            return
         dom = domain_feat()
         if not dom:
             ui.notification_show("Generate the domain boundaries first.", type="warning")
@@ -2787,6 +3178,7 @@ def server(input, output, session):
             ui.notification_show(f"Couldn't start soils fetch: {e}", type="error")
             return
         soil_snapshot.set(None)
+        soil_sel_units.set(frozenset())
         soil_task(payload)
 
     @reactive.effect
@@ -2805,45 +3197,91 @@ def server(input, output, session):
             ui.notification_show(f"NRCS soils fetch failed: {tail}", type="error", duration=10)
             return
         soil_snapshot.set(res)
-        _show_soils_layer(res)
         ui.notification_show(f"Fetched {len(res.get('polygons') or [])} NRCS soil polygons.",
                              duration=5)
 
-    def _pane_soils():
-        snap = soil_snapshot()                    # subscribing read: re-render when a fetch lands
-        header = ui.TagList(
-            ui.p("Fetch SSURGO soils from NRCS Soil Data Access for the model domain, then review "
-                 "map units, components, horizons and representative Ksat. Reviewing here does not "
-                 "change the model K — that happens in the conductivity derivation.",
-                 class_="hype-instr"),
-            _evt_btn("fetch_soils_evt", "Fetch NRCS soils", "btn-outline-primary btn-sm"))
-        if soil_task.status() == "running":
-            return ui.TagList(header, ui.div("Querying NRCS Soil Data Access…",
-                                             class_="hype-instr"))
-        if not snap:
-            return ui.TagList(header, ui.div("No soils fetched yet.", class_="hype-instr"))
-        polys, mus = snap.get("polygons") or [], snap.get("map_units") or []
-        cols = snap.get("source_columns_used") or {}
-        cov = ui.div(ui.tags.strong(f"{len(polys)} polygons · {len(mus)} map units"), ui.br(),
-                     "Columns used: " + (", ".join(f"{k}={v}" for k, v in cols.items()) or "—"),
-                     class_="hype-instr")
-        kv0 = float(_safe("kv", 1.0)) or 1.0
-        aniso = float(_safe("kh", 10.0)) / kv0
-        use_k = ui.TagList(
-            ui.input_select("soil_policy", "Aggregation method (confirm before use)",
-                            {"dominant": "Dominant component (largest %, its horizons)",
-                             "weighted": "Weighted (component % · arithmetic KH / harmonic KV)"},
-                            selected=str(_keep("soil_policy", "dominant"))),
-            ui.input_checkbox("use_soil_k",
-                              f"Use NRCS soils for model K (KV = Ksat × 0.0864; KH = {aniso:g} × KV; "
-                              "manual K-zones still override)",
-                              value=bool(_keep("use_soil_k", False))),
-            ui.output_ui("soil_k_coverage_note"))
-        choices = {mu["mukey"]: f"{mu.get('musym') or mu['mukey']} — {mu.get('name') or ''}"
-                   for mu in mus}
-        selector = ui.input_select("soil_mukey", "Map unit", choices) if choices else None
-        return ui.TagList(header, cov, use_k, selector, ui.output_ui("soil_detail"))
+    @reactive.effect
+    def _soils_apply():
+        if not _clicked_dynamic("soils_apply"):
+            return
+        snap = soil_snapshot()
+        mode = str(_safe("soil_use_mode", "none"))
+        if mode in ("aggregated", "zones") and not snap:
+            ui.notification_show("Fetch NRCS soils first.", type="warning")
+            return
+        kz = [z for z in kzone_feats()
+              if (z.get("properties") or {}).get("src") != "nrcs"]   # re-import replaces
+        sel = soil_sel_units()
+        if mode == "zones":
+            if not sel:
+                ui.notification_show("Click at least one map unit to import.", type="warning")
+                return
+            policy, depth_m, aniso, kh0, kv0 = _soil_k_inputs()
+            mus = {str(mu.get("mukey")): mu for mu in (snap.get("map_units") or [])}
+            new = []
+            for p in snap.get("polygons") or []:
+                mk = str(p.get("mukey"))
+                if mk not in sel or not p.get("geometry"):
+                    continue
+                mu = mus.get(mk) or {}
+                zkh, zkv, _der = _soil_unit_k(mu, policy, depth_m, aniso, kh0, kv0)
+                label = f"{mu.get('musym') or mk} {mu.get('name') or ''}".strip()
+                new.append({"type": "Feature",
+                            "properties": {"KH": round(zkh, 4), "KV": round(zkv, 4),
+                                           "LABEL": label, "src": "nrcs"},
+                            "geometry": p["geometry"]})
+            new = geometry.normalize_kzone_features(new, **_kz_defaults())   # assigns uids
+            kz = kz + new
+            _kept["use_kzones"] = True
+            ui.update_checkbox("use_kzones", value=True)
+            _kept["use_soil_k"] = False
+            msg = (f"Imported {len(new)} soil polygon{'s' if len(new) != 1 else ''} "
+                   f"({len(sel)} map unit{'s' if len(sel) != 1 else ''}) as K-zones.")
+        elif mode == "aggregated":
+            _kept["use_soil_k"] = True
+            msg = "Aggregated NRCS soils K will be used for the model."
+        else:
+            _kept["use_soil_k"] = False
+            msg = "NRCS soils are not used for the model K."
+        kzone_feats.set(kz)
+        _load_into_drawcontrol(kz)
+        soil_source.set({"mode": mode, "policy": str(_safe("soil_policy", "dominant")),
+                         "units": sorted(sel) if mode == "zones" else []})
+        ui.modal_remove()
+        ui.notification_show(msg, duration=6)
 
+    @reactive.effect
+    def _soils_modal_cancel():
+        if not _clicked_dynamic("soils_modal_cancel"):
+            return
+        p = _soil_proc.get("p")
+        if p is not None:
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        ui.modal_remove()
+
+    @render.ui
+    def soil_k_status():
+        # The Subsurface-properties pane's one-line soils summary. soil_source is the
+        # invalidation source (use_soil_k has no live input — it lives in _kept only).
+        _ = soil_source()
+        n_nrcs = sum(1 for f in kzone_feats()
+                     if (f.get("properties") or {}).get("src") == "nrcs")
+        if bool(_kept.get("use_soil_k")):
+            pol = {"dominant": "dominant component",
+                   "weighted": "weighted components"}.get(str(_kept.get("soil_policy")
+                                                              or "dominant"), "")
+            return ui.p(ui.span(class_="hype-st st-done"),
+                        f"Soils K: aggregated over the domain ({pol}).", class_="hype-chk ok")
+        if n_nrcs:
+            return ui.p(ui.span(class_="hype-st st-done"),
+                        f"Soils K: {n_nrcs} polygon{'s' if n_nrcs != 1 else ''} imported "
+                        "as K-zones.", class_="hype-chk ok")
+        return ui.p("Soils K: not used.", class_="hype-chk")
+
+    @output(suspend_when_hidden=False)       # rendered inside the soils modal (late-bound)
     @render.ui
     def soil_k_coverage_note():
         _ = run_result()                          # re-render after each run
@@ -2860,6 +3298,7 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return None
 
+    @output(suspend_when_hidden=False)       # rendered inside the soils modal (late-bound)
     @render.ui
     def soil_detail():
         snap = soil_snapshot()
@@ -2964,59 +3403,111 @@ def server(input, output, session):
                 html = None
         if html is None:
             html = report_mod.render_html(res, app_version=APP_VERSION)
+        # The report renders inside a borderless iframe that fills the modal body, so the iframe is
+        # the ONLY scroll region (EASI/SFARI pattern). Downloads + Close live in the footer, keeping
+        # the body 100% report. The full-height DIALOG sizing is injected here scoped to #shiny-modal
+        # (Shiny's fixed modal id) so it applies ONLY while the report is open — the other size="xl"
+        # modals (USGS, NRCS) share .modal-dialog/.modal-body and must keep their default sizing.
         return ui.modal(
-            ui.div(
-                ui.download_button("dl_report_html", "HTML", class_="btn-sm btn-outline-primary"),
-                ui.download_button("dl_report_pdf", "PDF", class_="btn-sm btn-outline-primary"),
-                ui.download_button("dl_report_csv", "Metrics CSV", class_="btn-sm btn-outline-primary"),
-                ui.download_button("dl_report_json", "JSON", class_="btn-sm btn-outline-primary"),
-                class_="hype-actions"),
-            ui.tags.iframe(srcdoc=html, style="width:100%;height:60vh;border:1px solid #ccc"),
+            ui.tags.style(
+                "#shiny-modal .modal-dialog{max-width:min(1280px,96vw);width:96vw;"
+                "height:calc(100vh - 1.25rem);margin:.6rem auto}"
+                "#shiny-modal .modal-content{height:100%;max-height:100%;overflow:hidden;"
+                "display:flex;flex-direction:column}"
+                "#shiny-modal .modal-body{flex:1 1 auto;min-height:0;padding:0;overflow:hidden;"
+                "display:flex}"
+                "#shiny-modal .hype-report-frame{min-height:0}"),
+            ui.tags.iframe(srcdoc=html, class_="hype-report-frame", title="Site summary report"),
             title="Site Summary Report", size="xl", easy_close=True,
-            footer=ui.modal_button("Close"))
+            footer=ui.div(
+                ui.download_button("dl_report_pdf", "PDF", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("dl_report_html", "HTML", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("dl_report_csv", "Metrics CSV", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("dl_report_summary", "Run summary", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("dl_report_rtd", "RTD data", class_="btn-sm btn-outline-secondary"),
+                ui.download_button("dl_report_json", "JSON", class_="btn-sm btn-outline-secondary"),
+                ui.modal_button("Close", class_="btn-sm btn-primary"),
+                class_="hype-report-actions"))
 
     def _flux_metrics(hz_stats: dict, hz_dir):
-        """(ExchangeAccounting in m3/s, transit_times, transit_weights, censored, transit_rows)
-        from the §8.3 interface-pass artifacts. The model budget is m3/day; the canonical
-        results + streamflow are m3/s, hence the /86400."""
+        """Flux-weighted §8.3 interface-pass metrics as a dict bundle: exchange (m3/s),
+        transit_times, transit_weights, path_depths (returning subset; None when the depth pass did
+        not run), censored, transit_rows. The model budget is m3/day; the canonical results +
+        streamflow are m3/s, hence the /86400."""
         from hype_app.metrics import ExchangeAccounting
         DAY = 86400.0
-        exchange = transit_t = transit_w = censored = None
-        transit_rows = []
+        out = {"exchange": None, "transit_times": None, "transit_weights": None,
+               "path_depths": None, "censored": None, "transit_rows": []}
         acct = ((hz_stats or {}).get("flux") or {}).get("accounting") \
             if isinstance((hz_stats or {}).get("flux"), dict) else None
         if acct:
-            exchange = ExchangeAccounting(
+            out["exchange"] = ExchangeAccounting(
                 total_downwelling=acct["total_downwelling"] / DAY,
                 returning_hyporheic=acct["returning"] / DAY,
                 losing_to_sides=acct["losing"] / DAY,
                 unresolved=acct["unresolved"] / DAY)
             if acct.get("total_downwelling"):
-                censored = acct["unresolved"] / acct["total_downwelling"]
+                out["censored"] = acct["unresolved"] / acct["total_downwelling"]
         fx = hz_results.flux_arrays(hz_dir) if hz_dir else None
         if fx is not None:
             ret = fx["cls"] == 1
+            has_depth = "max_depth_m" in fx
             if ret.any():
-                transit_t = fx["time_days"][ret]
-                transit_w = fx["weight"][ret]
-            cls_names = {0: "unresolved", 1: "returning", 2: "losing"}
-            transit_rows = [
+                out["transit_times"] = fx["time_days"][ret]
+                out["transit_weights"] = fx["weight"][ret]
+                if has_depth:
+                    out["path_depths"] = fx["max_depth_m"][ret]
+            cls_names = {0: "unresolved", 1: "returning", 2: "losing",
+                         3: "gaining", 4: "throughflow"}
+            out["transit_rows"] = [
                 {"particle_id": int(i), "source_cell": int(fx["source_node"][i]),
                  "flow_weight": float(fx["weight"][i] / DAY),
                  "endpoint_class": cls_names.get(int(fx["cls"][i]), "unresolved"),
                  "transit_time_days": float(fx["time_days"][i]),
+                 "max_depth_m": (float(fx["max_depth_m"][i]) if has_depth
+                                 and fx["max_depth_m"][i] == fx["max_depth_m"][i] else None),
                  "termination": int(fx["status"][i])}
                 for i in range(len(fx["cls"]))]
-        return exchange, transit_t, transit_w, censored, transit_rows
+        return out
 
-    @reactive.effect
-    @reactive.event(input.gen_report_evt)
-    def _gen_report():
+    def _report_spatial(hz_dir):
+        """Best-effort spatial data for the report figures (report §17.4): plan-view GeoJSON plus
+        the returning-path GeoDataFrame with the reach centerline reprojected to the same metric CRS
+        for the longitudinal section. Any failure degrades to a missing figure, never a broken run."""
+        if not hz_dir:
+            return None
+        rf = reach_feat()
+        reach_lonlat = (rf["geometry"]["coordinates"]
+                        if rf and (rf.get("geometry") or {}).get("type") == "LineString" else None)
+        df = domain_feat() if callable(domain_feat) else None
+        domain_lonlat = (df["geometry"]["coordinates"][0]
+                         if df and (df.get("geometry") or {}).get("type") == "Polygon" else None)
+        planview = {
+            "down_fc": hz_results.flow_exchange_geojson(hz_dir, "down"),
+            "up_fc": hz_results.flow_exchange_geojson(hz_dir, "up"),
+            "footprint_fc": hz_results.footprint_geojson(hz_dir, "hyporheic"),
+            "reach_lonlat": reach_lonlat, "domain_lonlat": domain_lonlat}
+        paths_gdf = reach_line = None
+        try:
+            gdf = hz_results.class_paths_gdf(hz_dir)
+            if gdf is not None and len(gdf):
+                if "hz_class" in gdf.columns:
+                    gdf = gdf[gdf["hz_class"] == "hyporheic"]
+                if len(gdf) and reach_lonlat:
+                    import geopandas as gpd
+                    from shapely.geometry import LineString
+                    rl = gpd.GeoSeries([LineString(reach_lonlat)], crs="EPSG:4326").to_crs(gdf.crs)
+                    paths_gdf, reach_line = gdf, rl.iloc[0]
+        except Exception:  # noqa: BLE001 — the section figure is optional
+            paths_gdf = reach_line = None
+        return {"planview": planview, "paths_gdf": paths_gdf, "reach_line": reach_line}
+
+    def _build_and_show_report() -> bool:
+        """Assemble the results model, generate every report format, and show the modal. Shared by
+        the Generate button and the auto-open effect. Returns True on success."""
         hz, snap_dict = hz_result(), input_snapshot()
         if not hz or not snap_dict:
-            ui.notification_show("Delineate the hyporheic zone first (its stats feed the report).",
-                                 type="warning")
-            return
+            return False
         try:
             from hype_app.contracts import AssessmentInputSnapshot
             snap = AssessmentInputSnapshot.model_validate(snap_dict)
@@ -3027,31 +3518,69 @@ def server(input, output, session):
                 snap = snap.model_copy(update={"site": _site_metadata()})
             except Exception:  # noqa: BLE001
                 pass
-            stats = (hz.get("stats") or {}).get("classes") or hz.get("stats") or {}
+            full_stats = hz.get("stats") or {}
+            stats = full_stats.get("classes") or full_stats or {}
             hyp = stats.get("hyporheic") or {}
             vol, porosity = hyp.get("volume_m3"), snap.k.porosity
-            exchange, transit_t, transit_w, censored, transit_rows = _flux_metrics(
-                hz.get("stats") or {}, hz.get("hz_dir"))
+            acct = (full_stats.get("flux") or {}).get("accounting") or {}
+            net_exch = acct.get("net_stream_exchange")
+            domain_vol = (full_stats.get("domain") or {}).get("active_saturated_volume_m3")
+            fm = _flux_metrics(full_stats, hz.get("hz_dir"))
+            exchange, transit_rows = fm["exchange"], fm["transit_rows"]
 
             res = assess.build_results(
                 snap, hz_stats=stats, streamflow_cms=snap.streamflow.value_cms,
                 reach_length_m=_reach_length_m(), exchange=exchange,
-                transit_times_days=transit_t, transit_weights=transit_w,
+                transit_times_days=fm["transit_times"], transit_weights=fm["transit_weights"],
+                path_depths=fm["path_depths"],
                 mobile_pore_storage_m3=(float(vol) * float(porosity) if vol is not None else None),
-                reference_area_m2=hyp.get("footprint_m2"),
                 footprint_weighted_m2=hyp.get("footprint_m2"), porosity=porosity,
-                censored_fraction=censored,
+                censored_fraction=fm["censored"],
+                streambed_area_m2=acct.get("streambed_area_m2"),
+                active_streambed_area_m2=acct.get("active_streambed_area_m2"),
+                net_stream_exchange_cms=(net_exch / 86400.0 if net_exch is not None else None),
+                domain_volume_m3=domain_vol, hz_accounting=acct,
                 app_version=APP_VERSION)
             results_model.set(res.model_dump(mode="json"))
+            spatial = None
+            try:
+                spatial = _report_spatial(hz.get("hz_dir"))
+            except Exception:  # noqa: BLE001 — figures are best-effort
+                spatial = None
             paths = report_mod.generate_report(res, work_dir / "report",
-                                               transit_rows=transit_rows,
+                                               transit_rows=transit_rows, spatial=spatial,
                                                app_version=APP_VERSION,
                                                model_version="MODFLOW 6 / MODPATH 7")
             report_paths.set(paths)
             ui.modal_show(_report_modal(res, paths))
+            return True
         except Exception as e:  # noqa: BLE001
             ui.notification_show(f"Report generation failed: {type(e).__name__}: {e}",
                                  type="error", duration=8)
+            return False
+
+    @reactive.effect
+    @reactive.event(input.gen_report_evt)
+    def _gen_report():
+        if not hz_result() or not input_snapshot():
+            ui.notification_show("Delineate the hyporheic zone first (its stats feed the report).",
+                                 type="warning")
+            return
+        _build_and_show_report()
+
+    @reactive.effect
+    def _auto_open_report():
+        """Open the report once when a delineation run completes (EASI pattern). Isolated so later
+        site-metadata edits do not reopen it; the Generate button remains for manual re-open."""
+        hz, snap_d = hz_result(), input_snapshot()
+        if not hz or not isinstance(snap_d, dict):
+            return
+        cur = snap_d.get("input_hash")
+        with reactive.isolate():
+            if not report_mod.should_autoopen(_report_shown_for(), cur):
+                return
+            _report_shown_for.set(cur)      # mark before building so a failure never loops
+            _build_and_show_report()
 
     def _report_bytes(fmt):
         p = (report_paths() or {}).get(fmt)
@@ -3072,6 +3601,14 @@ def server(input, output, session):
     @render.download(filename="assessment_results.json")
     def dl_report_json():
         yield _report_bytes("json")
+
+    @render.download(filename="run_summary.json")
+    def dl_report_summary():
+        yield _report_bytes("run_summary")
+
+    @render.download(filename="rtd_distribution.json")
+    def dl_report_rtd():
+        yield _report_bytes("rtd_json")
 
     # ------------------------------------------------------------------
     # Gradient sensitivity (revision §10): sequential scenario execution + aggregation
@@ -3127,23 +3664,27 @@ def server(input, output, session):
         return await anyio.to_thread.run_sync(_work)
 
     def _scenario_metrics(stats: dict, hz_dir) -> dict:
-        """Complete metric/HFCI dict for ONE scenario (§10.4 alternatives keep metrics only)."""
-        from hype_app import hfci as hfci_mod
+        """Metric dict for ONE sensitivity scenario (§10.4 alternatives keep metrics only)."""
         from hype_app import metrics as metrics_mod
         classes = (stats or {}).get("classes") or {}
         hyp = classes.get("hyporheic") or {}
+        acct = ((stats or {}).get("flux") or {}).get("accounting") or {}
+        streambed_area = acct.get("streambed_area_m2")
         porosity = float(_safe("porosity", 0.3))
         out: dict = {"volume_m3": hyp.get("volume_m3"), "footprint_m2": hyp.get("footprint_m2")}
         if hyp.get("volume_m3") is not None:
             out["pore_storage_m3"] = float(hyp["volume_m3"]) * porosity
-        exchange, tt, tw, censored, _rows = _flux_metrics(stats, hz_dir)
+            if streambed_area:
+                out["equivalent_active_depth_m"] = round(
+                    float(hyp["volume_m3"]) / float(streambed_area), 4)
+        fm = _flux_metrics(stats, hz_dir)
+        exchange, tt, tw = fm["exchange"], fm["transit_times"], fm["transit_weights"]
         snap_d = input_snapshot() or {}
         q_cms = (snap_d.get("streamflow") or {}).get("value_cms")
         if q_cms is None:
             f = _safe("ras_flow", None)
             q_cms = float(f) * CFS_TO_CMS if f else None
         reach_len = _reach_length_m()
-        exc_raw = None
         if exchange is not None and q_cms:
             conn = metrics_mod.connectivity(
                 streamflow=q_cms, returning_hyporheic=exchange.returning_hyporheic,
@@ -3151,22 +3692,12 @@ def server(input, output, session):
                 losing=exchange.losing_to_sides, unresolved=exchange.unresolved,
                 reach_length_m=reach_len)
             if conn is not None:
-                exc_raw = conn.excursions_per_mile
                 out["excursions_per_mile"] = round(conn.excursions_per_mile, 6)
+                if conn.turnovers_per_km == conn.turnovers_per_km:      # finite (not NaN)
+                    out["turnovers_per_km"] = round(conn.turnovers_per_km, 6)
                 out["returning_cms"] = round(exchange.returning_hyporheic, 8)
-        storage_raw = None
-        if out.get("pore_storage_m3") is not None and hyp.get("footprint_m2"):
-            storage_raw = out["pore_storage_m3"] / float(hyp["footprint_m2"])
-        proc_raw = None
         if tt is not None and tw is not None and len(tt):
-            proc_raw = hfci_mod.processing_driver(tt, tw)
             out["rtd_median_days"] = round(metrics_mod.weighted_quantile(tt, tw, 0.5), 4)
-        h = hfci_mod.compute_hfci(exchange_raw=exc_raw, storage_raw=storage_raw,
-                                  processing_raw=proc_raw)
-        out["hfci"] = h.hfci
-        out["exchange_score"] = h.exchange.score
-        out["storage_score"] = h.storage.score
-        out["processing_score"] = h.processing.score
         return {k: v for k, v in out.items() if v is not None}
 
     def _sens_manifest_objects():
@@ -3211,6 +3742,9 @@ def server(input, output, session):
             "left_profile": grad_mod.serialize_profile(s.gradients.left_controls),
             "right_profile": grad_mod.serialize_profile(s.gradients.right_controls)}
             for s in manifest.scenarios]
+        if not runner.modflow_available():
+            ui.notification_show(MODFLOW_UNAVAILABLE_MSG, type="error", duration=8)
+            return
         try:
             crs = proj_crs()
             crs_id = crs.to_epsg() or crs.to_wkt()
@@ -3361,11 +3895,10 @@ def server(input, output, session):
                 ui.tags.strong(f"{len(done)} succeeded · {len(failed)} failed · "
                                f"design: {manifest.generator.value}"), class_="hype-instr"))
             rows = []
-            for key, label in (("hfci", "HFCI (0–1)"),
-                               ("excursions_per_mile", "Excursions / mile"),
-                               ("volume_m3", "Hyporheic volume (m³)"),
-                               ("pore_storage_m3", "Pore storage (m³)"),
-                               ("rtd_median_days", "RTD median (days)")):
+            for key, label in (("turnovers_per_km", "Turnovers per km"),
+                               ("rtd_median_days", "Median residence time (days)"),
+                               ("equivalent_active_depth_m", "Equivalent active depth (m)"),
+                               ("volume_m3", "Active hyporheic volume (m³)")):
                 agg = sens_mod.aggregate_metric(manifest.scenarios, key, manifest.preferred_id)
                 if not agg:
                     continue
@@ -3381,10 +3914,6 @@ def server(input, output, session):
                                              ui.tags.th("Min"), ui.tags.th("Max"),
                                              ui.tags.th("Range"))),
                     ui.tags.tbody(*rows), class_="table table-sm hype-sens-table"))
-                dom = sens_mod.dominant_capacity_contributor(manifest.scenarios)
-                if dom:
-                    parts.append(ui.div(f"Dominant capacity contributor across scenarios: {dom}.",
-                                        class_="hype-instr"))
             parts.append(ui.div("Ranges show sensitivity to the tested gradient assumptions — "
                                 "not confidence intervals. Untested: K/soils, streamflow, "
                                 "geometry, grid resolution, porosity.", class_="hype-warn"))
@@ -3449,8 +3978,8 @@ def server(input, output, session):
                                  "in the Reference slope field.")
             slight = max(0.0, float(_safe("g_mult_slight", 0.5) or 0.0))
             strong = max(0.0, float(_safe("g_mult_strong", 1.0) or 0.0))
-            left = GradientQualitative(_safe("g_qual_left", "neutral"))
-            right = GradientQualitative(_safe("g_qual_right", "neutral"))
+            left = GradientQualitative(_safe("g_qual_left", "slightly_gaining"))
+            right = GradientQualitative(_safe("g_qual_right", "slightly_gaining"))
             cfg = GradientBoundaryConfigV2.from_qualitative(
                 left=left, right=right, reference_slope=rs, slight=slight, strong=strong)
             # sensitivity bounds = one category step either way, on the LIVE multiplier scale
@@ -3491,17 +4020,78 @@ def server(input, output, session):
             return None
 
     @reactive.calc
+    def cap_wse_anchors():
+        """Cap-anchored WSE for the four domain corners: per corner, the valid WSE sample
+        nearest it (metric distance) along its OWN boundary cap — upstream cap for ul/ur,
+        downstream cap for dl/dr. {"ul": {"wse","dist","edge"} | None, ...} with dist in
+        proj-CRS metres and edge as (lon, lat) for display. None overall until domain + CRS +
+        water surface exist; per-corner None when that cap never crosses wetted WSE (callers
+        fall back to the nearest-edge snap). The engine anchors along the corner-to-corner
+        chord, so a hand-bowed multi-vertex cap can diverge slightly — post-conditioning caps
+        are 2-pt chords, where the two coincide."""
+        build, crs, p = _domain_build(), proj_crs(), wse_preview_path()
+        if not build or crs is None or not p:
+            return None
+        try:
+            import numpy as np
+            from pyproj import Transformer
+
+            from hype_app import wse_index
+            to_ll = None
+            out = {}
+            for cap_key, corner_keys in (("up", ("ul", "ur")), ("down", ("dl", "dr"))):
+                feat = build.get(cap_key)
+                raw = wse_index.valid_samples_along_line(p, feat) if feat else None
+                if raw is None:
+                    out[corner_keys[0]] = out[corner_keys[1]] = None
+                    continue
+                if to_ll is None:
+                    to_m = Transformer.from_crs(raw["crs"], crs, always_xy=True)
+                    to_ll = Transformer.from_crs(raw["crs"], "EPSG:4326", always_xy=True)
+                    ll_to_m = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                xm, ym = to_m.transform(raw["x"], raw["y"])
+                lon, lat = to_ll.transform(raw["x"], raw["y"])
+                xm, ym = np.asarray(xm), np.asarray(ym)
+                cc = feat["geometry"]["coordinates"]        # cap runs left→right: [0]=l, [-1]=r
+                cx, cy = ll_to_m.transform([cc[0][0], cc[-1][0]], [cc[0][1], cc[-1][1]])
+                for k, x0, y0 in ((corner_keys[0], cx[0], cy[0]),
+                                  (corner_keys[1], cx[1], cy[1])):
+                    dx, dy = xm - float(x0), ym - float(y0)
+                    i = int(np.argmin(dx * dx + dy * dy))
+                    out[k] = {"wse": float(raw["value"][i]),
+                              "dist": float(np.hypot(dx[i], dy[i])),
+                              "edge": (float(np.asarray(lon)[i]), float(np.asarray(lat)[i]))}
+            return out
+        except Exception:  # noqa: BLE001
+            return None
+
+    @reactive.calc
     def grad_point_heads():
-        """Preview rows for every gradient-specified point (the four corners + the intermediate
-        points): map position, nearest wetted WSE cell, and head = WSE + gradient × distance —
+        """Preview rows for every gradient-specified point: the four corners (both modes — the
+        ONLY rows in qualitative mode, where the gradient is the signed multiplier × reference
+        slope) plus the intermediate points (points mode). Corner rows anchor to the WSE along
+        their OWN boundary cap (cap_wse_anchors — the valid sample nearest the corner on the cap
+        line), falling back to the nearest wetted edge when that cap never crosses water;
+        intermediate rows snap to the nearest wetted WSE cell. head = WSE + gradient × distance,
         the same anchor formula the engine applies along each side at run time. edge/wse/dist/
-        head stay None until a water surface exists."""
+        head stay None until a water surface exists; in qualitative mode with no usable
+        reference slope, gradient/head stay None (anchors still shown, pills read "h —")."""
         build, crs = _domain_build(), proj_crs()
         if not build or crs is None:
             return []
         grad_ver()                                   # in-place gradient edits recompute heads
-        pts = grad_pts()
+        bc_qual = str(_safe("bc_mode", BC_QUAL)) == BC_QUAL   # legacy corner rides points branch
+        pts = [] if bc_qual else grad_pts()
+        qual_g = {"left": None, "right": None}
+        if bc_qual:
+            try:
+                cfg = _gradient_config()
+                qual_g = {"left": _g4(cfg.left_controls[0].preferred),
+                          "right": _g4(cfg.right_controls[0].preferred)}
+            except Exception:  # noqa: BLE001 — no usable slope: anchors shown, heads "h —"
+                pass
         idx = wse_edge_samples()
+        caps = cap_wse_anchors()
         import geopandas as gpd
         from pyproj import Transformer
         from shapely.geometry import shape as _shape
@@ -3518,9 +4108,11 @@ def server(input, output, session):
                     continue
                 c4326 = feat["geometry"]["coordinates"]
                 first, last = ln.coords[0], ln.coords[-1]
-                entries = [(0.0, _g4(_safe(k0, 0.005)), k0[2:],
+                g0 = qual_g[side] if bc_qual else _g4(_safe(k0, 0.005))
+                g1 = qual_g[side] if bc_qual else _g4(_safe(k1, 0.005))
+                entries = [(0.0, g0, k0[2:],
                             (float(c4326[0][0]), float(c4326[0][1])), (first[0], first[1])),
-                           (1.0, _g4(_safe(k1, 0.005)), k1[2:],
+                           (1.0, g1, k1[2:],
                             (float(c4326[-1][0]), float(c4326[-1][1])), (last[0], last[1]))]
                 for p in pts:
                     if p["side"] != side:
@@ -3532,10 +4124,18 @@ def server(input, output, session):
                 for stn, g, uid, lonlat, xy in sorted(entries, key=lambda e: e[0]):
                     row = {"uid": uid, "side": side, "station": stn, "gradient": g, "pt": lonlat,
                            "edge": None, "wse": None, "dist": None, "head": None}
-                    if idx is not None:
+                    cap = (caps.get(uid)
+                           if caps and uid in ("ul", "dl", "ur", "dr") else None)
+                    if cap is not None:              # corner: anchored along its own cap line
+                        row.update(edge=cap["edge"], wse=cap["wse"], dist=cap["dist"],
+                                   head=(None if g is None else
+                                         grad_mod.anchor_head(cap["wse"], g, cap["dist"])))
+                    elif idx is not None:
                         d, w, _ex, _ey, i = wse_index.nearest_edge(idx, xy[0], xy[1])
                         row.update(edge=(float(idx["lon"][i]), float(idx["lat"][i])),
-                                   wse=w, dist=d, head=grad_mod.anchor_head(w, g, d))
+                                   wse=w, dist=d,
+                                   head=(None if g is None else
+                                         grad_mod.anchor_head(w, g, d)))
                     rows.append(row)
         except Exception:  # noqa: BLE001
             return rows
@@ -3544,7 +4144,9 @@ def server(input, output, session):
     @render.ui
     def gradient_qual_preview():
         # Text-only (the slope + multiplier inputs live statically in the pane — re-rendering
-        # here never remounts an input mid-keystroke).
+        # here never remounts an input mid-keystroke). One dim note with the two candidate
+        # slopes so the user can choose what to type into Reference slope; the reset link
+        # appears only while a manual override is active.
         try:
             _ = (input.g_qual_left(), input.g_qual_right(),
                  input.g_mult_slight(), input.g_mult_strong())      # subscribe
@@ -3552,27 +4154,17 @@ def server(input, output, session):
             pass
         ov, auto = ref_slope_override(), ref_slope_auto()
         dem_s, wse_s = dem_slope_centerline(), wse_slope_centerline()
-        length = reach_len_live_m()
 
         def _f(s):
-            return f"{s.value:.5f}" if s is not None else "—"
-        src = ("manual override" if ov is not None else
-               {"wse_raster": "auto · water-surface slope",
-                "dem_drop": "auto · DEM slope"}.get(getattr(auto, "source", None),
-                                                    "unavailable — enter one"))
+            return f"{s.value:.5f}" if s is not None else "n/a"
         reset = (ui.tags.button(
                      "reset to auto", type="button", class_="hype-link",
                      onclick="Shiny.setInputValue('g_ref_auto_evt',Date.now(),{priority:'event'})")
                  if ov is not None and auto is not None else None)
-        bits = [ui.div(ui.span(f"Reference slope: {src}"), reset, class_="hype-instr hype-dim"),
-                ui.div(f"DEM slope {_f(dem_s)} · water-surface slope {_f(wse_s)}"
-                       + (f" · centerline {length:,.0f} m" if length else ""),
-                       class_="hype-instr hype-dim")]
+        bits = [ui.div(ui.span(f"DEM slope: {_f(dem_s)}. Water surface slope: {_f(wse_s)}."),
+                       reset, class_="hype-instr hype-dim")]
         try:
-            cfg = _gradient_config()
-            bits.append(ui.div(
-                f"Left {cfg.left_controls[0].preferred:+.5f} · "
-                f"right {cfg.right_controls[0].preferred:+.5f} m/m", class_="hype-instr"))
+            _gradient_config()                       # no usable slope -> visible error
         except ValueError as e:
             bits.append(ui.div(str(e), class_="hype-warn"))
         return ui.TagList(*bits)
@@ -3695,6 +4287,11 @@ def server(input, output, session):
             ui.notification_show("Need all four boundaries (closing into a domain) plus terrain "
                                  "before running the surface model.", type="warning", duration=6)
             return
+        if bnd_conflicts():
+            ui.notification_show("A boundary line crosses the stream centerline. Adjust the "
+                                 "boundary or the reach centerline in the Boundaries step, "
+                                 "then try again.", type="error", duration=8)
+            return
         if not ras_engine.ras_available():
             ui.notification_show(RAS_UNAVAILABLE_MSG, type="error", duration=8)
             return
@@ -3702,11 +4299,14 @@ def server(input, output, session):
         est = ras_engine.estimate_cell_count(_domain_gdf_4326(), cell)
         _green, cap = ras_engine.cell_budget()
         if est > cap:
-            need = cell * (est / cap) ** 0.5
-            ui.notification_show(f"~{est:,} cells at {cell:g} m — over the {cap:,} limit. "
-                                 f"Increase the cell size to ~{need:.0f} m.",
-                                 type="error", duration=10)
-            return
+            if not runmode.IS_DESKTOP:
+                need = cell * (est / cap) ** 0.5
+                ui.notification_show(f"~{est:,} cells at {cell:g} m — over the {cap:,} limit. "
+                                     f"Increase the cell size to ~{need:.0f} m.",
+                                     type="error", duration=10)
+                return
+            ui.notification_show(f"~{est:,} cells at {cell:g} m — no limit in Desktop Run, "
+                                 "but a mesh this size may take a long time.", duration=8)
         slope = float(_safe("ras_slope", 0.0) or 0.0)
         if slope <= 0:
             slope = ras_slope_default() or 0.001
@@ -3729,6 +4329,9 @@ def server(input, output, session):
         ras_stage.set("Starting"); ras_pct.set(None)
         ras_t0.set(time.monotonic())
         ras_elapsed.set(0)
+        _ras_mesh_payload.clear()       # _ras_done auto-meshes from this snapshot on success
+        _ras_mesh_payload.update({k: payload[k] for k in (
+            "up", "left", "right", "down", "domain", "dem", "cell_size_m", "work_dir")})
         await _cascade_clear("sw")      # re-running the water surface invalidates groundwater + results
         ras_task(payload)
 
@@ -3766,6 +4369,22 @@ def server(input, output, session):
         ras_result.set(res)                         # extent + overlay effects draw from this
         with reactive.isolate():                    # fresh SW result → its stale badge clears
             _stale_marks.set(frozenset(_stale_marks() - {"sw"}))
+        # The run's mesh is a result too: build the overlay even when Preview mesh was never
+        # clicked, so the tree's "2D mesh" row has something to show. Same child path as the
+        # button; skipped when a preview at this cell size already exists. Reads are isolated —
+        # this effect must depend on ras_task.status() only (the done-handler re-fire lesson).
+        with reactive.isolate():
+            _prev_mesh = ras_mesh_prev()
+            _meshing = mesh_prev_task.status() == "running"
+        _cell = float(_ras_mesh_payload.get("cell_size_m", 0.0) or 0.0)
+        if (_ras_mesh_payload and not _meshing
+                and (_prev_mesh is None
+                     or abs(float(_prev_mesh.get("cell_size_m", _cell)) - _cell) > 1e-9)):
+            try:
+                _mesh_auto["on"] = True
+                mesh_prev_task(dict(_ras_mesh_payload))
+            except Exception:  # noqa: BLE001 — the mesh is a nicety; the run result stands
+                _mesh_auto["on"] = False
         origin, z0 = _scene_frame()                 # 3-D drapes for the surface results
         if origin is not None:
             try:
@@ -3847,14 +4466,60 @@ def server(input, output, session):
         _upsert_sig[key] = id(feat)
 
     @reactive.effect
+    def _wetted_filter_sync():
+        # Owns wetted_filter_res: the upstream–downstream connectivity split of the modeled
+        # wetted extent, plus the pool-masked WSE raster the GW run consumes (_wse_path).
+        # Recomputes on RAS completion/restore and on the pane toggle — cheap geometry, no
+        # RAS re-run. try/except is load-bearing: an error raised out of an EFFECT destroys
+        # the whole session; any failure degrades to the unfiltered extent instead.
+        res = ras_result()
+        try:
+            on = bool(input.wetted_filter())
+        except Exception:  # noqa: BLE001 — pane not rendered yet; the kept mirror rules
+            on = bool(_safe("wetted_filter", True))
+        try:
+            depth_p = (res or {}).get("depth_tif")
+            src_wse = (res or {}).get("wse_for_gw")
+            with reactive.isolate():           # caps can't change without cascading sw away
+                build = _domain_build()
+            if not (on and depth_p and Path(depth_p).exists() and src_wse and build):
+                wetted_filter_res.set(None)
+                return
+            split = ras_results.split_wetted_by_connectivity(
+                depth_p, build["up"], build["down"])
+            if split is None:                  # nothing spans both caps — filter can't apply
+                wetted_filter_res.set({"failed": True})
+                return
+            split["wse_path"] = (
+                ras_results.mask_out_polygons(src_wse, split["removed_feat"],
+                                              str(work_dir / "inputs" / "wse_ras_gw.tif"))
+                if split.get("removed_feat") is not None else None)
+            wetted_filter_res.set(split)
+        except Exception as e:  # noqa: BLE001
+            print(f"[wetted filter] failed: {e}")
+            wetted_filter_res.set(None)
+
+    @reactive.effect
     def _ras_extent_sync():
         # Owns the "Modeled extent" polygon (persists while a result exists — it's the water
-        # surface the groundwater run consumes). Pure upsert: transitions no longer churn the
-        # layer list, so the old force-fresh-per-step workaround is gone.
+        # surface the groundwater run consumes) and its "Removed pools" twin (the isolated
+        # parts the upstream–downstream filter excluded from the GW extent). Pure upsert:
+        # transitions no longer churn the layer list, so the old force-fresh-per-step
+        # workaround is gone.
         if not _HAS_MAP:
             return
         ext = (ras_result() or {}).get("extent_feat")
+        filt = wetted_filter_res()
+        removed = None
+        if filt and filt.get("kept_feat") is not None:
+            ext = filt["kept_feat"]
+            removed = filt.get("removed_feat")
+        try:
+            show_rm = bool(input.show_removed_pools())
+        except Exception:  # noqa: BLE001 — pane not rendered yet
+            show_rm = bool(_safe("show_removed_pools", False))
         _upsert_geojson("Modeled extent", ext, WSE_STYLE)
+        _upsert_geojson("Removed pools", removed if show_rm else None, REMOVED_STYLE)
 
     @reactive.effect
     def _ras_result_overlays():
@@ -3909,10 +4574,16 @@ def server(input, output, session):
             ui.notification_show("Need all four boundaries (closing into a domain) plus terrain "
                                  "before meshing.", type="warning", duration=6)
             return
+        if bnd_conflicts():
+            ui.notification_show("A boundary line crosses the stream centerline. Adjust the "
+                                 "boundary or the reach centerline in the Boundaries step, "
+                                 "then try again.", type="error", duration=8)
+            return
         if not ras_engine.ras_available():
             ui.notification_show(RAS_UNAVAILABLE_MSG, type="error", duration=8)
             return
         try:
+            _mesh_auto["on"] = False                # button build — full notifications
             mesh_prev_task({
                 "up": build["up"], "left": build["left"], "right": build["right"],
                 "down": build["down"], "domain": build["domain"], "dem": active_dem(),
@@ -3932,12 +4603,20 @@ def server(input, output, session):
             res = {"error": str(e)}
         if not isinstance(res, dict):               # belt-and-braces: never let a malformed
             res = {"error": f"meshing returned {res!r}"}   # result kill the session
+        auto = _mesh_auto["on"]                     # run-triggered build: store, but no toasts
+        _mesh_auto["on"] = False
         ras_log_tick.set(len(ras_log_lines))
         if "error" in res:
-            ui.notification_show("Meshing failed: " + str(res["error"])[:300],
-                                 type="error", duration=8)
+            if auto:                                # the run already succeeded — log only
+                ras_log_lines.append("[auto mesh] failed: " + str(res["error"])[:300])
+                ras_log_tick.set(len(ras_log_lines))
+            else:
+                ui.notification_show("Meshing failed: " + str(res["error"])[:300],
+                                     type="error", duration=8)
             return
         ras_mesh_prev.set(res)                      # _ras_mesh_sync draws it
+        if auto:
+            return
         if res.get("too_big"):
             ui.notification_show(f"Mesh built: {res.get('cell_count', 0):,} cells — too many "
                                  f"faces ({res.get('n_faces', 0):,}) to draw as an overlay; "
@@ -3972,8 +4651,9 @@ def server(input, output, session):
         """Clear every surface-model product (result, overlays, mesh preview + their layers)."""
         ras_result.set(None)
         ras_mesh_prev.set(None)
+        wetted_filter_res.set(None)
         _ras_overlays.clear()
-        for nm in ("Modeled extent", "sw_depth", "sw_wse", "RAS mesh"):
+        for nm in ("Modeled extent", "Removed pools", "sw_depth", "sw_wse", "RAS mesh"):
             _set_layer(nm, None)
 
     def _drop_gw_artifacts():
@@ -3983,8 +4663,6 @@ def server(input, output, session):
         run_result.set(None)
         head_tifs.set([])
         head_rng.set(None)
-        fp_stats.set(None)
-        sel_pids.set(())
         _head_cache.clear()
         _contour_cache.clear()
         for nm in ("head", "grid", "wse_raster"):
@@ -4095,19 +4773,22 @@ def server(input, output, session):
                                  "into a domain, plus terrain.", type="warning", duration=6)
             return
         est = grid_estimate()
-        if est and estimate.band(est["n_cells"]) == "red":
+        if not runmode.IS_DESKTOP and est and estimate.band(est["n_cells"]) == "red":
             ui.notification_show(estimate.band_message(est), type="error", duration=10)
             return
         wse = _wse_path()
         if wse is None:
-            ui.notification_show("No water surface yet — draw the wetted extent, run the Surface "
-                                 "model, or upload a WSE raster.", type="warning", duration=6)
+            ui.notification_show("No water surface yet — run the water-surface model first "
+                                 "(Water surface step).", type="warning", duration=6)
             return
         try:
             gradients_cfg = _gradient_config()   # qualitative or gradient-points (never None)
         except ValueError as ge:
             ui.notification_show(f"Fix the boundary gradients first: {ge}",
                                  type="warning", duration=8)
+            return
+        if not runner.modflow_available():
+            ui.notification_show(MODFLOW_UNAVAILABLE_MSG, type="error", duration=8)
             return
         _wse_used["path"] = wse             # for the Results "Water surface (raster)" overlay
         try:
@@ -4270,14 +4951,9 @@ def server(input, output, session):
             ui.notification_show("Model run failed.", type="error", duration=8)
             return
         run_result.set(res)
-        sel_pids.set(())                               # new run → clear any stale selection
         with reactive.isolate():                       # fresh GW result → its stale badge clears
             _stale_marks.set(frozenset(_stale_marks() - {"gw"}))
         _reset_res_layer_vis()                         # fresh layers → all visible, shadows dropped
-        try:
-            fp_stats.set(results.flowpath_stats(res, work_dir))
-        except Exception:  # noqa: BLE001 — stats pane degrades to "n/a"; never block the map
-            fp_stats.set(None)
         if _HAS_MAP:
             try:
                 # Flow paths (and their entry/return dots) are produced ONLY by delineation now
@@ -4306,14 +4982,17 @@ def server(input, output, session):
                         gwf_ws = work_dir / "model" / "gwf_workspace"
                         if next(gwf_ws.glob("*.dis.grb"), None) is not None:
                             build = _domain_build()
+                            _grid_auto["on"] = True     # quiet build — stay in the current view
                             mesh_task({
                                 "run_ws": str(gwf_ws), "crs": proj_crs().to_wkt(),
                                 "sides": ({k: build[k] for k in ("up", "left", "right", "down")}
                                           if build else None),
                                 "scene_z0": z0,
                             })
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as e:  # noqa: BLE001 — the grid is a nicety; the run stands
+                        _grid_auto["on"] = False
+                        log_lines.append("[auto grid] skipped: " + str(e)[:300])
+                        log_tick.set(len(log_lines))
             except Exception as e:  # noqa: BLE001
                 ui.notification_show(f"Results computed; map render issue: {e}", duration=6)
         await _clear_hz_outputs()      # a new GW run rewrites the workspaces HZ reads
@@ -4325,6 +5004,7 @@ def server(input, output, session):
                          + [f"hz_nodes_{c}_start" for c in HZ_CLASSES]
                          + [f"hz_nodes_{c}_end" for c in HZ_CLASSES]
                          + [f"hz_foot_{c}" for c in HZ_CLASSES]
+                         + ["hz_flow_down", "hz_flow_up"]      # streambed exchange map
                          + ["hz_paths_sel"])
     # the tree-checkbox-driven subset: hz_paths_sel is owned by _hz_selection_layer and has no
     # tree node — parking it (e.g. _hz_done's creation park) would hide selections forever
@@ -4342,6 +5022,8 @@ def server(input, output, session):
             _set_layer(f"hz_foot_{cls}", None)
             _set_layer(f"hz_nodes_{cls}_start", None)
             _set_layer(f"hz_nodes_{cls}_end", None)
+        _set_layer("hz_flow_down", None)
+        _set_layer("hz_flow_up", None)
         _set_layer("hz_paths_sel", None)
         await _sweep_hz(_ALL_HZ_KEYS)       # heal any client copies the removals missed
         for key in ("hz3d_paths_", "hz3d_vol_"):
@@ -4434,7 +5116,7 @@ def server(input, output, session):
             return
         ppc = int(_safe("hz_ppc", 1))
         est = _hz_particle_estimate(ppc)
-        if est > HZ_MAX_PARTICLES:
+        if not runmode.IS_DESKTOP and est > HZ_MAX_PARTICLES:
             ui.notification_show(
                 f"~{est:,} particles at {ppc}/cell is over the {HZ_MAX_PARTICLES:,} limit — "
                 f"use fewer particles per cell.", type="error", duration=10)
@@ -4442,6 +5124,9 @@ def server(input, output, session):
         if est > 500_000:
             ui.notification_show(f"~{est:,} particles — this may take several minutes.",
                                  duration=7)
+        if not runner.modflow_available():
+            ui.notification_show(MODFLOW_UNAVAILABLE_MSG, type="error", duration=8)
+            return
         try:
             crs = proj_crs()
             crs_id = crs.to_epsg() or crs.to_wkt()
@@ -4454,7 +5139,7 @@ def server(input, output, session):
                     "sample_per_class": int(_safe("hz_sample", 300)),
                     "porosity": float(_safe("porosity", 0.3)),
                     "modflow_bin_dir": runner.modflow_bin_dir(),
-                    "hard_cap_particles": HZ_MAX_PARTICLES,
+                    "hard_cap_particles": (10**9 if runmode.IS_DESKTOP else HZ_MAX_PARTICLES),
                 },
             }
         except Exception as e:  # noqa: BLE001
@@ -4519,7 +5204,6 @@ def server(input, output, session):
         # the classed paths replace the monolithic forward set (2-D + 3-D)
         _set_layer("paths", None)
         _set_layer("paths_sel", None)
-        sel_pids.set(())
         # visibility FIRST — classed paths on; only the hyporheic volume on by default (four
         # overlapping translucent shells would be unreadable). Fresh results also re-arm the
         # GROUP checks — an earlier group-uncheck must not leave the new delineation invisible
@@ -4530,8 +5214,8 @@ def server(input, output, session):
             suf = ui_tree.HZ_CLASS_SUFFIX[cls]
             _check_state[f"gw.res.paths.{suf}"] = (cls == "hyporheic")
             _check_state[f"gw.res.hz.{suf}"] = (cls == "hyporheic")
-        for gid in ("gw.res.hz", "gw.res.paths", "gw.res.hz.vols"):
-            _check_state[gid] = True
+        for gid in ("gw.res.hz", "gw.res.paths", "gw.res.hz.vols", "gw.res.hz.flows"):
+            _check_state[gid] = True               # flows = the streambed exchange map
         _apply_check_effective("gw.res.hz")     # one cascade covers the whole Zone subtree
         # ... then park EVERYTHING at creation, even the default-visible keys. NO hz original
         # ever rides the run-completion burst: the client is busy building the 3-D scene right
@@ -4593,6 +5277,13 @@ def server(input, output, session):
                         data=foot, style=HZ_FOOT_STYLE[cls], name=f"{HZ_LABEL[cls]} footprint"))
                 else:
                     _set_layer(f"hz_foot_{cls}", None)
+            # streambed exchange map (Flows node): downwelling / upwelling cell rectangles
+            for direction, style, label in (("down", FLOW_DOWN_STYLE, "Stream downwelling"),
+                                            ("up", FLOW_UP_STYLE, "Stream upwelling")):
+                ex = _tag_hz(hz_results.flow_exchange_geojson(hz_dir, direction),
+                             f"hz_flow_{direction}")
+                _set_layer(f"hz_flow_{direction}",
+                           GeoJSON(data=ex, style=style, name=label) if ex else None)
             # everything above went into _layer_shadow (creation park) — reveal the checked
             # keys once the burst + 3-D churn settle; the reveal schedules its own verify.
             _schedule_hz_reveal()
@@ -5006,12 +5697,22 @@ def server(input, output, session):
         gdf = hz_gdf()
         if gdf is None:
             return
+        # A box drag ends on the map, so Leaflet fires a plain map click right after
+        # this event — stamp the pick so the mapclear deselect skips it and the
+        # properties pane stays open (same contract as _on_hz_path_click).
+        _map_ui["map_sel_ts"] = time.monotonic()
         b = input.fp_select_box() or {}
         try:
             bx = _box(float(b["west"]), float(b["south"]), float(b["east"]), float(b["north"]))
         except (KeyError, TypeError, ValueError):
             return
-        sub = gdf[gdf.intersects(bx)]       # crossing window: anything the box touches
+        # Selection only offers what the user can see: classes whose checkbox is
+        # effectively off are excluded (single click already can't hit them — the
+        # hidden GeoJSON is off the map entirely).
+        vis = [c for c in HZ_CLASSES
+               if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[c]}")]
+        sub = gdf[gdf["hz_class"].isin(vis)]
+        sub = sub[sub.intersects(bx)]       # crossing window: anything the box touches
         hz_sel_pids.set(tuple(int(p) for p in sub["particleid"]))
 
     @reactive.effect
@@ -5148,7 +5849,7 @@ def server(input, output, session):
     # without erasing the children's own state.
     _check_state: dict = {}
     _CHECK_DEFAULTS = {"base.imagery": False,     # topo is the startup basemap
-                       "base.hydro": False,       # NHD hydrography overlay: opt-in, off by default
+                       # base.hydro (NHD flowline vectors) defaults ON — absent key = True
                        # Results defaults (revision §8.1): after delineation only the HYPORHEIC
                        # paths + volume show; losing/gaining/throughflow are opt-in.
                        "gw.res.paths.los": False, "gw.res.paths.gain": False,
@@ -5227,8 +5928,10 @@ def server(input, output, session):
                         lyr.visible = on
                     except Exception:  # noqa: BLE001
                         pass
-            else:
-                _set_keys_visible(ui_tree.NODE_LAYERS.get(mid, ()), on)
+            # base nodes fall through to the layers path too: base.hydro drives the
+            # "NHD streams" vector — hiding routes it into _hidden_keys, so each
+            # reach-step viewport refetch parks instead of re-adding (sticky OFF)
+            _set_keys_visible(ui_tree.NODE_LAYERS.get(mid, ()), on)
             out.append(mid)
         _bump_vis()
         return out
@@ -5246,8 +5949,7 @@ def server(input, output, session):
                         lyr.visible = on
                     except Exception:  # noqa: BLE001
                         pass
-            else:
-                _set_keys_visible(ui_tree.NODE_LAYERS.get(nid, ()), on)
+            _set_keys_visible(ui_tree.NODE_LAYERS.get(nid, ()), on)
         _bump_vis()
 
     def _hide_node_layers(nid):
@@ -5355,9 +6057,24 @@ def server(input, output, session):
                 "hype3d_vis", {"key": payload["key"], "on": _eff_checked(nid)})
 
     @reactive.extended_task
-    async def scene_terrain_task(dem_p: str, crs_wkt: str, origin: tuple, z0: float) -> dict:
-        return await anyio.to_thread.run_sync(
-            lambda: scene.terrain_payload(dem_p, crs_wkt, tuple(origin), float(z0)))
+    async def scene_terrain_task(dem_p: str, crs_wkt: str, origin: tuple, z0: float,
+                                 domain_f: dict | None = None) -> dict:
+        def _work():
+            p = dem_p
+            if domain_f is not None:
+                # Clip the 3-D terrain surface to the model domain: nodata outside the
+                # polygon renders as skipped quads client-side, so the surface ends at the
+                # boundary instead of overhanging the whole DEM rectangle. Soft-fail to the
+                # full DEM on any raster hiccup (the 2026-07-16 crash rule).
+                try:
+                    out = work_dir / "scene" / "terrain_domain.tif"
+                    p = dem.clip_dem_to_polygon(dem_p, geometry.single_feature_gdf(domain_f),
+                                                str(out))
+                except Exception as e:  # noqa: BLE001
+                    print(f"[scene] terrain clip failed (using the full DEM): {e}")
+                    p = dem_p
+            return scene.terrain_payload(str(p), crs_wkt, tuple(origin), float(z0))
+        return await anyio.to_thread.run_sync(_work)
 
     @reactive.effect
     def _push_terrain_3d():
@@ -5367,13 +6084,14 @@ def server(input, output, session):
         origin, z0 = _scene_frame()
         if origin is None or scene_terrain_task.status() == "running":
             return
-        sig = (p, origin[0], origin[1])
+        dom = domain_feat()                # domain exists -> clipped surface; regen re-clips
+        sig = (p, origin[0], origin[1], id(dom) if dom else None)
         if _scene.get("terrain_sig") == sig:
             return
         _scene["terrain_sig"] = sig
         crs = _scene["crs"]
         scene_terrain_task(p, crs.to_wkt() if hasattr(crs, "to_wkt") else str(crs),
-                           tuple(origin), float(z0))
+                           tuple(origin), float(z0), dom)
 
     @reactive.effect
     async def _terrain_3d_done():
@@ -5482,8 +6200,9 @@ def server(input, output, session):
             hidden.add("gw.res.hz")            # the Zone group appears after a GW run
             if _task_state(sens_task) == "initial" and sens_result() is None:
                 hidden.add("gw.sens")          # sensitivity surfaces once a run/manifest exists
-        if hz_result() is None:                # Flow-paths + Volumes populate on delineation
-            hidden.update(("gw.res.paths", "gw.res.hz.vols"))   # children drop with their parent
+        if hz_result() is None:                # Flow-paths/Volumes/Flows populate on delineation
+            hidden.update(("gw.res.paths", "gw.res.hz.vols",    # children drop with their parent
+                           "gw.res.hz.flows"))
         dimmed = {nid for nid in ui_tree.NODE_LAYERS
                   if checks.get(nid) and not _eff_checked(nid)}
         payload = ui_tree.build_tree_payload(
@@ -5519,7 +6238,8 @@ def server(input, output, session):
                 await _cascade_clear(nid, include_self=True)
         elif kind == "mapclear":
             # Empty-map click → deselect (clears the props context). Skipped when a map-driven
-            # selection consumed the same click (mirror/boundary/path picks stamp map_sel_ts),
+            # selection consumed the same click (mirror/boundary/path picks and flow-path box
+            # selects stamp map_sel_ts),
             # and while an "add gradient point" click is armed — that click IS the placement
             # (tree.js can't see this state, and near-line clicks land on tiles, not the line;
             # message order vs the widget interaction is not guaranteed).
@@ -5551,7 +6271,9 @@ def server(input, output, session):
             if on and nid in ("base.imagery", "base.topo"):    # base maps act as a radio
                 other = "base.topo" if nid == "base.imagery" else "base.imagery"
                 _check_state[other] = False
-                _apply_check_effective(other)
+                # fold the sibling's nodes into the 3-D vis sync below, or the unticked
+                # basemap's drape key (basemap/basemap_topo) keeps its stale visibility
+                affected = list(affected) + list(_apply_check_effective(other))
             for mid in affected:               # the same checkboxes drive the 3-D scene
                 key3d = ui_tree.NODE_3D.get(mid)
                 if key3d:
@@ -5560,6 +6282,19 @@ def server(input, output, session):
             await _sweep_hz([k for mid in affected if not _eff_checked(mid)
                              for k in ui_tree.NODE_LAYERS.get(mid, ())
                              if k.startswith("hz_") and _layers.get(k) is None])
+            # Hiding a flow-path class drops its paths from the current selection —
+            # the highlight layer and info pane must never report invisible paths.
+            path_nodes = {f"gw.res.paths.{s}" for s in ui_tree.HZ_CLASS_SUFFIX.values()}
+            if path_nodes & set(affected):
+                with reactive.isolate():
+                    pids, gdf = hz_sel_pids(), hz_gdf()
+                if pids and gdf is not None:
+                    vis = [c for c in HZ_CLASSES
+                           if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[c]}")]
+                    sub = gdf[gdf["particleid"].isin(pids) & gdf["hz_class"].isin(vis)]
+                    keep = tuple(int(p) for p in sub["particleid"])
+                    if len(keep) != len(pids):
+                        hz_sel_pids.set(keep)
 
     @output(suspend_when_hidden=False)     # the CARD is display:none until this output fills —
     @render.ui                             # default suspension would deadlock (hidden ⇒ never
@@ -5633,6 +6368,28 @@ def server(input, output, session):
                         "state": state, "active": n == active})
         return out
 
+    def _runmode_chip():
+        """Right-justified run-mode pill: accent "Cloud Run" with the restriction summary on
+        hover, or a grayed "Desktop Run" (no limits). A plain div with no data-jump, so
+        tree.js's delegated click routing ignores it; tabindex gives keyboard users the
+        :focus-within popover."""
+        if runmode.IS_DESKTOP:
+            name, cls = "Desktop Run", "hype-runmode desktop"
+            body = [ui.div("Running locally — the cloud size limits are off.",
+                           class_="hype-runmode-lead"),
+                    ui.div("Mesh, grid, and particle counts are bounded only by this "
+                           "computer's memory.", class_="hype-runmode-note")]
+        else:
+            name, cls = "Cloud Run", "hype-runmode"
+            body = [ui.div("Running on the cloud server — size limits apply:",
+                           class_="hype-runmode-lead"),
+                    ui.tags.ul(*[ui.tags.li(ui.tags.b(f"{k}: "), v)
+                                 for k, v in runmode.cloud_limits()])]
+        return ui.div(ui.span(class_="hype-runmode-glyph"),
+                      ui.span(name, class_="hype-runmode-name"),
+                      ui.div(*body, class_="hype-runmode-pop"),
+                      class_=cls, tabindex="0")
+
     @render.ui
     def stage_bar():
         parts = []
@@ -5645,7 +6402,8 @@ def server(input, output, session):
                 title=("Complete the earlier stages first" if s["state"] == "locked" else None),
                 **{"data-jump": s["node"]}))
             parts.append(ui.span(class_="hype-stage-sep"))
-        return ui.div(*parts[:-1], class_="hype-stagebar")
+        return ui.div(ui.div(*parts[:-1], class_="hype-stagebar-scroll"),
+                      _runmode_chip(), class_="hype-stagebar")
 
     _nav_seen: dict = {}
 
@@ -5935,10 +6693,51 @@ def server(input, output, session):
                     up_feat.set(b["up"]); left_feat.set(b["left"])
                     right_feat.set(b["right"]); down_feat.set(b["down"])
 
+    def _kz_defaults():
+        """Default KH/KV for zones that don't carry their own yet (fresh draws, legacy saves).
+        The old global Zone KH/KV pair lives on in _kept so pre-revision projects keep their
+        effective values."""
+        try:
+            kh = float(_kept.get("kzone_kh") or 50.0)
+        except (TypeError, ValueError):
+            kh = 50.0
+        try:
+            kv = float(_kept.get("kzone_kv") or 5.0)
+        except (TypeError, ValueError):
+            kv = 5.0
+        return {"default_kh": kh, "default_kv": kv}
+
+    _kz_seen: dict = {}
+
+    @reactive.effect
+    def _kz_mirror():
+        # The _gpt_mirror idiom for the per-zone KH/KV numerics: on change, write the value
+        # into the zone Feature's properties IN PLACE — the list never re-sets, so the row
+        # being typed in never remounts and focus never drops.
+        for f in kzone_feats():                    # re-arms when zones are added/removed
+            p = f.get("properties") or {}
+            uid = p.get("uid")
+            if not uid:
+                continue
+            for key, iid in (("KH", f"kz_kh_{uid}"), ("KV", f"kz_kv_{uid}")):
+                try:
+                    v = input[iid]()               # subscribes; SilentException until mounted
+                except Exception:  # noqa: BLE001
+                    continue
+                if v is None or v == _kz_seen.get(iid, _MISSING):
+                    continue
+                _kz_seen[iid] = v
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0:
+                    p[key] = fv
+
     @reactive.effect
     def _kz_buttons():
         # K-zone list management (same strict-increment guard as _clicked_dynamic so props-pane
-        # re-render resets don't fire): Add → arm a guided polygon draw; Remove last / Clear all.
+        # re-render resets don't fire): Add → arm a guided polygon draw; per-row ×; Clear all.
         def _clicked(bid):
             try:
                 n = int(input[bid]() or 0)
@@ -5952,13 +6751,14 @@ def server(input, output, session):
         if _clicked("kz_add"):
             kz_adding.set(True)
             _unhide_node_layers("gw.k")        # drawing into a hidden K-zone layer = invisible
-        if _clicked("kz_rmlast"):
-            kz = list(kzone_feats())
-            if kz:
-                kz.pop()
+        for f in list(kzone_feats()):          # per-row remove buttons (dynamic ids)
+            uid = (f.get("properties") or {}).get("uid")
+            if uid and _clicked(f"kz_rm_{uid}"):
+                kz = [z for z in kzone_feats()
+                      if (z.get("properties") or {}).get("uid") != uid]
                 kzone_feats.set(kz)
                 _load_into_drawcontrol(kz)
-            kz_adding.set(False)
+                kz_adding.set(False)
         if _clicked("kz_clear"):
             kzone_feats.set([])
             _load_into_drawcontrol([])
@@ -6011,6 +6811,25 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.nav_new)
     def _confirm_new_project():
+        if runmode.IS_DESKTOP:
+            # GMS-style: pick the project location up front so every run writes in place.
+            # Hard gate — no unsaved desktop sessions, so the only action is Create.
+            open_note = (ui.p(f"The current project ({Path(_ws['project_file']).name}) keeps "
+                              "its folder. It is saved automatically when you leave it.",
+                              class_="hype-dim")
+                         if _ws["project_file"] else None)
+            ui.modal_show(ui.modal(
+                ui.p("Pick where the project's main .hype file lives. Terrain, model runs, "
+                     "and results save into that folder as you work."),
+                open_note,
+                title="New project",
+                footer=ui.TagList(
+                    ui.modal_button("Cancel"),
+                    ui.input_action_button("confirm_new_create", "Create project…",
+                                           class_="btn-primary"),
+                ),
+                easy_close=True))
+            return
         ui.modal_show(ui.modal(
             ui.p("This clears the reach, terrain, boundaries, model runs, and results in this "
                  "session. Save or download your project first if you want to keep it."),
@@ -6022,11 +6841,21 @@ def server(input, output, session):
             ),
             easy_close=True))
 
-    async def _reset_session_state():
-        """Wipe the session back to first-run — memory, map layers, 3-D scene, AND the
-        workspace dir. Shared by New project and Open project (which re-populates after)."""
+    @reactive.effect
+    async def _new_create():
+        if not _clicked_dynamic("confirm_new_create"):
+            return
+        ui.modal_remove()
+        await _pick_path("new_project", save=True)
+
+    async def _reset_memory_state():
+        """Wipe the in-memory session back to first-run — reactives, map layers, 3-D scene —
+        WITHOUT touching the disk. Callers that own a temp workspace wipe it separately
+        (_reset_session_state); project-folder flows must never wipe the user's folder."""
         # Stop in-flight work first: a straggling done-handler must not repopulate the fresh
         # session, and Windows can't delete files a live child still holds open.
+        _autosave["restoring"] = True
+        session.on_flushed(lambda: _autosave.update(restoring=False), once=True)
         _task_armed.update(gw=False, hz=False, sens=False)
         _terminate_child()
         _kill_ras_proc()
@@ -6044,12 +6873,15 @@ def server(input, output, session):
         dem_path.set(None); dem_meta.set(None)
         dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _drop_gw_artifacts()               # run result + head/grid/WSE layers + the grid preview
+        _set_project_meta(None, None)      # create/open re-establish it (or the gate re-arms)
         stage.set("")
         log_lines.clear(); log_tick.set(0); step_v.set(0)
         hz_result.set(None); hz_gdf.set(None); hz_sel_pids.set(())
         hz_log_lines.clear(); hz_log_tick.set(0); hz_step_v.set(0)
         input_snapshot.set(None); flow_lookup.set(None); flow_source.set(None)
+        usgs_pick_v.set(None); usgs_flow_err.set(None)
         soil_snapshot.set(None); soil_overrides.set([])
+        soil_source.set(None); soil_sel_units.set(frozenset())
         results_model.set(None); report_paths.set(None)
         sens_result.set(None); sens_log_lines.clear(); sens_log_tick.set(0)
         _drop_ras_artifacts(); ras_log_lines.clear(); ras_log_tick.set(0)
@@ -6079,14 +6911,36 @@ def server(input, output, session):
         _kept.pop("grid_wireframe", None)
         ui.update_checkbox("grid_wireframe", value=False)
         view_mode_v.set("2d")
-        # Disk too: leftovers from an opened/previous project must never leak into the next
-        # project's Download (the bundler sweeps work_dir wholesale).
-        for child in work_dir.iterdir():
-            try:
-                shutil.rmtree(child) if child.is_dir() else child.unlink()
-            except OSError:
-                pass
         _bump_vis()
+
+    async def _reset_session_state():
+        """Memory reset + disk wipe for TEMP sessions. Shared by cloud New and cloud Open
+        (which re-populates after). In project-folder mode the wipe is skipped — the folder
+        is the user's data; project flows handle disk explicitly."""
+        await _reset_memory_state()
+        if _ws["project_file"] is None:
+            # Leftovers from an opened/previous project must never leak into the next
+            # project's Download (the bundler sweeps work_dir wholesale).
+            for child in work_dir.iterdir():
+                try:
+                    shutil.rmtree(child) if child.is_dir() else child.unlink()
+                except OSError:
+                    pass
+
+    def _adopt_workspace(folder: Path, main_file: Path | None):
+        """Rebind the session workspace to `folder` (a project folder, or a fresh temp dir
+        when main_file is None). Only called while no task is running — every consumer reads
+        the closure at call time, and engine payloads snapshot str(work_dir) per run. The
+        old dir is deleted only when it was an unsaved temp session (nothing else will)."""
+        nonlocal work_dir
+        old, was_temp = work_dir, _ws["project_file"] is None
+        work_dir = Path(folder)
+        _ws["project_file"] = str(main_file) if main_file else None
+        project_file.set(_ws["project_file"])
+        if runmode.IS_DESKTOP and main_file:
+            recents.touch(main_file)       # welcome-dialog list; swallows its own IO errors
+        if was_temp and old != work_dir:
+            shutil.rmtree(old, ignore_errors=True)
 
     @reactive.effect
     async def _reset():
@@ -6095,7 +6949,9 @@ def server(input, output, session):
             return
         ui.modal_remove()
         await _reset_session_state()
-        _select("reach")
+        # The reset cleared the project name, so the session is logically gated again:
+        # go straight to the name dialog (its Cancel lands on the welcome).
+        _show_new_project_dialog()
 
     @reactive.effect
     @reactive.event(input.nav_help)
@@ -6124,7 +6980,16 @@ def server(input, output, session):
                 "drawn extent. Nothing is saved on the server — **Save** (top right) gives you "
                 "a project file (.hype) to pick up later with **Open**: complete with all "
                 "computed data, or settings-only for a small file. A .hype file is a ZIP "
-                "archive — rename it to .zip to browse the stage folders in GIS."),
+                "archive — rename it to .zip to browse the stage folders in GIS."
+                + ("\n\n**Desktop projects**: HYPE Desktop works in project folders. **New** "
+                   "asks where to put the project's main .hype file, and every stage saves "
+                   "into that folder as you work (terrain, models, results sit next to the "
+                   "main file, like a GMS project). **Save** rewrites the main file in place; "
+                   "settings also autosave after each completed run. **Save As** copies the "
+                   "whole project to a new name or location and switches to it. **Export** "
+                   "makes a portable .hype you can open in the cloud app. Avoid working in "
+                   "two windows on the same folder; the last writer wins."
+                   if runmode.IS_DESKTOP else "")),
             title="Help", easy_close=True))
 
     @reactive.effect
@@ -6171,49 +7036,24 @@ def server(input, output, session):
             "model_origin_elev_m": model_origin_effective(),
             "wse_mode": wse_mode_v(),
             "kzones": {"enabled": bool(_safe("use_kzones", False)),
-                       "kh": float(_safe("kzone_kh", 50.0)),
-                       "kv": float(_safe("kzone_kv", 5.0)),
-                       "count": len(kzone_feats() or [])},
+                       "count": len(kzone_feats() or []),
+                       "zones": [{"label": (f.get("properties") or {}).get("LABEL"),
+                                  "kh": (f.get("properties") or {}).get("KH"),
+                                  "kv": (f.get("properties") or {}).get("KV"),
+                                  "src": (f.get("properties") or {}).get("src")}
+                                 for f in (kzone_feats() or [])]},
             "active_dem": (Path(str(dem_p)).name if dem_p else None),
             "carve_applied": bool(carve_active()),
         }
 
-    # Workspace paths inside the manifest are stored behind this token, work_dir-relative —
-    # a saved session's absolute temp paths are meaningless in the session that reopens it.
-    _WS_TOKEN = "$WORKSPACE$"
-
+    # Workspace paths inside the manifest are stored behind bundle.WS_TOKEN, work_dir-relative —
+    # a saved session's absolute paths are meaningless in the session that reopens it. Thin
+    # closures (not aliases) so both read the CURRENT work_dir after a project-folder rebind.
     def _tokenize_paths(obj):
-        """Deep-copy `obj` with every absolute path under work_dir rewritten to $WORKSPACE$/rel."""
-        base = work_dir.resolve()
-
-        def walk(v):
-            if isinstance(v, dict):
-                return {k: walk(x) for k, x in v.items()}
-            if isinstance(v, (list, tuple)):
-                return [walk(x) for x in v]
-            if isinstance(v, (str, Path)):
-                s = str(v)
-                try:
-                    rp = Path(s)
-                    if rp.is_absolute():
-                        return _WS_TOKEN + "/" + rp.resolve().relative_to(base).as_posix()
-                except (OSError, ValueError):
-                    pass                    # not under the workspace — leave it alone
-                return s
-            return v
-        return walk(obj)
+        return bundle.tokenize_paths(obj, work_dir)
 
     def _detokenize_paths(obj):
-        """Inverse of _tokenize_paths, against THIS session's work_dir."""
-        def walk(v):
-            if isinstance(v, dict):
-                return {k: walk(x) for k, x in v.items()}
-            if isinstance(v, list):
-                return [walk(x) for x in v]
-            if isinstance(v, str) and v.startswith(_WS_TOKEN + "/"):
-                return str(work_dir / v[len(_WS_TOKEN) + 1:])
-            return v
-        return walk(obj)
+        return bundle.detokenize_paths(obj, work_dir)
 
     def _project_state():
         """The session manifest (config/state.json) — everything Open needs that isn't already
@@ -6241,32 +7081,116 @@ def server(input, output, session):
                 "ras_opacity": ras_opacity_v(),
                 "run_result": _tokenize_paths(run_result()),
                 "input_snapshot": input_snapshot(),
-                "flow_lookup": flow_lookup(), "flow_source": flow_source(),
-                "soil_snapshot": soil_snapshot(), "soil_overrides": soil_overrides(),
-                "results_model": results_model(),
-                "sens_result": ({k: v for k, v in (sens_result() or {}).items()
-                                 if k != "running"} or None),
+                # flow/soil/results/sens carry absolute workspace paths (raw_response_paths,
+                # artifact_paths, sens dir/hz_dir) — tokenize them like the other artifact
+                # dicts or a moved/reopened project folder points at dead paths.
+                "flow_lookup": _tokenize_paths(flow_lookup()), "flow_source": flow_source(),
+                "soil_snapshot": _tokenize_paths(soil_snapshot()),
+                "soil_overrides": soil_overrides(),
+                "soil_source": soil_source(),
+                "results_model": _tokenize_paths(results_model()),
+                "sens_result": _tokenize_paths({k: v for k, v in (sens_result() or {}).items()
+                                                if k != "running"} or None),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
                 "hz_result": _tokenize_paths(hz_result()),
                 "wse_used": _tokenize_paths(_wse_used.get("path")),
                 "stale_marks": sorted(_stale_marks()),
+                "project_name": _ws["project_name"],
+                "project_units": (project_meta_v() or {}).get("units")
+                                 or project_meta.UNITS_METRIC,
+                "project_created": (project_meta_v() or {}).get("created"),
                 "kept": dict(_kept),
                 "check_state": dict(_check_state),
                 "hidden_keys": sorted(_hidden_keys),
                 "sel_node": sel_node(), "current_step": current_step(),
             }
 
-    def _stream_bundle(include_computed=True):
+    def _current_vectors():
+        return {"reach": reach_feat(), "upstream": up_feat(), "left": left_feat(),
+                "right": right_feat(), "downstream": down_feat(), "domain": domain_feat(),
+                "wse_extent": wse_extent_feat(), "k_zones": kzone_feats()}
+
+    def _save_project_file() -> bool:
+        """Desktop in-place Save: write the settings-only bundle to the project's main .hype.
+        The desktop_project marker is what classify_bundle keys on — it is written ONLY here,
+        never by the download/export path, so portable copies stay portable."""
+        pf = _ws["project_file"]
+        if not pf:
+            return False
+        with reactive.isolate():
+            bundle.save_bundle_to(work_dir, pf, vectors=_current_vectors(), params=params(),
+                                  run_config=_run_config(),
+                                  state=_project_state() | {"desktop_project": True},
+                                  assessment_input=input_snapshot())
+        return True
+
+    def _gms_export_name() -> str:
+        """Project name sanitized for the GMS file/folder names (Win32-safe)."""
+        stem = _ws["project_name"] or ""
+        if not stem:
+            pf = project_file()
+            stem = Path(pf).stem if pf else ""
+        stem = re.sub(r"[^A-Za-z0-9 _-]+", "_", stem).rstrip(" .")
+        return stem or "hype_project"
+
+    def _build_gms_tree():
+        """Generate the GMS project into a temp dir for bundling.
+
+        Never sinks the save: any export failure becomes GMS/EXPORT_ERROR.txt inside
+        the archive (a mid-download abort would corrupt the user's .hype instead).
+        Returns (tmp_root_to_cleanup, extra_trees_tuple_for_zip_workspace).
+        """
+        tmp = Path(tempfile.mkdtemp(prefix="hype_gms_"))
+        dest = tmp / "gms"
+        dest.mkdir()
+        name = _gms_export_name()
+        porosity = 0.3
+        try:
+            stats = json.loads((work_dir / "summary" / "hz" / "hz_stats.json")
+                               .read_text(encoding="utf-8"))
+            porosity = float(stats["knobs"]["porosity"])
+        except Exception:  # noqa: BLE001 — fall back to the pane input / default
+            try:
+                porosity = float(_safe("porosity", 0.3))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            crs = proj_crs()
+            wkt = crs.to_wkt(version="WKT1_ESRI") if crs is not None else ""
+            res = gms.export_gms_project(
+                work_dir, dest, name=name, crs_wkt_esri=wkt, porosity=porosity,
+                hz_dir=work_dir / "summary" / "hz",
+                log=lambda m: print(f"[gms] {m}", flush=True))
+            for w in res.get("warnings", []):
+                print(f"[gms] {w}", flush=True)
+        except Exception as e:  # noqa: BLE001 — the save must still complete
+            print(f"[gms] export failed: {e!r}", flush=True)
+            shutil.rmtree(dest, ignore_errors=True)
+            dest.mkdir(exist_ok=True)
+            (dest / "EXPORT_ERROR.txt").write_text(
+                "The GMS project could not be generated for this save.\n"
+                f"Reason: {e}\n"
+                "The rest of the archive is complete; re-run the groundwater "
+                "stage and save again to retry.\n", encoding="utf-8")
+        return tmp, (("GMS", dest),)
+
+    def _stream_bundle(include_computed=True, include_gms=False):
         """Build the archive and stream it in 1 MiB chunks — flat egress memory even at
         hundreds of MB."""
-        vectors = {"reach": reach_feat(), "upstream": up_feat(), "left": left_feat(),
-                   "right": right_feat(), "downstream": down_feat(), "domain": domain_feat(),
-                   "wse_extent": wse_extent_feat(), "k_zones": kzone_feats()}
-        path = bundle.zip_workspace(work_dir, vectors=vectors, params=params(),
-                                    run_config=_run_config(), state=_project_state(),
-                                    assessment_input=input_snapshot(),
-                                    include_computed=include_computed)
+        gms_tmp = None
+        extra: tuple = ()
+        if include_gms:
+            gms_tmp, extra = _build_gms_tree()
+        try:
+            path = bundle.zip_workspace(work_dir, vectors=_current_vectors(), params=params(),
+                                        run_config=_run_config(), state=_project_state(),
+                                        assessment_input=input_snapshot(),
+                                        include_computed=include_computed,
+                                        extra_trees=extra)
+        finally:
+            if gms_tmp is not None:
+                shutil.rmtree(gms_tmp, ignore_errors=True)
         try:
             with open(path, "rb") as fh:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):   # 1 MiB — flat egress memory
@@ -6281,40 +7205,128 @@ def server(input, output, session):
         return str(_safe("save_scope", "full")) == "full"
 
     @render.ui
+    def project_badge():
+        if runmode.IS_DESKTOP:
+            pf = project_file()
+            if not pf:
+                return None
+            p = Path(pf)
+            return ui.span(p.stem, class_="hype-project-badge", title=str(p.parent))
+        name = (project_meta_v() or {}).get("name")
+        if not name:
+            return None
+        return ui.span(name, class_="hype-project-badge",
+                       title="Cloud session. Use Save to download the project file.")
+
+    @reactive.effect
+    async def _push_doc_title():
+        # Browser tab title mirrors the project name (the desktop shell titles its own
+        # window via _post_title; a hidden WebView tab title is harmless there).
+        name = (project_meta_v() or {}).get("name")
+        await session.send_custom_message("hype_doc_title", {"title": name})
+
+    @render.ui
     def save_project():
-        if not _has_workspace():
+        pf = project_file()
+        if pf:
+            # Project open (desktop): RAS2025-style trio. Save = in place; Save As = copy
+            # the whole folder and switch to it; Export = portable single-file bundle.
+            return ui.TagList(
+                ui.input_action_link("nav_save", "Save",
+                                     title=f"Save to {Path(pf).name}"),
+                ui.input_action_link("nav_save_as", "Save As…",
+                                     title="Copy the whole project to a new name or "
+                                           "location, then switch to it"),
+                ui.input_action_link("nav_save_copy", "Export…",
+                                     title="Export a portable .hype bundle for sharing "
+                                           "or for the cloud app"))
+        name = (project_meta_v() or {}).get("name")     # cloud: re-render when the name lands
+        if name is None and not _has_workspace():
             return ui.span("Save", class_="hype-nav-dim", title="Nothing to save yet")
         return ui.input_action_link("nav_save", "Save",
-                                    title="Save a project file (.hype) — reopen it with Open "
-                                          "to pick up where you left off")
+                                    title="Download this project as a .hype file. Reopen "
+                                          "it later with Open.")
+
+    def _do_desktop_save():
+        # Hard gate: a desktop session always has a project open, so Save = rewrite the
+        # main .hype in place. No dialog, no download.
+        if not _ws["project_file"]:
+            _ensure_welcome()              # unreachable in practice; never strand the gate
+            return
+        try:
+            _save_project_file()
+            ui.notification_show(f"Saved {Path(_ws['project_file']).name}", duration=4)
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Save failed: {e}", type="error", duration=10)
 
     @reactive.effect
     @reactive.event(input.nav_save)
     def _save_dialog():
+        if runmode.IS_DESKTOP:
+            _do_desktop_save()
+        else:
+            _show_bundle_dialog()
+
+    async def _begin_save_as():
+        """Desktop Save As entry: guard, then route through the native/dev picker. The
+        reply funnels into _on_project_path -> _save_as_project."""
+        if not (runmode.IS_DESKTOP and _ws["project_file"]):
+            return
+        if _busy_tasks():
+            ui.notification_show("A task is still running. Wait for it to finish (or "
+                                 "cancel it) before using Save As.", type="warning",
+                                 duration=6)
+            return
+        await _pick_path("save_as", save=True,
+                         file_name=f"{Path(_ws['project_file']).stem}.hype")
+
+    @reactive.effect
+    @reactive.event(input.nav_save_as)
+    async def _save_as_link():
+        await _begin_save_as()
+
+    @reactive.effect
+    @reactive.event(input.nav_save_copy)
+    def _save_copy_link():
+        _show_bundle_dialog()
+
+    def _show_bundle_dialog():
+        """The scoped .hype download dialog: cloud Save / desktop Export. Same mechanics,
+        mode-specific framing so it is obvious what each mode is producing."""
+        if runmode.IS_DESKTOP:
+            title, btn = "Export portable bundle", "Export .hype"
+            intro = ("This makes a portable .hype copy for sharing or for the cloud app. "
+                     "Your project folder stays where it is; Save and Save As manage it.")
+        else:
+            title, btn = "Save project", "Save project"
+            intro = ("Downloads a .hype file named after your project. Nothing stays on "
+                     "the server, so save before you leave.")
         ui.modal_show(ui.modal(
+            ui.p(intro, class_="hype-instr"),
             ui.input_radio_buttons(
                 "save_scope", None,
                 choices={
                     "full": ui.TagList(
                         ui.tags.b("Complete project"),
                         ui.div("Settings plus all computed data (terrain, water surface, "
-                               "groundwater model, results). Reopens exactly where you "
-                               "left off.", class_="hype-dim")),
+                               "groundwater model, results). Includes an Aquaveo GMS "
+                               "project when a groundwater run exists. Reopens exactly "
+                               "where you left off.", class_="hype-dim")),
                     "light": ui.TagList(
                         ui.tags.b("Settings only"),
-                        ui.div("Reach, boundaries, and all parameters — small file. Terrain "
+                        ui.div("Reach, boundaries, and all parameters (small file). Terrain "
                                "and model runs are re-run after opening.", class_="hype-dim")),
                 },
                 selected=("full" if _save_scope_full() else "light")),
-            ui.div(".hype files are ZIP archives — rename one to .zip to browse its folders "
+            ui.div(".hype files are ZIP archives; rename one to .zip to browse its folders "
                    "in GIS.", class_="hype-instr hype-dim"),
             footer=ui.TagList(
                 ui.modal_button("Cancel"),
                 # The click starts the download client-side; the nonce just tells the server
                 # to close the dialog (removing the modal doesn't cancel the transfer).
-                ui.download_button("dl_save", "Save project", class_="btn-primary btn-sm",
+                ui.download_button("dl_save", btn, class_="btn-primary btn-sm",
                                    onclick="Shiny.setInputValue('save_dl_go', Date.now())")),
-            title="Save project", easy_close=True))
+            title=title, easy_close=True))
 
     @reactive.effect
     @reactive.event(input.save_dl_go)
@@ -6327,11 +7339,21 @@ def server(input, output, session):
     # then. Computing it eagerly lets shiny.js cache the value and apply it the moment the
     # modal's element binds. (The filename lambda + generator still run per download request,
     # so the scope radio is read at click time.)
+    def _download_name() -> str:
+        # Project name when set (sanitized), else the timestamp fallback of old.
+        stem = project_meta.filename_stem(_ws["project_name"] or "",
+                                          f"hype_project_{datetime.now():%Y%m%d_%H%M}")
+        return f"{stem}{'' if _save_scope_full() else '_settings'}.hype"
+
     @output(suspend_when_hidden=False)
-    @render.download(filename=lambda: (f"hype_project_{datetime.now():%Y%m%d_%H%M}"
-                                       f"{'' if _save_scope_full() else '_settings'}.hype"))
+    @render.download(filename=_download_name)
     def dl_save():
-        yield from _stream_bundle(include_computed=_save_scope_full())
+        # GMS rides every Complete save with usable groundwater results (no toggle);
+        # stale or absent GW = exactly today's archive, no GMS folder, no error.
+        include_gms = (_save_scope_full() and run_result() is not None
+                       and "gw" not in _stale_marks())
+        yield from _stream_bundle(include_computed=_save_scope_full(),
+                                  include_gms=include_gms)
 
     # ---- Open project (restore a saved .hype / downloaded project .zip) ----
     _open_seen: dict = {}      # last consumed upload datapath — the file input is re-created
@@ -6345,19 +7367,39 @@ def server(input, output, session):
 
     @reactive.effect
     @reactive.event(input.nav_open)
-    def _open_dialog():
+    async def _open_dialog():
         if _busy_tasks():
             ui.modal_show(ui.modal(
-                ui.p("A task is still running — wait for it to finish (or cancel it) before "
+                ui.p("A task is still running. Wait for it to finish (or cancel it) before "
                      "opening a project."),
                 title="Open project", easy_close=True))
             return
-        ui.modal_show(ui.modal(
+        if runmode.IS_DESKTOP:
+            await _pick_path("open_project", save=False)
+            return
+        _show_open_modal()
+
+    def _show_open_modal():
+        """Cloud Open (upload). Under the startup gate it is not dismissable and carries
+        a Cancel that funnels back to the welcome; once a project exists it behaves like
+        any other dialog."""
+        body = (
             ui.p("Open a saved HYPE project (.hype, or a project .zip saved by an older "
                  "version). This replaces everything in the current session."),
             ui.input_file("open_project", None, accept=[".hype", ".zip"], multiple=False,
-                          button_label="Browse…", placeholder="No file selected", width="100%"),
-            title="Open project", easy_close=True))
+                          button_label="Browse…", placeholder="No file selected",
+                          width="100%"))
+        if _gated():
+            ui.modal_show(ui.modal(*body, title="Open project", easy_close=False,
+                                   footer=ui.input_action_button("open_cancel", "Cancel")))
+        else:
+            ui.modal_show(ui.modal(*body, title="Open project", easy_close=True))
+
+    @reactive.effect
+    def _open_cancel():
+        if _clicked_dynamic("open_cancel"):
+            ui.modal_remove()
+            _ensure_welcome()
 
     @reactive.effect
     @reactive.event(input.open_project)
@@ -6370,28 +7412,40 @@ def server(input, output, session):
             return
         _open_seen["dp"] = dp
         if _busy_tasks():                  # re-check — the modal may have sat open a while
-            ui.notification_show("A task is still running — wait for it to finish before "
+            ui.notification_show("A task is still running. Wait for it to finish before "
                                  "opening a project.", type="warning", duration=6)
             return
+        fb_name = Path(str(up[0].get("name") or "")).stem or None   # pre-metadata fallback
         ui.modal_remove()
         ui.notification_show("Opening project…", duration=None, id="open_prog")
         try:
-            await _apply_project(dp)
-            ui.notification_show("Project opened — pick up where you left off.", duration=6)
+            await _apply_project(dp, fallback_name=fb_name)
+            ui.notification_show("Project opened. Pick up where you left off.", duration=6)
         except bundle.ProjectError as e:
             ui.notification_show(str(e), type="error", duration=10)
+            _ensure_welcome()              # the wipe already ran: re-gate, never strand
         except Exception as e:  # noqa: BLE001 — a failed restore must never kill the session
             ui.notification_show(f"Couldn't open the project: {e}", type="error", duration=10)
+            _ensure_welcome()
         finally:
             ui.notification_remove("open_prog")
 
-    async def _apply_project(zip_path):
+    async def _apply_project(zip_path, *, fallback_name: str | None = None):
         """Restore a saved session: wipe, extract, set every reactive in ONE flush with the
         non-reactive guards stamped, rebuild the raster layers, re-apply saved visibility,
         land on the saved selection. Everything else (tree, stage bar, decor vectors, panes,
         3-D terrain) rehydrates itself from the restored values after the flush."""
         await _reset_session_state()
         payload = bundle.restore_workspace(zip_path, work_dir)
+        await _rehydrate(payload, fallback_name=fallback_name)
+
+    async def _rehydrate(payload: dict, *, fallback_name: str | None = None):
+        """Set every reactive from a restore payload (restore_workspace / restore_in_place /
+        the Save As snapshot). Callers reset memory state first; detokenization runs
+        against the CURRENT work_dir, so this is what heals paths after a rebind.
+        `fallback_name` seeds the project name for pre-metadata bundles (upload stem)."""
+        _autosave["restoring"] = True
+        session.on_flushed(lambda: _autosave.update(restoring=False), once=True)
         st = _detokenize_paths(payload.get("state") or {})
         vec = payload.get("vectors") or {}
 
@@ -6408,7 +7462,7 @@ def server(input, output, session):
         # or _ras_stale_on_edit discards every result being restored right now.
         _ras_inputs_sig["sig"] = tuple(id(f) for f in (b_up, b_left, b_right, b_down))
         wse_extent_feat.set(vec.get("wse_extent"))
-        kzone_feats.set(vec.get("k_zones") or [])
+        kzone_feats.set(vec.get("k_zones") or [])   # re-normalized below, after _kept restores
         gen_r = int(st.get("reach_gen") or (1 if reach else 0))
         gen_d = int(st.get("dem_gen") or 0)
         reach_gen.set(gen_r); dem_gen.set(gen_d)
@@ -6419,11 +7473,22 @@ def server(input, output, session):
         _kept.clear()
         _kept.update(st.get("kept") or {})
         _restore_stamp["t"] = time.monotonic()
+        # project identity: stored name wins, else fallback (upload filename stem). On
+        # desktop the main file's stem IS the name — Save As lands here with the new stem
+        # already adopted, renaming the project; created rides the restored state.
+        _pm = project_meta.meta_from_state(st, fallback_name=fallback_name)
+        if runmode.IS_DESKTOP and _ws["project_file"]:
+            _pm["name"] = Path(_ws["project_file"]).stem
+        _set_project_meta(_pm["name"], _pm["created"], _pm["units"])
         # gradient boundary conditions: migrate legacy kept modes (4-corner, structured text)
         # onto the points model in place; a saved grad_pts list always wins over legacy text
         from hype_app import gradients as _grad_mod
         grad_pts.set(_grad_mod.migrate_kept_gradients(_kept, st.get("grad_pts")))
         grad_adding.set(None)
+        # K-zones from pre-per-zone-K saves are bare geometry: give them uids + the save's
+        # effective global Zone KH/KV pair (now in _kept) so nothing changes value.
+        with reactive.isolate():
+            kzone_feats.set(geometry.normalize_kzone_features(kzone_feats(), **_kz_defaults()))
         _rs_ov = st.get("ref_slope_override")
         ref_slope_override.set(float(_rs_ov) if _rs_ov is not None else None)
 
@@ -6449,9 +7514,10 @@ def server(input, output, session):
                 if carve_active():
                     _show_carve_overlay(cm)
 
-        # water surface
-        if st.get("wse_mode") in ("model", "draw", "upload"):
-            wse_mode_v.set(st["wse_mode"])
+        # water surface — a saved wse_mode is ignored: the draw/upload paths were removed from
+        # the UI and the reset above already pinned "model". Restored wse_extent/wse artifacts
+        # are harmless (every consumer is mode-guarded); an old draw/upload project just needs
+        # a surface-model run before its next groundwater run.
         ras_opacity_v.set(float(st.get("ras_opacity") or 0.7))
         rr = st.get("ras_result")
         if rr and rr.get("depth_tif") and Path(rr["depth_tif"]).is_file():
@@ -6479,26 +7545,32 @@ def server(input, output, session):
             _kept["site_date"] = str(_site["assessment_date"])
         flow_lookup.set(st.get("flow_lookup"))
         flow_source.set(st.get("flow_source"))
-        _soil = st.get("soil_snapshot")
-        soil_snapshot.set(_soil)
+        soil_snapshot.set(st.get("soil_snapshot"))
         soil_overrides.set(st.get("soil_overrides") or [])
+        soil_source.set(st.get("soil_source"))
+        soil_sel_units.set(frozenset((st.get("soil_source") or {}).get("units") or []))
         results_model.set(st.get("results_model"))
         # Settings-only archives carry no model/sensitivity files — those stages come back
-        # not-done rather than "done" with nothing on disk. Gate on what restore_workspace
-        # actually extracted, NOT on a disk probe: right after the session wipe, Windows can
-        # keep just-deleted dirs visible (delete-pending) until their handles drain.
-        _restored = payload.get("restored") or set()
-        sens_result.set(st.get("sens_result")
-                        if any(p.startswith("sensitivity/") for p in _restored) else None)
-        if _soil and _HAS_MAP:
-            _show_soils_layer(_soil)
-        rn = st.get("run_result")
-        if rn and any(p.startswith("model/gwf_workspace/") for p in _restored):
-            run_result.set(rn)
+        # not-done rather than "done" with nothing on disk. After an EXTRACTION, gate on what
+        # restore_workspace actually wrote, NOT a disk probe: right after the session wipe,
+        # Windows can keep just-deleted dirs visible (delete-pending) until their handles
+        # drain. An in-place open (restored is None) deleted nothing, so there the sibling
+        # folders on disk ARE the truth.
+        _restored = payload.get("restored")
+
+        def _present(rel: str) -> bool:
+            if _restored is not None:
+                return any(p.startswith(rel) for p in _restored)
+            d = work_dir / rel.rstrip("/")
             try:
-                fp_stats.set(results.flowpath_stats(rn, work_dir))
-            except Exception:  # noqa: BLE001
-                fp_stats.set(None)
+                return d.is_dir() and next(d.iterdir(), None) is not None
+            except OSError:
+                return False
+
+        sens_result.set(st.get("sens_result") if _present("sensitivity/") else None)
+        rn = st.get("run_result")
+        if rn and _present("model/gwf_workspace/"):
+            run_result.set(rn)
             if _HAS_MAP:
                 try:
                     _show_run_layers(rn)
@@ -6538,6 +7610,610 @@ def server(input, output, session):
                 await session.send_custom_message("hype_fly", {"bounds": b})
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- Desktop project folders (runmode.IS_DESKTOP) ----------------------------------
+    # GMS-style: the folder holding the main .hype IS the workspace — sessions run in place,
+    # Save rewrites the main file, nothing is deleted on close. Native pickers come from the
+    # shell bridge (www/desktop_bridge.js ↔ MainForm); in a plain dev browser the bridge is
+    # absent and a typed-path modal stands in. Every rebind requires _busy_tasks() empty —
+    # ExtendedTasks hold a captured str(work_dir).
+    _PROJECT_DIRS = bundle.PROJECT_DIRS    # folder-layout contract lives in bundle.py
+    _pending_pick: dict = {}       # purpose of the in-flight picker / fallback modal
+    _pending_import: dict = {}     # source .hype awaiting an import-target choice
+
+    def _shell_present() -> bool:
+        return bool(_safe("desktop_shell", None))
+
+    # One log line when the shell bridge attaches — lands in the shell's hype.log, so
+    # "did native-dialog detection work?" is answerable from logs alone.
+    _bridge_seen: dict = {}
+
+    @reactive.effect
+    @reactive.event(input.desktop_shell)
+    async def _bridge_attached():
+        if input.desktop_shell() and not _bridge_seen.get("logged"):
+            _bridge_seen["logged"] = True
+            print("[desktop] shell bridge attached", flush=True)
+        # Re-assert the window title on every (re)attach — after a WebView reload the shell
+        # still shows the lost session's project title. Idempotent (empty title = app name).
+        await _post_title()
+
+    async def _post_title():
+        """Window title follows the open project (shell builds show '<name> — HYPE Desktop')."""
+        if _shell_present():
+            pf = _ws["project_file"]
+            await session.send_custom_message(
+                "hype_desktop", {"type": "setTitle", "title": Path(pf).stem if pf else ""})
+
+    def _warn_path_advisories(folder: Path):
+        s = str(folder)
+        if len(s) > 140:
+            ui.notification_show("That path is quite long. The solvers can hit the Windows "
+                                 "260-character limit inside deeply nested model folders; a "
+                                 "shorter path is safer.", type="warning", duration=8)
+        od = os.environ.get("OneDrive") or os.environ.get("OneDriveConsumer")
+        if od:
+            try:
+                Path(s).resolve().relative_to(Path(od).resolve())
+                ui.notification_show("That folder is inside OneDrive. Pause syncing during "
+                                     "model runs (sync locks can break solver writes).",
+                                     type="warning", duration=8)
+            except (ValueError, OSError):
+                pass
+
+    # ---- Startup gate: RAS2025-style welcome dialog (both run modes) -------------------
+    # Hard gate by design: the user must create or open a project before entering the app.
+    # Desktop: a project = a folder (model runs are heavy; everything saves in place), so
+    # there is no unsaved desktop session. Cloud: a project = a name (nothing persists
+    # server-side; the name titles the session and the Save download). Every cancel/error
+    # exit from the project dialogs funnels back via _ensure_welcome, so a project-less
+    # session is never left dialog-less.
+    _welcome = {"recents": []}     # snapshot behind the rendered rows (onclick idx → path)
+
+    def _gated() -> bool:
+        if runmode.IS_DESKTOP:
+            return _ws["project_file"] is None
+        return _ws["project_name"] is None
+
+    def _ensure_welcome():
+        if _gated():
+            _show_welcome()
+
+    def _welcome_when(iso: str) -> str:
+        try:
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            secs = (datetime.now(timezone.utc) - dt).total_seconds()
+        except ValueError:
+            return ""
+        if secs < 90:
+            return "just now"
+        if secs < 3600:
+            return f"{int(secs // 60)} min ago"
+        if secs < 172800:
+            return f"{int(secs // 3600)} h ago"
+        if secs < 86400 * 14:
+            return f"{int(secs // 86400)} days ago"
+        return dt.astimezone().strftime("%b %d, %Y")
+
+    def _show_welcome():
+        # Minimal splash (user call): wordmark + two actions + recents, zero body copy,
+        # no Bootstrap title bar. The recents block is omitted entirely when empty
+        # (cloud always: a Cloud Run container has no meaningful recents to offer).
+        items = recents.load()[:8] if runmode.IS_DESKTOP else []
+        _welcome["recents"] = items
+        recent_block: tuple = ()
+        if items:
+            recent_block = (
+                ui.div("Recent Projects", class_="hype-sec"),
+                ui.div(*[
+                    ui.tags.button(
+                        ui.span(it["name"], class_="hype-welcome-name"),
+                        ui.span(str(Path(it["path"]).parent), class_="hype-welcome-dir"),
+                        ui.span(_welcome_when(it["last_opened"]), class_="hype-welcome-when"),
+                        type="button", class_="hype-welcome-row", title=it["path"],
+                        # idx only — never a path — goes into inline JS (backslash-escape trap)
+                        onclick=f"Shiny.setInputValue('welcome_recent', "
+                                f"{{i: {i}, n: Date.now()}}, {{priority: 'event'}})")
+                    for i, it in enumerate(items)], class_="hype-welcome-list"),
+            )
+        ui.modal_show(ui.modal(
+            ui.div(
+                ui.div(ui.span("HYPE", class_="hype-welcome-mark"),
+                       ui.div("Hyporheic Exchange Explorer", class_="hype-welcome-sub"),
+                       class_="hype-welcome-brand"),
+                ui.div(_evt_btn("welcome_new", "New Project", "btn-primary"),
+                       _evt_btn("welcome_open", "Open Project", "btn-outline-secondary"),
+                       class_="hype-welcome-actions"),
+                *recent_block,
+                class_="hype-welcome"),
+            title=None,
+            footer=None,
+            easy_close=False))
+
+    def _show_new_project_dialog():
+        """Cloud New Project: a name is all a browser session needs (there is no folder).
+        Hard-gated like the welcome — Cancel funnels back there."""
+        ui.modal_show(ui.modal(
+            ui.input_text("new_project_name", "Project name", width="100%",
+                          placeholder="e.g. Mink Creek"),
+            ui.div(f"Units: {project_meta.UNIT_LABELS[project_meta.UNITS_METRIC]}. "
+                   "Unit selection is locked in this version.",
+                   class_="hype-instr hype-dim"),
+            ui.p("Nothing is stored on the server. Use Save to download your project as "
+                 "a .hype file when you finish.", class_="hype-instr hype-dim"),
+            title="New project",
+            footer=ui.TagList(
+                ui.input_action_button("new_project_cancel", "Cancel"),
+                ui.input_action_button("new_project_create", "Create project",
+                                       class_="btn-primary")),
+            easy_close=False))
+
+    @reactive.effect
+    def _new_project_cancel():
+        if _clicked_dynamic("new_project_cancel"):
+            ui.modal_remove()
+            _ensure_welcome()
+
+    @reactive.effect
+    async def _new_project_create():
+        if not _clicked_dynamic("new_project_create"):
+            return
+        name = str(_safe("new_project_name", "") or "").strip()
+        if not name:
+            ui.notification_show("Enter a project name.", type="warning", duration=4)
+            return                         # modal stays up for another try
+        ui.modal_remove()
+        await _reset_session_state()       # no-op on a virgin session; makes the entry
+        #                                    identical after the destructive-New confirm
+        _set_project_meta(name, datetime.now().isoformat(timespec="seconds"))
+        _select("reach")
+        ui.notification_show(f"Created {name}", duration=5)
+
+    @reactive.effect
+    @reactive.event(input.welcome_new)
+    async def _welcome_new():
+        if runmode.IS_DESKTOP:
+            await _pick_path("new_project", save=True)
+        else:
+            _show_new_project_dialog()
+
+    @reactive.effect
+    @reactive.event(input.welcome_open)
+    async def _welcome_open():
+        if runmode.IS_DESKTOP:
+            await _pick_path("open_project", save=False)
+        else:
+            _show_open_modal()
+
+    @reactive.effect
+    @reactive.event(input.welcome_recent)
+    async def _welcome_recent():
+        msg = input.welcome_recent() or {}
+        try:
+            it = _welcome["recents"][int(msg.get("i"))]
+        except (TypeError, ValueError, IndexError):
+            return
+        p = Path(it["path"])
+        if not p.is_file():
+            ui.notification_show("That project file is no longer there.", type="warning",
+                                 duration=6)
+            _show_welcome()            # rebuilt list — the vanished entry prunes out
+            return
+        await _on_project_path("open_project", p)
+
+    _welcome_shown: dict = {}
+
+    @reactive.effect
+    def _welcome_gate():
+        # One-shot per session. A reconnect is a fresh server session in Shiny, so every
+        # real page load re-gates (including a mid-work reload that lost the project); it
+        # can never pop over a live project — nothing returns the gate condition to True
+        # without immediately presenting the next dialog itself (cloud New resets straight
+        # into the name dialog).
+        if _welcome_shown.get("done"):
+            return
+        _welcome_shown["done"] = True
+        with reactive.isolate():
+            if _gated():
+                _show_welcome()
+
+    async def _pick_path(purpose: str, *, save: bool, file_name: str | None = None):
+        """Ask for a .hype path: native dialog via the shell bridge when present, else a
+        typed-path modal (dev browser). Replies funnel into _on_project_path."""
+        _pending_pick["purpose"] = purpose
+        shell = _shell_present()
+        print(f"[desktop] picker: {'native' if shell else 'fallback'} ({purpose})", flush=True)
+        if shell:
+            await session.send_custom_message("hype_desktop", {
+                "type": "pickProjectSave" if save else "pickProjectOpen",
+                "purpose": purpose, "fileName": file_name or "Project1.hype"})
+            return
+        ui.modal_show(ui.modal(
+            ui.p("Type the full path for the project's main .hype file. Its folder becomes "
+                 "the project folder." if save else
+                 "Type the full path of the project's main .hype file."),
+            ui.input_text("dev_pick_path", None, width="100%",
+                          placeholder=r"D:\Projects\SiteA\SiteA.hype"),
+            footer=ui.TagList(
+                ui.input_action_button("dev_pick_cancel", "Cancel"),
+                ui.input_action_button("dev_pick_go", "OK", class_="btn-primary")),
+            title="Project path", easy_close=not _gated()))
+
+    @reactive.effect
+    def _dev_pick_cancel():
+        if _clicked_dynamic("dev_pick_cancel"):
+            ui.modal_remove()
+            _ensure_welcome()
+
+    @reactive.effect
+    async def _dev_pick():
+        if not _clicked_dynamic("dev_pick_go"):
+            return
+        raw = str(_safe("dev_pick_path", "") or "").strip().strip('"')
+        ui.modal_remove()
+        if not raw:
+            _ensure_welcome()
+            return
+        p = Path(raw)
+        if not p.is_absolute():
+            ui.notification_show("Enter an absolute path (e.g. D:\\Projects\\SiteA\\SiteA.hype).",
+                                 type="warning", duration=6)
+            _ensure_welcome()
+            return
+        await _on_project_path(str(_pending_pick.get("purpose") or ""), p)
+
+    @reactive.effect
+    @reactive.event(input.desktop_pick)
+    async def _desktop_picked():
+        msg = input.desktop_pick() or {}
+        if msg.get("cancelled") or not msg.get("path"):
+            # Native dialog dismissed. Under the startup gate the welcome dialog is usually
+            # still on screen (a self-replace is harmless); the one exception it rescues is
+            # the import_target hop, whose flow removed the import modal before picking.
+            _ensure_welcome()
+            return
+        await _on_project_path(str(msg.get("purpose") or ""), Path(str(msg["path"])))
+
+    async def _on_project_path(purpose: str, p: Path):
+        if not runmode.IS_DESKTOP:
+            return
+        if _busy_tasks():                  # re-check — a native dialog can sit open a while
+            ui.notification_show("A task is still running. Wait for it to finish (or cancel "
+                                 "it) first.", type="warning", duration=6)
+            return                         # any open modal (welcome included) stays up
+        ui.modal_remove()                  # clear the welcome / fallback dialog for dispatch
+        try:
+            if purpose == "new_project":
+                await _create_project(p)
+            elif purpose == "open_project":
+                await _open_project_path(p)
+            elif purpose == "import_target":
+                await _import_bundle_to(p)
+            elif purpose == "save_as":
+                await _save_as_project(p)
+        except bundle.ProjectError as e:
+            ui.notification_show(str(e), type="error", duration=10)
+            _ensure_welcome()
+        except Exception as e:  # noqa: BLE001 — a failed project op must never kill the session
+            ui.notification_show(f"Project operation failed: {e}", type="error", duration=10)
+            _ensure_welcome()
+
+    def _as_hype(p: Path) -> Path:
+        return p if p.suffix.lower() == ".hype" else p.with_suffix(".hype")
+
+    def _show_clash_modal(purpose: str, main_file: Path, names: list[str], foreign: bool):
+        """The picked folder already holds HYPE content. RAS2025 refuses non-empty targets
+        outright; our adaptation offers its fix (a fresh stem-named subfolder) as the
+        primary action but keeps an explicit override. `purpose` ("new_project",
+        "import_target", or "save_as") picks which dispatcher the confirm buttons
+        re-enter; Cancel funnels back to the welcome gate. Everything before
+        confirmation is read-only."""
+        sub = bundle.clash_subfolder(main_file)
+        _pending_pick["clash"] = {"purpose": purpose, "path": str(main_file),
+                                  "sub": str(sub)}
+        shown = sorted(names)
+        listed = ", ".join(shown[:6]) + (f" and {len(shown) - 6} more"
+                                         if len(shown) > 6 else "")
+        head = (f"This folder already holds another HYPE project ({listed})."
+                if foreign else
+                f"This folder already contains HYPE project files ({listed}).")
+        if purpose == "import_target":
+            risk = ("Importing here would extract this project's files over it right away."
+                    if foreign else
+                    "Importing here would overwrite matching files right away.")
+        elif purpose == "save_as":
+            risk = ("Saving the copy here would mix it with that project; model runs from "
+                    "one would overwrite the other's files."
+                    if foreign else
+                    "Saving the copy here would overwrite matching files right away.")
+        else:
+            risk = ("Projects in one folder share the same content folders, so model runs "
+                    "from one project would overwrite the other's files."
+                    if foreign else
+                    "Model runs in the new project can overwrite them.")
+        ui.modal_show(ui.modal(
+            ui.p(f"{head} {risk}"),
+            ui.p("Create subfolder keeps this project separate. It will be created at:"),
+            ui.div(ui.tags.code(str(sub)), style="word-break: break-all;"),
+            title="Folder isn't empty",
+            footer=ui.TagList(
+                ui.input_action_button("create_cancel", "Cancel"),
+                ui.input_action_button("confirm_create_anyway", "Use this folder anyway",
+                                       class_="btn-danger"),
+                ui.input_action_button("confirm_create_subfolder", "Create subfolder",
+                                       class_="btn-primary")),
+            easy_close=not _gated()))
+
+    async def _create_project(main_file: Path, *, confirmed: bool = False):
+        main_file = _as_hype(main_file)
+        folder = main_file.parent
+        names, foreign = bundle.folder_clash(folder, main_file)
+        if names and not confirmed:
+            _show_clash_modal("new_project", main_file, names, foreign)
+            return
+        _warn_path_advisories(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        if _ws["project_file"]:
+            try:
+                _save_project_file()       # parting save of the project we're leaving
+            except Exception:  # noqa: BLE001
+                pass
+        await _reset_memory_state()
+        _adopt_workspace(folder, main_file)
+        _set_project_meta(main_file.stem,  # stamped once, at creation; the stem IS the name
+                          datetime.now().isoformat(timespec="seconds"))
+        _save_project_file()               # the folder has its main file from minute one
+        await _post_title()
+        _select("reach")
+        ui.notification_show(f"Created {main_file.name}", duration=5)
+
+    @reactive.effect
+    def _create_cancel():
+        if _clicked_dynamic("create_cancel"):
+            ui.modal_remove()
+            _pending_pick.pop("clash", None)
+            _pending_import.pop("src", None)   # a cancelled import clash ends the import
+            _ensure_welcome()
+
+    @reactive.effect
+    async def _create_anyway():
+        if not _clicked_dynamic("confirm_create_anyway"):
+            return
+        ui.modal_remove()
+        st = _pending_pick.pop("clash", None)
+        if not st:
+            _ensure_welcome()
+            return
+        try:
+            if st["purpose"] == "import_target":
+                await _import_bundle_to(Path(st["path"]), confirmed=True)
+            elif st["purpose"] == "save_as":
+                await _save_as_project(Path(st["path"]), confirmed=True)
+            else:
+                await _create_project(Path(st["path"]), confirmed=True)
+        except bundle.ProjectError as e:   # same net as _on_project_path — an unhandled
+            ui.notification_show(str(e), type="error", duration=10)      # effect exception
+            _ensure_welcome()                                            # kills the session
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Project operation failed: {e}", type="error", duration=10)
+            _ensure_welcome()
+
+    @reactive.effect
+    async def _create_subfolder():
+        if not _clicked_dynamic("confirm_create_subfolder"):
+            return
+        ui.modal_remove()
+        st = _pending_pick.pop("clash", None)
+        if not st:
+            _ensure_welcome()
+            return
+        try:
+            # Dispatched UNCONFIRMED on purpose: the clash check re-runs against the
+            # subfolder, so the dialog simply reappears (deeper path shown) if that
+            # one is occupied too. Zero disk effects until a clean or confirmed pass.
+            if st["purpose"] == "import_target":
+                await _import_bundle_to(Path(st["sub"]))
+            elif st["purpose"] == "save_as":
+                await _save_as_project(Path(st["sub"]))
+            else:
+                await _create_project(Path(st["sub"]))
+        except bundle.ProjectError as e:
+            ui.notification_show(str(e), type="error", duration=10)
+            _ensure_welcome()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Project operation failed: {e}", type="error", duration=10)
+            _ensure_welcome()
+
+    async def _open_project_path(p: Path):
+        if not p.is_file():
+            ui.notification_show("That file doesn't exist.", type="error", duration=6)
+            _ensure_welcome()
+            return
+        if bundle.classify_bundle(p) == "project":
+            await _open_in_place(p)
+            return
+        # A portable bundle (cloud save / export): its content lives inside the zip. Hard
+        # gate — no "open temporarily"; it lands in a project folder or not at all.
+        _pending_import["src"] = str(p)
+        sibs = any((p.parent / d).is_dir() for d in _PROJECT_DIRS)
+        ui.modal_show(ui.modal(
+            ui.p(f"“{p.name}” is a portable project file. Import it into a project folder "
+                 "to work on it here."),
+            title="Open project file",
+            footer=ui.TagList(
+                ui.input_action_button("import_cancel", "Cancel"),
+                *([ui.input_action_button("import_open_here", "Open in place here")]
+                  if sibs else []),
+                ui.input_action_button("import_to_folder", "Import into a project…",
+                                       class_="btn-primary")),
+            easy_close=not _gated()))
+
+    async def _open_in_place(main_file: Path, *, stamp: bool = False):
+        payload = bundle.restore_in_place(main_file)   # parse/validate BEFORE any reset —
+        #                                  a corrupt file must never cost the live session
+        if _ws["project_file"] and _ws["project_file"] != str(main_file):
+            try:
+                _save_project_file()                   # parting save of the old project
+            except Exception:  # noqa: BLE001
+                pass
+        await _reset_memory_state()
+        _adopt_workspace(main_file.parent, main_file)
+        await _rehydrate(payload)
+        if stamp:
+            _save_project_file()   # unmarked file opened in place by choice: stamp the marker
+        await _post_title()
+        ui.notification_show(f"Opened {main_file.name}", duration=5)
+
+    @reactive.effect
+    def _import_cancel():
+        if _clicked_dynamic("import_cancel"):
+            ui.modal_remove()
+            _pending_import.pop("src", None)
+            _ensure_welcome()
+
+    @reactive.effect
+    async def _import_to_folder():
+        if not _clicked_dynamic("import_to_folder"):
+            return
+        ui.modal_remove()
+        await _pick_path("import_target", save=True)
+
+    @reactive.effect
+    async def _import_open_here():
+        if not _clicked_dynamic("import_open_here"):
+            return
+        ui.modal_remove()
+        src = _pending_import.pop("src", None)
+        if not src:
+            _ensure_welcome()
+            return
+        try:
+            await _open_in_place(Path(src), stamp=True)
+        except bundle.ProjectError as e:   # corrupt file must not kill the session (or gate)
+            ui.notification_show(str(e), type="error", duration=10)
+            _ensure_welcome()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Couldn't open the project: {e}", type="error", duration=10)
+            _ensure_welcome()
+
+    async def _import_bundle_to(target_main: Path, *, confirmed: bool = False):
+        target_main = _as_hype(target_main)
+        folder = target_main.parent
+        if not _pending_import.get("src"):     # stale dispatch: nothing left to import
+            _ensure_welcome()
+            return
+        # Gate BEFORE extraction: restore_workspace writes content dirs immediately, so
+        # an occupied folder must be confirmed first. src stays stashed across the modal
+        # round-trip and is consumed exactly once, at the proceed point below.
+        names, foreign = bundle.folder_clash(folder, target_main)
+        if names and not confirmed:
+            _show_clash_modal("import_target", target_main, names, foreign)
+            return
+        src = _pending_import.pop("src")
+        _warn_path_advisories(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        ui.notification_show("Importing project…", duration=None, id="open_prog")
+        try:
+            # Extract into the NEW folder first — non-destructive to the current session.
+            payload = bundle.restore_workspace(src, folder)
+            if _ws["project_file"]:
+                try:
+                    _save_project_file()
+                except Exception:  # noqa: BLE001
+                    pass
+            await _reset_memory_state()
+            _adopt_workspace(folder, target_main)
+            await _rehydrate(payload)
+            _save_project_file()
+            await _post_title()
+            ui.notification_show(f"Imported {target_main.name} into {folder.name}",
+                                 duration=6)
+        finally:
+            ui.notification_remove("open_prog")
+
+    async def _save_as_project(target_main: Path, *, confirmed: bool = False):
+        """Desktop Save As: copy the WHOLE project (content dirs + a fresh main .hype) to a
+        new name/location, then switch to it. Copy is two-phase (copy, then reset+rebind+
+        rehydrate) so a failure leaves the current project fully intact; _rehydrate
+        detokenizes the snapshot against the NEW work_dir, healing every cached absolute
+        path, and its stem-sync renames the project to the new stem."""
+        src_main = _ws["project_file"]
+        if not src_main:
+            _ensure_welcome()
+            return
+        target_main = _as_hype(target_main)
+        folder = target_main.parent
+        same_folder = False
+        try:
+            if target_main.resolve() == Path(src_main).resolve():
+                _do_desktop_save()         # picked the current file: that IS a plain Save
+                return
+            same_folder = folder.resolve() == work_dir.resolve()
+        except OSError:
+            pass
+        if same_folder:
+            ui.notification_show("Pick a different folder. Two projects can't share one "
+                                 "folder; their model runs would overwrite each other's "
+                                 "files.", type="warning", duration=8)
+            return
+        names, foreign = bundle.folder_clash(folder, target_main)
+        if names and not confirmed:
+            _show_clash_modal("save_as", target_main, names, foreign)
+            return
+        if _busy_tasks():                  # the clash modal may have sat open a while
+            ui.notification_show("A task is still running. Wait for it to finish (or "
+                                 "cancel it) before using Save As.", type="warning",
+                                 duration=6)
+            return
+        _warn_path_advisories(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            _save_project_file()           # parting save: the copy carries latest settings
+        except Exception:  # noqa: BLE001
+            pass
+        with reactive.isolate():
+            payload = {"state": _project_state(), "vectors": _current_vectors(),
+                       "params": params(), "run_config": _run_config(),
+                       "assessment_input": input_snapshot(), "scoring_profile": None,
+                       "extracted": 0, "restored": None}
+        ui.notification_show("Copying project files…", duration=None, id="saveas_prog")
+        try:
+            bundle.copy_project_tree(work_dir, folder)
+        except OSError as e:
+            # copy_project_tree already rolled back the dirs it created fresh; we are
+            # still bound to the old project, fully intact.
+            ui.notification_show(f"Couldn't copy the project: {e}", type="error",
+                                 duration=10)
+            return
+        finally:
+            ui.notification_remove("saveas_prog")
+        await _reset_memory_state()
+        _adopt_workspace(folder, target_main)      # old folder is a project — left intact
+        await _rehydrate(payload)                  # heals paths; stem-sync renames project
+        _save_project_file()                       # the NEW main file, freshly stamped
+        await _post_title()
+        ui.notification_show(f"Saved as {target_main.name}. You are now working in "
+                             f"{folder}.", duration=6)
+
+    # Autosave (desktop, project open): each completed stage writes the small main file, so
+    # closing without Save loses at most a few clicks. The subscriptions below are exactly
+    # the reactives the done-handlers set; effects batch per flush, so one completion = one
+    # save. Restores flip _autosave["restoring"] and clear it on_flushed → zero saves.
+    @reactive.effect
+    def _autosave_on_results():
+        if not runmode.IS_DESKTOP:
+            return
+        _ = (reach_feat(), dem_path(), carve_meta(), ras_result(), run_result(), hz_result(),
+             sens_result(), soil_snapshot(), flow_lookup(), results_model(), input_snapshot(),
+             wse_extent_feat())
+        if _ws["project_file"] is None or _autosave["restoring"]:
+            return
+        try:
+            _save_project_file()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Autosave failed: {e}", type="warning", duration=6)
 
     # ---- properties panes (right panel): one builder per tree node; bodies are the former
     # left-pane step branches, verbatim (they close over the server-scope reactives) ----
@@ -6644,6 +8320,10 @@ def server(input, output, session):
                 hint = "Draw the line on the map (click to place vertices, double-click to finish)."
             else:
                 hint = "Selecting this boundary starts an edit on the map."
+            conflict = next((c for c in bnd_conflicts() if c["slot"] == slot), None)
+            if conflict is not None:
+                rows.append(ui.div(conflict["msg"] + " Model runs are blocked until this "
+                                   "is fixed.", class_="hype-card err"))
             return ui.TagList(
                 ui.div(hint, class_="hype-instr"), *rows,
                 ui.div(ui.input_action_button("bnd_clear_side", "Clear & redraw",
@@ -6654,103 +8334,73 @@ def server(input, output, session):
 
     def _pane_sw():
             with reactive.isolate():          # persisted prefill only; a live (subscribing) read
-                wse_mode0 = wse_mode_v()      # here would re-render this pane on every radio change
-                slope0 = ras_slope_default()
+                slope0 = ras_slope_default()  # here would re-render this pane on every change
             return ui.TagList(
                 # Canonical streamflow — always available (used by the RAS model AND, later, the
-                # hyporheic connectivity metric) regardless of how the water surface is set (§5.1).
+                # hyporheic connectivity metric) (§5.1). Get USGS Flow opens the review modal.
                 ui.div(
                     ui.input_numeric("ras_flow", "Streamflow (cfs)", value=_keep("ras_flow", 100.0),
                                      min=0.1, step=10.0),
                     ui.input_action_button("get_usgs_flow", "Get USGS Flow",
                                            class_="btn-outline-primary btn-sm"),
-                    ui.output_ui("flow_source_note"),
                     class_="hype-flow-input"),
-                _usgs_section(),
-                ui.input_radio_buttons(
-                    "wse_mode", "Water surface (top boundary)",
-                    {"model": "Modeled — HEC-RAS 2D (below)",
-                     "draw": "Wetted extent (auto / drawn)",
-                     "upload": "Upload a WSE raster"},
-                    selected=(wse_mode0 or "model")),
-                ui.panel_conditional(
-                    "input.wse_mode === 'upload'",
-                    ui.input_file("wse_upload", "WSE GeoTIFF", accept=[".tif", ".tiff"],
-                                  multiple=False)),
-                ui.panel_conditional(
-                    "input.wse_mode === 'draw'",
-                    ui.div("The wetted extent derives from the DEM automatically; select "
-                           "Wetted extent in the tree to review or redraw it.",
-                           class_="hype-instr")),
-                # RAS setup renders ONLY in "model" mode — the parameters mean nothing for a
-                # drawn/uploaded water surface and previously sat there as clutter.
-                ui.panel_conditional(
-                    "input.wse_mode === 'model'",
-                    ui.div("Runs a HEC-RAS 2D model over the domain (steady inflow → "
-                           "normal-depth outflow) using the streamflow above; its water surface "
-                           "becomes the top boundary.", class_="hype-instr"),
-                    ui.input_numeric("ras_slope", "Normal-depth friction slope",
-                                     value=_keep("ras_slope",
-                                                 round(slope0, 5) if slope0 else 0.001),
-                                     min=0.00001, step=0.0005),
-                    ui.input_numeric("ras_n", "Manning's n", value=_keep("ras_n", 0.06),
-                                     min=0.01, max=0.2, step=0.005),
-                    ui.input_numeric("ras_cell", "Mesh cell size (m)",
-                                     value=_keep("ras_cell", 10.0), min=1.0, step=1.0),
-                    ui.accordion(
-                        ui.accordion_panel(
-                            "Advanced",
-                            ui.input_select(
-                                "ras_engine_sel", "Engine",
-                                {"swe": "HEC-RAS 2025 — 2D Shallow Water (explicit, CPU)"},
-                                selected="swe"),
-                            ui.div("The only RAS 2025 engine that runs on Posit Connect Cloud "
-                                   "(Linux): Diffusion Wave needs Intel MKL (Windows-only) and "
-                                   "the GPU solver needs CUDA.", class_="hype-instr"),
-                            ui.input_numeric("ras_hours", "Simulation duration (hr)",
-                                             value=_keep("ras_hours", 6.0), min=0.5, step=0.5),
-                            ui.input_numeric("ras_dt", "Compute timestep (s)",
-                                             value=_keep("ras_dt", 10.0), min=0.1, step=1.0),
-                            ui.input_numeric("ras_out_min", "Output interval (min)",
-                                             value=_keep("ras_out_min", 15.0), min=1.0,
-                                             step=5.0),
-                        ),
-                        open=False, id="ras_adv",
+                ui.div("Water surface model (HEC-RAS 2D)", class_="hype-subhead"),
+                ui.input_numeric("ras_slope", "Normal-depth friction slope",
+                                 value=_keep("ras_slope",
+                                             round(slope0, 5) if slope0 else 0.001),
+                                 min=0.00001, step=0.0005),
+                ui.input_numeric("ras_n", "Manning's n", value=_keep("ras_n", 0.06),
+                                 min=0.01, max=0.2, step=0.005),
+                ui.input_numeric("ras_cell", "Mesh cell size (m)",
+                                 value=_keep("ras_cell", 10.0), min=1.0, step=1.0),
+                ui.accordion(
+                    ui.accordion_panel(
+                        "Advanced",
+                        # Fixed engine, shown as a note — SWE-explicit is the only RAS 2025
+                        # engine that runs on Posit Connect Cloud (Diffusion Wave needs Intel
+                        # MKL, the GPU solver needs CUDA), so there is nothing to select.
+                        ui.div("Engine: 2D Shallow Water (CPU)", class_="hype-instr"),
+                        ui.input_numeric("ras_hours", "Simulation duration (hr)",
+                                         value=_keep("ras_hours", 6.0), min=0.5, step=0.5),
+                        ui.input_numeric("ras_dt", "Compute timestep (s)",
+                                         value=_keep("ras_dt", 10.0), min=0.1, step=1.0),
+                        ui.input_numeric("ras_out_min", "Output interval (min)",
+                                         value=_keep("ras_out_min", 15.0), min=1.0,
+                                         step=5.0),
                     ),
-                    ui.output_ui("ras_estimate"),
-                    ui.output_ui("ras_controls"),  # Run/Cancel + live log + summary
+                    open=False, id="ras_adv",
                 ),
+                ui.output_ui("ras_estimate"),
+                ui.output_ui("ras_controls"),  # Run/Cancel + live log + summary
                 _next_hint("gw", "Next: Groundwater →"),
             )
 
     def _pane_k():
             return ui.TagList(
-                ui.div("Hydraulic conductivity. Optionally draw K-zone polygons.",
-                       class_="hype-instr"),
                 ui.input_numeric("kh", "Horizontal K (m/d)", value=_keep("kh", 10.0),
                                  min=0.0001, step=1.0),
                 ui.input_numeric("kv", "Vertical K (m/d)", value=_keep("kv", 1.0),
                                  min=0.0001, step=0.5),
                 ui.input_numeric("porosity", "Porosity", value=_keep("porosity", 0.3),
                                  min=0.01, max=0.6, step=0.05),
+                ui.div("NRCS soils (SSURGO)", class_="hype-subhead"),
+                ui.output_ui("soil_k_status"),
+                ui.div(ui.input_action_button("get_nrcs_soils", "Get NRCS Soils K",
+                                              class_="btn-sm btn-outline-primary"),
+                       class_="hype-actions"),
+                ui.div("K-zones", class_="hype-subhead"),
                 ui.input_checkbox("use_kzones", "Use hydraulic-conductivity zones",
                                   value=bool(_keep("use_kzones", False))),
                 ui.panel_conditional(
                     "input.use_kzones === true",
-                    ui.div("Add one or more K-zone polygons (each uses these values); "
-                           "double-click a zone to edit it.", class_="hype-instr"),
-                    ui.input_numeric("kzone_kh", "Zone KH (m/d)", value=_keep("kzone_kh", 50.0),
-                                     min=0.0001, step=1.0),
-                    ui.input_numeric("kzone_kv", "Zone KV (m/d)", value=_keep("kzone_kv", 5.0),
-                                     min=0.0001, step=0.5),
+                    ui.div("Each zone has its own KH and KV; zones override the base K "
+                           "where they cover.", class_="hype-instr"),
                     ui.div(
                         ui.input_action_button("kz_add", "Add K-zone", class_="btn-sm btn-primary"),
-                        ui.input_action_button("kz_rmlast", "Remove last",
-                                               class_="btn-sm btn-outline-secondary"),
                         ui.input_action_button("kz_clear", "Clear all",
                                                class_="btn-sm btn-outline-secondary"),
                         class_="hype-bnd-row"),
-                    ui.output_ui("kzone_status")),
+                    ui.output_ui("kzone_list")),
                 _next_hint("gw.mesh", "Next: Model grid →"),
             )
 
@@ -6825,12 +8475,10 @@ def server(input, output, session):
             # accordion → the ONE "Run groundwater model" button. Light reads only.
             if ras_result() is not None:
                 sw_ok, sw_detail = True, "modeled (HEC-RAS)"
-            elif wse_extent_feat() is not None:
-                sw_ok, sw_detail = True, "wetted extent"
-            elif wse_mode_v() == "upload" and bool(_safe("wse_upload", None)):
-                sw_ok, sw_detail = True, "uploaded raster"
             else:
-                sw_ok, sw_detail = False, "not set"
+                # model-only: a restored wetted extent / uploaded raster no longer satisfies
+                # the run path (_wse_path accepts only the RAS result)
+                sw_ok, sw_detail = False, "not set — run the surface model"
             kz_n = len(kzone_feats() or []) if bool(_safe("use_kzones", False)) else 0
             k_detail = (f"KH {float(_safe('kh', 10.0)):g} · KV {float(_safe('kv', 1.0)):g} m/d"
                         + (f" · {kz_n} zone{'' if kz_n == 1 else 's'}" if kz_n else ""))
@@ -6845,8 +8493,6 @@ def server(input, output, session):
                         (round(_auto.value, 6) if _auto is not None
                          else _keep("g_ref_slope", 0.005)))
             return ui.TagList(
-                ui.div("Everything the groundwater run needs, in one place — check the inputs, "
-                       "set the boundary gradients, then run.", class_="hype-instr"),
                 ui.div(
                     _hub_row(True, "Subsurface properties", k_detail, "gw.k"),
                     _hub_row(True, "Model grid", grid_detail, "gw.mesh"),
@@ -6860,13 +8506,15 @@ def server(input, output, session):
                     f"input.bc_mode === '{BC_QUAL}'",
                     ui.div(
                         ui.input_select("g_qual_left", "Left floodplain", _QUAL_CHOICES,
-                                        selected=str(_keep("g_qual_left", "neutral"))),
+                                        selected=str(_keep("g_qual_left", "slightly_gaining"))),
                         ui.input_select("g_qual_right", "Right floodplain", _QUAL_CHOICES,
-                                        selected=str(_keep("g_qual_right", "neutral"))),
+                                        selected=str(_keep("g_qual_right", "slightly_gaining"))),
                         class_="hype-field-row"),
+                    # Reference slope on its own full-width row so the label never wraps;
+                    # the two multipliers pair up below it.
+                    ui.input_numeric("g_ref_slope", "Reference slope (m/m)", value=_rs0,
+                                     min=0.0, step=0.0005),
                     ui.div(
-                        ui.input_numeric("g_ref_slope", "Reference slope (m/m)", value=_rs0,
-                                         min=0.0, step=0.0005),
                         ui.input_numeric("g_mult_slight", "Slight ×",
                                          value=_keep("g_mult_slight", 0.5), min=0.0, step=0.1),
                         ui.input_numeric("g_mult_strong", "Strong ×",
@@ -6879,25 +8527,6 @@ def server(input, output, session):
                     # + map-added points, gradients editable in place.
                     ui.output_ui("gradient_pts_table"),
                     ui.output_ui("gradient_pts_msgs")),
-                ui.accordion(
-                    ui.accordion_panel(
-                        "Particle tracking",
-                        ui.input_select("pt_per_cell", "Particles per stream cell",
-                                        {"1": "1 (default)", "4": "4 (2×2)", "9": "9 (3×3)"},
-                                        selected=str(_keep("pt_per_cell", "1"))),
-                        ui.input_numeric("pt_min_mult", "Min. flow-path length (× cell size)",
-                                         value=_keep("pt_min_mult", 3.0), min=0.0, step=0.5),
-                        ui.div(
-                            ui.tags.ul(
-                                ui.tags.li("Seeds a particle in every wetted stream cell, "
-                                           "tracked through the bed."),
-                                ui.tags.li("Paths shorter than the min length above aren't "
-                                           "counted hyporheic (0 = keep all)."),
-                            ),
-                            class_="hype-instr"),
-                    ),
-                    open=False, id="gw_pt_acc",
-                ),
                 ui.div(ui.input_action_button("run_model", "Run groundwater model",
                                               class_="btn-primary"), class_="hype-actions"),
             )
@@ -6928,6 +8557,20 @@ def server(input, output, session):
                 ui.output_ui("head_legend"),
             )
 
+    def _fpsel_buttons():
+            # Selection mode: plain buttons (no server round-trip) — www/flowpath_select.js
+            # arms/disarms the crossing-window tool via document-level delegation and keeps
+            # the active states in sync, so any pane can carry a copy of this row.
+            return ui.div(
+                ui.tags.button("Single", type="button",
+                               class_="hype-fpsel-single active",
+                               title="Click one flow path (or its entry/return dot) on the map"),
+                ui.tags.button("Box select", type="button",
+                               class_="hype-fpsel-multi",
+                               title="Drag a crossing window; every flow path it touches is "
+                                     "selected"),
+                class_="hype-fpsel-row")
+
     def _pane_paths():
             if hz_result() is None:
                 return ui.div("Delineate the hyporheic zone (on the Zone node) to map the flow "
@@ -6937,17 +8580,7 @@ def server(input, output, session):
                        "paths and their entry (blue) / return (red) dots together. Click a path "
                        "or dot for its properties, or drag a box to select several.",
                        class_="hype-instr"),
-                # Selection mode: plain buttons (no server round-trip) — www/flowpath_select.js
-                # arms/disarms the crossing-window tool and keeps the active states in sync.
-                ui.div(
-                    ui.tags.button("Single", type="button",
-                                   class_="hype-fpsel-single active",
-                                   title="Click one flow path (or its entry/return dot) on the map"),
-                    ui.tags.button("Box select", type="button",
-                                   class_="hype-fpsel-multi",
-                                   title="Drag a crossing window; every flow path it touches is "
-                                         "selected"),
-                    class_="hype-fpsel-row"),
+                _fpsel_buttons(),
                 ui.output_ui("hz_sel_props"),
             )
 
@@ -7024,10 +8657,39 @@ def server(input, output, session):
                 mode = wse_mode_v()
             if mode == "model":
                 have = (ras_result() or {}).get("extent_feat") is not None
-                msg = ("The modeled wetted extent from the HEC-RAS surface run." if have else
-                       "The wetted extent will come from the HEC-RAS surface model — run it "
-                       "under Water surface.")
-                return ui.div(msg, class_="hype-instr")
+                if not have:
+                    return ui.div("The wetted extent will come from the HEC-RAS surface "
+                                  "model — run it under Water surface.", class_="hype-instr")
+                filt = wetted_filter_res()
+                note = None
+                if filt and filt.get("failed"):
+                    note = ui.div("Could not find an extent connected upstream to downstream "
+                                  "— filter not applied; the full wetted extent feeds the "
+                                  "groundwater model.", class_="hype-card warn")
+                elif filt and filt.get("kept_feat") is not None:
+                    n_rm = int(filt.get("n_removed") or 0)
+                    if n_rm:
+                        note = ui.div(f"{n_rm} isolated pool{'s' if n_rm != 1 else ''} "
+                                      f"removed ({filt.get('removed_m2', 0):,.0f} m²) — "
+                                      "excluded from the groundwater boundary condition.",
+                                      class_="hype-instr")
+                    else:
+                        note = ui.div("No isolated pools — the wetted extent is fully "
+                                      "connected.", class_="hype-instr")
+                return ui.TagList(
+                    ui.div("The modeled wetted extent from the HEC-RAS surface run. This "
+                           "extent sets the groundwater model's stream boundary condition.",
+                           class_="hype-instr"),
+                    ui.input_checkbox("wetted_filter",
+                                      "Remove isolated pools (keep only the extent connected "
+                                      "upstream to downstream)",
+                                      value=bool(_keep("wetted_filter", True))),
+                    note,
+                    ui.input_checkbox("show_removed_pools",
+                                      "Show removed pools on the map",
+                                      value=bool(_keep("show_removed_pools", False)))
+                    if (filt and filt.get("removed_feat") is not None) else None,
+                )
             present = wse_extent_feat() is not None
             with reactive.isolate():
                 active = bnd_slot() == "wse"
@@ -7076,7 +8738,8 @@ def server(input, output, session):
 
     def _pane_basemaps():
             return ui.div("Choose the basemap with the checkboxes — Imagery and Topo swap as a "
-                          "pair; NHD Hydrography overlays the streams used for reach picking.",
+                          "pair. NHD Hydrography shows the flowlines the reach snaps to; "
+                          "un-check it to clear the linework while modeling (picks still snap).",
                           class_="hype-instr")
 
     def _hz_swatch(cls):
@@ -7103,7 +8766,8 @@ def server(input, output, session):
                     ui.accordion_panel(
                         "Advanced",
                         ui.input_numeric("hz_sample", "Displayed paths per class",
-                                         value=int(_safe("hz_sample", 300)), min=50, max=1000,
+                                         value=int(_safe("hz_sample", 300)), min=50,
+                                         max=(100_000 if runmode.IS_DESKTOP else 1000),
                                          step=50),
                     ),
                     open=False, id="hz_adv_acc",
@@ -7168,10 +8832,11 @@ def server(input, output, session):
             # per-side origin/exit tallies for context
             osides = counts.get("origin_sides", {})
             esides = counts.get("exit_sides", {})
+            rows.append(_fpsel_buttons())
             rows.append(ui.output_ui("hz_sel_props"))
             return ui.TagList(
-                ui.div("Click a path on the map for its properties; the tree checkbox toggles "
-                       "the class.", class_="hype-instr"),
+                ui.div("Click a path on the map for its properties, or drag a box to select "
+                       "several; the tree checkbox toggles the class.", class_="hype-instr"),
                 *rows,
             )
         return _pane
@@ -7203,6 +8868,172 @@ def server(input, output, session):
         return ui.div(ui.span(label, class_="hype-hz-k"), ui.span(str(value), class_="hype-hz-v"),
                       class_="hype-hz-row")
 
+    def _pane_flows():
+        """Flux-weighted exchange-flow accounting (§8.3 four-way) + the exchange-map key."""
+        res = hz_result()
+        if res is None:
+            return ui.div("Delineate the hyporheic zone to compute the flow accounting.",
+                          class_="hype-instr")
+        stats = res.get("stats") or {}
+        flux = stats.get("flux")
+        if not flux:
+            return ui.div("No boundary inflow was found in the model budget, so there is "
+                          "no flow to account for.", class_="hype-instr")
+        acct = flux.get("accounting") or {}
+
+        def m3d(v):
+            f = float(v or 0.0)
+            return f"{f:,.0f} m³/d" if abs(f) >= 100 else f"{f:,.2f} m³/d"
+
+        if "gaining" not in acct:      # artifact from before the four-way extension
+            return ui.TagList(
+                ui.div("This delineation predates the four-flow accounting — re-run it "
+                       "(Zone → Delineate) to compute gaining and throughflow and the "
+                       "exchange map.", class_="hype-card warn"),
+                ui.div("Stream-exchange split from the saved run", class_="hype-instr"),
+                _kv("Stream downwelling", m3d(acct.get("total_downwelling"))),
+                _kv("Hyporheic (returning)", m3d(acct.get("returning"))),
+                _kv("Losing", m3d(acct.get("losing"))),
+                _kv("Unresolved", m3d(acct.get("unresolved"))),
+            )
+
+        down = float(acct.get("total_downwelling") or 0.0)
+        upw = float(acct.get("total_upwelling") or 0.0)
+        net = float(acct.get("net_stream_exchange") or 0.0)
+        rows = [ui.div("Flux-weighted flow accounting: every parcel of boundary inflow "
+                       "in the model budget is tracked to where it leaves the model — "
+                       "the same trajectories that delineated the zones.",
+                       class_="hype-instr")]
+        for cls, key in (("hyporheic", "returning"), ("gaining", "gaining"),
+                         ("losing", "losing"), ("throughflow", "throughflow")):
+            rows.append(ui.div(
+                _hz_swatch(cls), ui.span(HZ_LABEL[cls], class_="hype-hz-k"),
+                ui.span(m3d(acct.get(key)), class_="hype-hz-v"),
+                class_="hype-hz-row"))
+
+        def _tbl(title, trs):
+            return ui.TagList(
+                ui.div(title, class_="hype-props-title"),
+                ui.tags.table(ui.tags.tbody(*trs), class_="hype-props-table"))
+
+        def _tr(k, v):
+            return ui.tags.tr(ui.tags.td(k), ui.tags.td(v))
+
+        reach_tag = ("net gaining reach" if net > 0
+                     else "net losing reach" if net < 0 else "balanced")
+        rows.append(_tbl("Stream exchange", [
+            _tr("Downwelling (stream → subsurface)", m3d(down)),
+            _tr("Upwelling (subsurface → stream)", m3d(upw)),
+            _tr("Net exchange", f"{m3d(net)} · {reach_tag}"),
+            _tr("Unresolved (stream-origin)", m3d(acct.get("unresolved"))),
+        ]))
+        rows.append(_tbl("Boundary underflow", [
+            _tr("Inflow (sides)", m3d(acct.get("total_side_inflow"))),
+            _tr("Outflow (sides)", m3d(acct.get("total_side_outflow"))),
+            _tr("Unresolved (side-origin)", m3d(acct.get("side_unresolved"))),
+        ]))
+
+        ret = float(acct.get("returning") or 0.0)
+        norm = []
+        area = acct.get("streambed_area_m2")
+        if area and ret:
+            norm.append(_kv("Hyporheic flux", f"{ret / float(area):.4g} m/d over "
+                            f"{float(area):,.0f} m² of streambed"))
+        rl = _reach_length_m()
+        if rl and ret:
+            norm.append(_kv("Exchange per channel length", f"{ret / rl:.4g} m³/d per m"))
+        porosity = float((stats.get("knobs") or {}).get("porosity") or 0.0)
+        hyp_vol = float((stats.get("classes") or {}).get("hyporheic", {})
+                        .get("volume_m3") or 0.0)
+        if porosity > 0 and hyp_vol > 0 and ret > 0:
+            norm.append(_kv("Hyporheic turnover", f"{porosity * hyp_vol / ret:,.1f} days "
+                            "(pore volume ÷ hyporheic flow)"))
+        if norm:
+            rows.append(ui.div("Normalized", class_="hype-props-title"))
+            rows += norm
+
+        rtd_c = flux.get("rtd_by_class") or {}
+        tt = []
+        for key, cls in (("returning", "hyporheic"), ("gaining", "gaining"),
+                         ("losing", "losing"), ("throughflow", "throughflow")):
+            r = rtd_c.get(key)
+            if r:
+                tt.append(_kv(HZ_LABEL[cls], f"mean {r['weighted_mean_days']:g} d · "
+                              f"median {r['weighted_median_days']:g} d"))
+        if tt:
+            rows.append(ui.div("Flux-weighted transit time", class_="hype-props-title"))
+            rows += tt
+
+        qa = []
+        if acct.get("mass_balance_error") is not None:
+            qa.append(f"stream ledger closes to {float(acct['mass_balance_error']):.1e}")
+        if acct.get("upwelling_check_error") is not None:
+            qa.append("upwelling vs hyporheic+gaining agree within "
+                      f"{100.0 * float(acct['upwelling_check_error']):.1f}%")
+        if acct.get("closure_error_global") is not None:
+            qa.append(f"budget in/out closure {100.0 * float(acct['closure_error_global']):.2g}%")
+        if qa:
+            rows.append(ui.div("Checks: " + "; ".join(qa) + ". Unresolved flow is "
+                               "parcels still traveling at the tracking time cap.",
+                               class_="hype-instr"))
+        rows.append(ui.div("Map: red cells = downwelling (stream losing water), blue = "
+                           "upwelling (stream gaining); the tree checkbox toggles them.",
+                           class_="hype-instr"))
+        return ui.TagList(*rows)
+
+    def _pane_project():
+        """Project identity pane: name, save location, locked units, created date, and the
+        save actions (the same handlers the header links use)."""
+        meta = project_meta_v() or {}
+        if runmode.IS_DESKTOP and _ws["project_file"]:
+            loc: object = ui.tags.code(str(Path(_ws["project_file"]).parent),
+                                       style="word-break: break-all;")
+        else:
+            loc = "This browser session. Use Save to download a .hype project file."
+        units_label = project_meta.UNIT_LABELS.get(
+            meta.get("units"), project_meta.UNIT_LABELS[project_meta.UNITS_METRIC])
+        if runmode.IS_DESKTOP:
+            actions = (_evt_btn("proj_save", "Save", "btn-primary btn-sm"),
+                       _evt_btn("proj_save_as", "Save As…", "btn-outline-secondary btn-sm"),
+                       _evt_btn("proj_export", "Export portable bundle…",
+                                "btn-outline-secondary btn-sm"))
+        else:
+            actions = (_evt_btn("proj_save", "Save project…", "btn-primary btn-sm"),)
+        return ui.TagList(
+            ui.div(ui.div("Name", class_="hype-proj-k"),
+                   ui.div(meta.get("name") or "Untitled", class_="hype-proj-v"),
+                   class_="hype-proj-row"),
+            ui.div(ui.div("Location", class_="hype-proj-k"),
+                   ui.div(loc, class_="hype-proj-v"), class_="hype-proj-row"),
+            ui.div(ui.div("Units", class_="hype-proj-k"),
+                   ui.div(units_label, ui.span(" Locked in this version.",
+                                               class_="hype-dim"),
+                          class_="hype-proj-v"),
+                   class_="hype-proj-row"),
+            ui.div(ui.div("Created", class_="hype-proj-k"),
+                   ui.div(project_meta.created_display(meta.get("created")),
+                          class_="hype-proj-v"),
+                   class_="hype-proj-row"),
+            ui.div(*actions, class_="hype-actions"))
+
+    @reactive.effect
+    @reactive.event(input.proj_save)
+    def _proj_save():
+        if runmode.IS_DESKTOP:
+            _do_desktop_save()
+        else:
+            _show_bundle_dialog()
+
+    @reactive.effect
+    @reactive.event(input.proj_save_as)
+    async def _proj_save_as():
+        await _begin_save_as()
+
+    @reactive.effect
+    @reactive.event(input.proj_export)
+    def _proj_export():
+        _show_bundle_dialog()
+
     def _next_hint(nid, label, primary=False):
         """A guidance chip advancing the selection — plain button, delegated via tree.js
         (data-jump), so it carries none of the dynamic-input remount hazards. `primary`
@@ -7213,6 +9044,7 @@ def server(input, output, session):
 
     # node id -> pane builder (the dispatch table for the right properties panel)
     PANE_FOR_NODE = {
+        "project": _pane_project,
         "reach": _pane_reach,
         "terrain": _pane_dem, "terrain.dem": _pane_dem, "terrain.chanmod": _pane_chanmod,
         "bnd": _pane_boundaries,
@@ -7222,7 +9054,7 @@ def server(input, output, session):
         "bnd.down": _pane_bnd_side("down", "Downstream", DOWN_STYLE["color"]),
         "sw": _pane_sw, "sw.mesh": _pane_sw, "sw.wetted": _pane_wetted,
         "sw.wse": _pane_sw_raster("wse"), "sw.depth": _pane_sw_raster("depth"),
-        "gw": _pane_gw, "gw.k": _pane_k, "gw.soils": _pane_soils,
+        "gw": _pane_gw, "gw.k": _pane_k,
         "gw.mesh": _pane_mesh, "gw.run": _pane_run, "gw.sens": _pane_sens,
         "gw.res": _pane_results, "gw.res.head": _pane_head, "gw.res.paths": _pane_paths,
         "gw.res.hz": _pane_hz, "gw.res.hz.vols": _pane_vols,
@@ -7234,6 +9066,7 @@ def server(input, output, session):
         "gw.res.hz.los": _pane_hz_vol("losing"),
         "gw.res.hz.gain": _pane_hz_vol("gaining"),
         "gw.res.hz.thru": _pane_hz_vol("throughflow"),
+        "gw.res.hz.flows": _pane_flows,
         "base": _pane_basemaps, "base.imagery": _pane_basemaps, "base.topo": _pane_basemaps,
         "base.hydro": _pane_basemaps,
     }
@@ -7262,8 +9095,6 @@ def server(input, output, session):
                "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.k": (lambda: _domain_build() is not None,
                  "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
-        "gw.soils": (lambda: _domain_build() is not None,
-                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.mesh": (lambda: _domain_build() is not None,
                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.res": (lambda: run_result() is not None,
@@ -7279,7 +9110,7 @@ def server(input, output, session):
     # the Flow-paths / Volumes groups and their class rows need the analysis to have run
     for _hzc in ("gw.res.paths", "gw.res.paths.hyp", "gw.res.paths.los", "gw.res.paths.gain",
                  "gw.res.paths.thru", "gw.res.hz.vols", "gw.res.hz.hyp", "gw.res.hz.los",
-                 "gw.res.hz.gain", "gw.res.hz.thru"):
+                 "gw.res.hz.gain", "gw.res.hz.thru", "gw.res.hz.flows"):
         PREREQS[_hzc] = (lambda: hz_result() is not None,
                          "Delineate the hyporheic zone first.", "gw.res.hz",
                          "Go to Zone →")
@@ -7312,22 +9143,35 @@ def server(input, output, session):
         # First-run "home" card — shown while nothing is selected and no work exists yet.
         return _props_shell(
             "Get started",
-            ui.div("Build a hyporheic-exchange model in three moves:",
+            ui.div("Build a hyporheic exchange model in six steps:",
                    class_="hype-welcome-note"),
             ui.tags.ol(
+                # One item per header stage, same numbers and labels (ui_tree.STAGES) — the
+                # card is a legend for the bar, not a second numbering scheme.
                 ui.tags.li(ui.span("1", class_="hype-welcome-num"),
-                           ui.span("Define your reach — search a place, then pick two points "
-                                   "on a stream (or draw the centerline).")),
+                           ui.span(ui.tags.b("Reach"), ": pick two points on a stream, "
+                                   "or draw the centerline.")),
                 ui.tags.li(ui.span("2", class_="hype-welcome-num"),
-                           ui.span("Terrain and boundaries generate automatically — review "
-                                   "and edit them as needed.")),
+                           ui.span(ui.tags.b("Terrain"), ": elevation data downloads "
+                                   "automatically.")),
                 ui.tags.li(ui.span("3", class_="hype-welcome-num"),
-                           ui.span("Run the surface and groundwater models, then delineate "
+                           ui.span(ui.tags.b("Boundaries"), ": generated automatically. "
+                                   "Edit the lines if needed.")),
+                ui.tags.li(ui.span("4", class_="hype-welcome-num"),
+                           ui.span(ui.tags.b("Water surface"), ": set the streamflow and "
+                                   "run the surface model.")),
+                ui.tags.li(ui.span("5", class_="hype-welcome-num"),
+                           ui.span(ui.tags.b("Groundwater"), ": review the defaults and "
+                                   "run the groundwater model.")),
+                ui.tags.li(ui.span("6", class_="hype-welcome-num"),
+                           ui.span(ui.tags.b("Results"), ": view flow paths and delineate "
                                    "the hyporheic zone.")),
                 class_="hype-welcome-steps"),
-            ui.div("Work isn't saved on the server — use Save (top right) before you leave.",
+            ui.div("Use New (top right) to create a project folder — work saves there as "
+                   "you go." if runmode.IS_DESKTOP else
+                   "Work isn't saved on the server. Use Save (top right) before you leave.",
                    class_="hype-welcome-note"),
-            _next_hint("reach", "Start — define your reach →"),
+            _next_hint("reach", "Start with step 1: Reach →"),
             chrome=False)
 
     @reactive.effect
@@ -7433,13 +9277,17 @@ def server(input, output, session):
 
     @render.ui
     def domain_warning():
-        # Soft boundary sanity warnings, stacked: (1) the four boundaries don't meet at a corner
-        # (the derived domain still force-closes; snapping auto-connects near endpoints — this
+        # Boundary sanity warnings, stacked. Red cards first: a boundary line lying across the
+        # reach centerline (bnd_conflicts) BLOCKS the surface run + mesh preview until fixed.
+        # Then the soft amber guidance: (1) the four boundaries don't meet at a corner (the
+        # derived domain still force-closes; snapping auto-connects near endpoints — this
         # catches the ones too far apart to snap); (2) the reach centerline doesn't meet the
-        # up/down boundaries or crosses a floodplain side. Guidance only — never gates the step.
+        # up/down boundaries. Navigation itself is never gated.
         if not _HAS_MAP or current_step() != STEP_BOUNDARIES:
             return None
-        children = []
+        children = [ui.div(c["msg"] + " Model runs are blocked until this is fixed.",
+                           class_="hype-card err")
+                    for c in bnd_conflicts()]
         gap = geometry.corner_gaps_m(up_feat(), left_feat(), right_feat(), down_feat())
         if gap is not None and gap > 25.0:
             children.append(ui.div(
@@ -7454,16 +9302,44 @@ def server(input, output, session):
         return ui.TagList(*children) if children else None
 
     @render.ui
-    def kzone_status():
-        kn = len(kzone_feats())
+    def kzone_list():
+        # Per-zone editable KH/KV rows. Structural deps ONLY (the zone list + the drawing
+        # flag): values are painted from each Feature's properties and edited in place by
+        # _kz_mirror, so typing never re-renders (the gradient-table discipline).
+        kz = kzone_feats()
+        parts = []
         if kz_adding():
-            return ui.p("Drawing a K-zone — click on the map to place vertices.",
-                        class_="hype-chk")
-        if kn:
-            return ui.p(ui.span(class_="hype-st st-done"),
-                        f"{kn} K-zone{'' if kn == 1 else 's'} drawn — double-click one to edit.",
-                        class_="hype-chk ok")
-        return ui.p("No K-zones yet — click Add K-zone.", class_="hype-chk")
+            parts.append(ui.p("Drawing a K-zone — click on the map to place vertices, "
+                              "double-click to finish.", class_="hype-chk"))
+        elif not kz:
+            parts.append(ui.p("No K-zones yet — click Add K-zone.", class_="hype-chk"))
+        if kz:
+            rows = [ui.div(ui.span("Zone", class_="hype-kz-h"),
+                           ui.span("KH (m/d)", class_="hype-kz-h"),
+                           ui.span("KV (m/d)", class_="hype-kz-h"),
+                           ui.span(""), class_="hype-kz-row hype-kz-head")]
+            for f in kz:
+                p = f.get("properties") or {}
+                uid = p.get("uid") or ""
+                name = ui.span(str(p.get("LABEL") or "Zone"),
+                               (ui.span("NRCS", class_="hype-kz-src")
+                                if p.get("src") == "nrcs" else None),
+                               class_="hype-kz-name", title=str(p.get("LABEL") or ""))
+                rows.append(ui.div(
+                    name,
+                    ui.input_numeric(f"kz_kh_{uid}", None, value=p.get("KH"),
+                                     min=0.0001, step=1.0),
+                    ui.input_numeric(f"kz_kv_{uid}", None, value=p.get("KV"),
+                                     min=0.0001, step=0.5),
+                    ui.tags.button("×", type="button", class_="hype-gpt-rm",
+                                   onclick=(f"Shiny.setInputValue('kz_rm_{uid}', "
+                                            f"(window._kzrm_{uid}=(window._kzrm_{uid}||0)+1))"),
+                                   title="Remove this zone"),
+                    class_="hype-kz-row"))
+            parts.append(ui.div(*rows, class_="hype-kz-table"))
+            parts.append(ui.p("Double-click a zone on the map to edit its shape.",
+                              class_="hype-instr hype-dim"))
+        return ui.TagList(*parts)
 
     @render.ui
     def dem_status():
@@ -7496,10 +9372,14 @@ def server(input, output, session):
             return None
         facts = (f"Domain ≈ {est['dom_w']:,.0f} × {est['dom_h']:,.0f} m · {est['nlay']} layers "
                  f"({est['ncol']}×{est['nrow']} cells/layer)")
+        b = estimate.band(est["n_cells"])
+        msg = estimate.band_message(est)
+        if runmode.IS_DESKTOP and b == "red":
+            msg = (f"Grid ≈ {est['ncol']}×{est['nrow']}×{est['nlay']} = {est['n_cells']:,} cells. "
+                   "Very large — no limit in Desktop Run; expect a long, memory-hungry solve.")
         return ui.TagList(
             ui.div(facts, class_="hype-chk"),
-            ui.div(estimate.band_message(est),
-                   class_=f"hype-estimate {estimate.band(est['n_cells'])}"))
+            ui.div(msg, class_=f"hype-estimate {b}"))
 
     @render.ui
     def ras_estimate():
@@ -7518,9 +9398,14 @@ def server(input, output, session):
         green, cap = ras_engine.cell_budget()
         band = "green" if n <= green else ("amber" if n <= cap else "red")
         lead = f"{n:,} mesh cells (meshed)" if meshed else f"≈ {n:,} mesh cells"
+        red_msg = ("very large — no limit in Desktop Run; expect a long solve."
+                   if runmode.IS_DESKTOP else
+                   f"over the {cap:,}-cell limit; increase the cell size.")
         msg = (f"{lead} at {cell:g} m — "
-               + {"green": "quick run.", "amber": "will take a while on this server.",
-                  "red": f"over the {cap:,}-cell limit; increase the cell size."}[band])
+               + {"green": "quick run.",
+                  "amber": ("will take a while on this computer." if runmode.IS_DESKTOP
+                            else "will take a while on this server."),
+                  "red": red_msg}[band])
         return ui.div(msg, class_=f"hype-estimate {band}")
 
     @render.ui
@@ -7538,20 +9423,29 @@ def server(input, output, session):
                                               class_="btn-sm btn-outline-danger"),
                        class_="hype-actions"),
             )
+        blocked = bool(bnd_conflicts())     # boundary line across the centerline — hard gate
         if meshing:
             mesh_row = ui.div(ui.div(class_="hype-spinner"),
                               ui.span("Meshing…", class_="hype-run-label"),
                               class_="hype-run-head")
         else:
             mesh_row = ui.div(ui.input_action_button(
-                "ras_mesh_btn", "Preview mesh", class_="btn-sm btn-outline-secondary"),
+                "ras_mesh_btn", "Preview mesh", class_="btn-sm btn-outline-secondary",
+                disabled=blocked),
                 class_="hype-actions")
         parts = [
             mesh_row,
             ui.div(ui.input_action_button("run_surface", "Run surface model",
                                           class_="btn-primary",
-                                          disabled=meshing), class_="hype-actions"),
+                                          disabled=meshing or blocked), class_="hype-actions"),
         ]
+        if blocked:
+            parts = [
+                ui.div("A boundary line crosses the stream centerline. Fix it in the "
+                       "Boundaries step before meshing or running.", class_="hype-card err"),
+                _next_hint("bnd", "Fix boundaries →"),
+                *parts,
+            ]
         if res:
             m = res.get("max_depth_m") or 0.0
             n_parts = int(res.get("n_parts") or 0)
@@ -7563,6 +9457,14 @@ def server(input, output, session):
                 f"max depth {m:.2f} m · wetted area {res.get('wetted_area_m2', 0):,.0f} m²"
                 f"{pools} · {res.get('runtime_s', 0):.0f} s. The modeled water surface feeds "
                 f"the groundwater run.", class_="hype-chk ok"))
+            filt = wetted_filter_res()
+            if filt and filt.get("kept_feat") is not None and filt.get("n_removed"):
+                n_rm = int(filt["n_removed"])
+                parts.append(ui.div(
+                    ui.span(class_="hype-st st-done"),
+                    f"GW extent: {n_rm} isolated pool{'s' if n_rm != 1 else ''} removed "
+                    f"({filt.get('removed_m2', 0):,.0f} m²) — see Wetted extent (GW model).",
+                    class_="hype-chk"))
             if main_frac < 0.9:
                 terr_res = float(res.get("terrain_res_m") or 0.0)
                 hint = (f"The {terr_res:.0f} m terrain is likely too coarse — re-fetch the DEM "
@@ -7627,8 +9529,9 @@ def server(input, output, session):
         extras = []
         if g.get("boundaries"):
             extras.append("boundary lines labeled")
-        if g.get("basemap"):
-            extras.append("aerial drape on top (toggle USGS Imagery; opacity slider in the 3D toolbar)")
+        if g.get("basemap") or g.get("basemapTopo"):
+            extras.append("basemap drape on top (Basemaps picks USGS Imagery or Topo; "
+                          "opacity slider in the 3D toolbar)")
         tail = (" · " + ", ".join(extras)) if extras else ""
         return ui.p(ui.span(class_="hype-st st-done"),
                     f"{g.get('nActiveFull', 0):,} active cells{note} — drag to orbit, "
@@ -7757,78 +9660,6 @@ def server(input, output, session):
             rows.append(_kv("Residence", f"mean {sub['total_time_d'].mean():,.1f} d"))
         rows.append(clear)
         return ui.div(*rows)
-
-    # Flow-path metric rows: (stats column, single-path label, short distribution label).
-    # Units are the pipeline's — metric (the engine's "_ft" column names are labels only; the
-    # head legend already says m).
-    _FP_ROWS = [("length", "Path length (m)", "Length (m)"),
-                ("horiz", "Horizontal length (m)", "Horiz. (m)"),
-                ("depth", "Max depth below start (m)", "Depth (m)"),
-                ("rtime_d", "Residence time (days)", "Res. time (d)"),
-                ("vel", "Mean velocity (m/day)", "Vel. (m/d)")]
-    _FP_EXTRA = [("head_start", "Starting hydraulic head (m)"),
-                 ("head_end", "Ending hydraulic head (m)"),
-                 ("hyd_grad", "Hydraulic gradient (–)")]
-
-    def _fp_fmt(v, key: str = "") -> str:
-        import math
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return "n/a"
-        if not math.isfinite(f):
-            return "n/a"
-        return f"{f:,.4f}" if key == "hyd_grad" else f"{f:,.2f}"
-
-    @render.ui
-    def fp_props():
-        pids = sel_pids()
-        stats = fp_stats()
-        if not pids or stats is None:
-            return None
-        have = [p for p in pids if p in stats.index]
-        if not have:
-            return None
-        if len(have) == 1:
-            pid = have[0]
-            row = stats.loc[pid]
-            trs = [ui.tags.tr(ui.tags.td(lbl), ui.tags.td(_fp_fmt(row.get(k), k)))
-                   for k, lbl, _s in _FP_ROWS]
-            trs += [ui.tags.tr(ui.tags.td(lbl), ui.tags.td(_fp_fmt(row.get(k), k)))
-                    for k, lbl in _FP_EXTRA]
-            body = [ui.div(f"Flow path #{pid}", class_="hype-props-title"),
-                    ui.tags.table(ui.tags.tbody(*trs), class_="hype-props-table")]
-        else:
-            sub = stats.loc[have]
-            trs = [ui.tags.tr(ui.tags.th(""), *(ui.tags.th(h) for h in
-                                                ("Min", "Mean", "Median", "Max")))]
-            for k, _lbl, short in _FP_ROWS:
-                col = sub[k]
-                trs.append(ui.tags.tr(ui.tags.td(short),
-                                      ui.tags.td(_fp_fmt(col.min(), k)),
-                                      ui.tags.td(_fp_fmt(col.mean(), k)),
-                                      ui.tags.td(_fp_fmt(col.median(), k)),
-                                      ui.tags.td(_fp_fmt(col.max(), k))))
-            body = [ui.div(f"{len(have)} flow paths selected", class_="hype-props-title"),
-                    ui.tags.table(ui.tags.tbody(*trs), class_="hype-props-table")]
-            for k, lbl, unit in (("rtime_d", "Residence time", "days"),
-                                 ("length", "Path length", "m")):
-                try:
-                    uri = results.hist_datauri(sub[k].tolist(), label=lbl, unit=unit)
-                except Exception:  # noqa: BLE001
-                    uri = None
-                if uri:
-                    body.append(ui.img(src=uri, class_="hype-props-hist"))
-            with reactive.isolate():
-                shown = fp_gdf()
-                if results.flowpath_downsampled(run_result() or {}, shown):
-                    body.append(ui.div(f"Selection covers the {len(shown):,} paths shown "
-                                       "(display down-sampled).", class_="hype-props-note"))
-        return ui.div(*body,
-                      ui.div(ui.input_action_button("fp_clear", "Clear selection",
-                                                    class_="btn-sm btn-outline-secondary"),
-                             class_="hype-props-actions"),
-                      class_="hype-props")
 
     @render.ui
     def head_legend():

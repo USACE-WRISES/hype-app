@@ -34,6 +34,43 @@ def test_format_version_is_2():
     assert bundle.FORMAT_VERSION == 2
 
 
+def test_extra_trees_pack_but_never_restore(tmp_path):
+    """extra_trees (the GMS export rides this) pack under ROOT with forward-slash
+    arcs, and restore must IGNORE them: a one-way export, never workspace state."""
+    src = tmp_path / "session_a"
+    src.mkdir()
+    _make_workspace(src)
+    gms_src = tmp_path / "gms_build"
+    (gms_src / "Site_MODFLOW").mkdir(parents=True)
+    (gms_src / "Site.gpr").write_bytes(b"FAKE-GPR")
+    (gms_src / "Site_MODFLOW" / "Site.mfn").write_text("# name file")
+
+    zip_path = bundle.zip_workspace(src, vectors={"reach": _FEATURE},
+                                    state={"format_version": 2},
+                                    extra_trees=(("GMS", gms_src),))
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    assert f"{bundle.ROOT}/GMS/Site.gpr" in names
+    assert f"{bundle.ROOT}/GMS/Site_MODFLOW/Site.mfn" in names
+    assert not [n for n in names if "\\" in n]
+
+    dst = tmp_path / "session_b"
+    dst.mkdir()
+    out = bundle.restore_workspace(zip_path, dst)
+    assert not (dst / "GMS").exists()
+    assert not [p for p in out["restored"] if "GMS" in p or ".gpr" in p]
+
+
+def test_zip_workspace_without_extra_trees_unchanged(tmp_path):
+    src = tmp_path / "session_a"
+    src.mkdir()
+    _make_workspace(src)
+    zip_path = bundle.zip_workspace(src, vectors={"reach": _FEATURE},
+                                    state={"format_version": 2})
+    with zipfile.ZipFile(zip_path) as zf:
+        assert not [n for n in zf.namelist() if n.startswith(f"{bundle.ROOT}/GMS/")]
+
+
 def test_v2_roundtrip(tmp_path):
     src = tmp_path / "session_a"
     src.mkdir()
@@ -182,3 +219,40 @@ def test_non_hype_zip_rejected(tmp_path):
         zf.writestr("random.txt", "nope")
     with pytest.raises(bundle.ProjectError):
         bundle.restore_workspace(bogus, tmp_path / "out")
+
+
+# ---------------------------------------------------------------- project metadata keys
+
+def test_project_meta_keys_roundtrip_both_scopes(tmp_path):
+    """project_name/units/created are first-class state keys and must ride BOTH bundle
+    kinds: Complete and settings-only (the desktop main-file path)."""
+    state = {"format_version": 2, "project_name": "Mink Creek",
+             "project_units": "metric", "project_created": "2026-07-23T08:15:00"}
+    for include_computed in (True, False):
+        src = tmp_path / f"src_{include_computed}"
+        src.mkdir()
+        _make_workspace(src)
+        zip_path = bundle.zip_workspace(src, vectors={"reach": _FEATURE},
+                                        state=dict(state),
+                                        include_computed=include_computed)
+        dst = tmp_path / f"dst_{include_computed}"
+        dst.mkdir()
+        st = bundle.restore_workspace(zip_path, dst)["state"]
+        assert st["project_name"] == "Mink Creek", include_computed
+        assert st["project_units"] == "metric", include_computed
+        assert st["project_created"] == "2026-07-23T08:15:00", include_computed
+
+
+def test_legacy_state_without_meta_passes_through(tmp_path):
+    """Pre-metadata bundles restore with no meta keys injected — migration (stem
+    fallback, metric default) is the app's job, not the bundle layer's."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _make_workspace(src)
+    zip_path = bundle.zip_workspace(src, vectors={}, state={"format_version": 2})
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    st = bundle.restore_workspace(zip_path, dst)["state"]
+    assert "project_name" not in st
+    assert "project_units" not in st
+    assert "project_created" not in st

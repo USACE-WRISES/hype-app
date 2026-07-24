@@ -29,6 +29,48 @@ FORMAT_VERSION = 2        # bump when the archive layout or state.json schema ch
 class ProjectError(ValueError):
     """A project archive can't be opened; str(err) is a user-facing message."""
 
+
+# Workspace paths inside the state manifest are stored behind this token, base-relative —
+# a saved session's absolute paths are meaningless in the session (or machine) that reopens it.
+WS_TOKEN = "$WORKSPACE$"
+
+
+def tokenize_paths(obj, base: Path):
+    """Deep-copy `obj` with every absolute path under `base` rewritten to $WORKSPACE$/rel."""
+    base = Path(base).resolve()
+
+    def walk(v):
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [walk(x) for x in v]
+        if isinstance(v, (str, Path)):
+            s = str(v)
+            try:
+                rp = Path(s)
+                if rp.is_absolute():
+                    return WS_TOKEN + "/" + rp.resolve().relative_to(base).as_posix()
+            except (OSError, ValueError):
+                pass                    # not under the workspace — leave it alone
+            return s
+        return v
+    return walk(obj)
+
+
+def detokenize_paths(obj, base: Path):
+    """Inverse of tokenize_paths, against `base` (the reopening session's workspace root)."""
+    base = Path(base)
+
+    def walk(v):
+        if isinstance(v, dict):
+            return {k: walk(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, str) and v.startswith(WS_TOKEN + "/"):
+            return str(base / v[len(WS_TOKEN) + 1:])
+        return v
+    return walk(obj)
+
 # reach + boundary reactives -> arcname under ROOT (all EPSG:4326; in-memory only until now).
 # `k_zones` is a LIST of features; the rest are single Feature dicts. _write_vectors handles both.
 _VECTOR_ARCS = {
@@ -122,6 +164,8 @@ def _readme(run_config: dict | None, seen: set, include_computed: bool = True) -
         "  5_Groundwater/       model/gwf_workspace (MODFLOW 6) + model/mp7_workspace (MODPATH 7),",
         "                       GW inputs, and Results/ (head, pathlines, hyporheic_zone).",
         "  6_Site_Report/       Generated site summary report (HTML/PDF/CSV/JSON), when produced.",
+        "  GMS/                 Aquaveo GMS 10.7 project, when a groundwater run exists.",
+        "                       Extract the archive and open GMS/<name>.gpr in GMS.",
         "  data_sources/        Recorded USGS StreamStats/NSS and NRCS SDA responses, when fetched.",
         "  sensitivity/         Gradient-sensitivity scenario outputs, when run.",
         "  config/              params.json (engine inputs) + run_config.json (CRS/origin/modes)",
@@ -147,7 +191,8 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
                   run_config: dict | None = None, state: dict | None = None,
                   assessment_input: dict | None = None,
                   scoring_profile: dict | None = None,
-                  include_computed: bool = True) -> str:
+                  include_computed: bool = True,
+                  extra_trees: tuple = ()) -> str:
     """Build the organized workspace archive on disk; return the temp-file path.
 
     The archive is built to a temp file (not io.BytesIO) so peak memory stays flat even when the
@@ -164,6 +209,10 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
                        the computed/derived trees (2_Terrain, 4_Surface_Water, 5_Groundwater,
                        sensitivity/, 6_Site_Report). Restore is file-existence-gated per stage,
                        so such an archive reopens with those stages simply not done yet.
+    extra_trees      : ((arc_prefix, src_dir), ...) — extra directory trees packed under ROOT.
+                       Intentionally NOT registered in the restore maps below: restore ignores
+                       unknown arcs, so these are one-way exports (e.g. the GMS/ project tree)
+                       that never contaminate a reopened workspace.
     """
     root = Path(work_dir)
     seen: set = set()
@@ -207,6 +256,9 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
                 # silently when its source dir doesn't exist yet (feature not run).
                 _add_tree(zf, root / "sensitivity", _arc("sensitivity"), seen)
                 _add_tree(zf, root / "report", _arc("6_Site_Report"), seen)
+
+            for arc_prefix, src_dir in extra_trees:
+                _add_tree(zf, Path(src_dir), _arc(arc_prefix), seen)
 
             # data_sources rides along in BOTH scopes — the recorded USGS/NRCS responses are
             # tiny and they're inputs (provenance), not computed results.
@@ -275,6 +327,12 @@ _RESTORE_TREES = (
     ("6_Site_Report/",                        "report/"),
 )
 
+# Folder-layout contract: every directory a project folder can own. Must stay the union of
+# the first path components of the _RESTORE_FILES targets and _RESTORE_TREES destinations
+# above (tested in test_project_folders.py).
+PROJECT_DIRS: tuple[str, ...] = ("inputs", "model", "ras", "summary", "sensitivity",
+                                 "report", "data_sources")
+
 
 def _target_for(rel: str) -> str | None:
     """Workspace-relative target for one arcname (already stripped of ROOT), or None to skip."""
@@ -285,6 +343,55 @@ def _target_for(rel: str) -> str | None:
         if rel.startswith(prefix):
             return dest + rel[len(prefix):]
     return None                       # config/, README, vectors, or a future arc we don't know
+
+
+def _open_bundle(zip_path) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise ProjectError("That file isn't a readable HYPE project archive.") from e
+
+
+def _read_bundle(zf: zipfile.ZipFile) -> dict:
+    """Validate an open archive and read its non-file payload (state/vectors/config).
+
+    Shared by restore_workspace (which then extracts) and restore_in_place/classify_bundle
+    (which never write). Raises ProjectError with a user-facing message.
+    """
+    names = set(zf.namelist())
+    if not any(n.startswith(f"{ROOT}/") for n in names):
+        raise ProjectError("That zip wasn't made by HYPE (no hype_workspace folder inside).")
+    if f"{ROOT}/config/state.json" not in names:
+        raise ProjectError("This archive predates Save — it has the files but not the "
+                           "session state. Re-create it with Save from a current session.")
+
+    def _json(arc: str):
+        with zf.open(arc) as f:
+            return json.load(f)
+
+    state = _json(f"{ROOT}/config/state.json")
+    fmt = state.get("format_version")
+    if isinstance(fmt, int) and fmt > FORMAT_VERSION:
+        raise ProjectError("This project was saved by a newer version of HYPE — "
+                           "update the app to open it.")
+
+    vectors: dict = {}
+    for key, sub in _VECTOR_ARCS.items():
+        arc = f"{ROOT}/{sub}"
+        if arc not in names:
+            continue
+        feats = (_json(arc) or {}).get("features") or []
+        if feats:
+            vectors[key] = feats if key == "k_zones" else feats[0]
+
+    def _opt(arc: str):
+        return _json(arc) if arc in names else None
+
+    return {"state": state, "vectors": vectors,
+            "params": _opt(f"{ROOT}/config/params.json"),
+            "run_config": _opt(f"{ROOT}/config/run_config.json"),
+            "assessment_input": _opt(f"{ROOT}/config/assessment_input.json"),   # None on v1
+            "scoring_profile": _opt(f"{ROOT}/config/scoring_profile.json")}
 
 
 def restore_workspace(zip_path, work_dir) -> dict:
@@ -301,36 +408,8 @@ def restore_workspace(zip_path, work_dir) -> dict:
     isn't a reopenable HYPE project.
     """
     root = Path(work_dir).resolve()
-    try:
-        zf = zipfile.ZipFile(zip_path)
-    except (zipfile.BadZipFile, OSError) as e:
-        raise ProjectError("That file isn't a readable HYPE project archive.") from e
-    with zf:
-        names = set(zf.namelist())
-        if not any(n.startswith(f"{ROOT}/") for n in names):
-            raise ProjectError("That zip wasn't made by HYPE (no hype_workspace folder inside).")
-        if f"{ROOT}/config/state.json" not in names:
-            raise ProjectError("This archive predates Save — it has the files but not the "
-                               "session state. Re-create it with Save from a current session.")
-
-        def _json(arc: str):
-            with zf.open(arc) as f:
-                return json.load(f)
-
-        state = _json(f"{ROOT}/config/state.json")
-        fmt = state.get("format_version")
-        if isinstance(fmt, int) and fmt > FORMAT_VERSION:
-            raise ProjectError("This project was saved by a newer version of HYPE — "
-                               "update the app to open it.")
-
-        vectors: dict = {}
-        for key, sub in _VECTOR_ARCS.items():
-            arc = f"{ROOT}/{sub}"
-            if arc not in names:
-                continue
-            feats = (_json(arc) or {}).get("features") or []
-            if feats:
-                vectors[key] = feats if key == "k_zones" else feats[0]
+    with _open_bundle(zip_path) as zf:
+        payload = _read_bundle(zf)
 
         extracted = 0
         done: set = set()             # dedupes the depth/wse convenience copies
@@ -349,14 +428,112 @@ def restore_workspace(zip_path, work_dir) -> dict:
             done.add(target_rel)
             extracted += 1
 
-        def _opt(arc: str):
-            return _json(arc) if arc in names else None
+    return payload | {"extracted": extracted, "restored": done}
 
-        params = _opt(f"{ROOT}/config/params.json")
-        run_config = _opt(f"{ROOT}/config/run_config.json")
-        assessment_input = _opt(f"{ROOT}/config/assessment_input.json")   # None on v1 (legacy adapter)
-        scoring_profile = _opt(f"{ROOT}/config/scoring_profile.json")
 
-    return {"state": state, "vectors": vectors, "params": params,
-            "run_config": run_config, "assessment_input": assessment_input,
-            "scoring_profile": scoring_profile, "extracted": extracted, "restored": done}
+def restore_in_place(main_file) -> dict:
+    """Read a project's main .hype (settings-only bundle) WITHOUT writing anything.
+
+    The desktop "open in place" path: the folder holding `main_file` IS the workspace, so
+    there is nothing to extract — computed stages already live in the sibling folders.
+    Payload matches restore_workspace except extracted=0 and restored=None; the caller
+    gates stage presence on disk probes against those siblings instead of the restored set
+    (safe here — nothing was just deleted, so Windows delete-pending can't lie to us).
+    """
+    with _open_bundle(main_file) as zf:
+        payload = _read_bundle(zf)
+    return payload | {"extracted": 0, "restored": None}
+
+
+def classify_bundle(zip_path) -> str:
+    """"project" if this .hype is a desktop project's main file (its folder is the workspace),
+    else "standalone" (a cloud save / portable export whose content lives inside the zip).
+    Validates like restore — raises ProjectError on unreadable/foreign files."""
+    with _open_bundle(zip_path) as zf:
+        payload = _read_bundle(zf)
+    return "project" if payload["state"].get("desktop_project") is True else "standalone"
+
+
+def folder_clash(folder, main_file) -> tuple[list[str], bool]:
+    """What already lives in `folder` that a project rooted at `main_file` would collide
+    with: (names, has_foreign_hype). Names = existing PROJECT_DIRS entries plus every
+    .hype file other than `main_file` itself (a second main file means another project
+    already owns the folder's content dirs). Read-only; safe when `folder` or `main_file`
+    does not exist yet (the create/import clash checks probe targets before any mkdir)."""
+    folder = Path(folder)
+    names = [d for d in PROJECT_DIRS if (folder / d).exists()]
+    foreign: list[str] = []
+    if folder.is_dir():
+        main_r = Path(main_file).resolve()   # strict=False: fine for nonexistent targets
+        foreign = sorted(f.name for f in folder.iterdir()
+                         if f.is_file() and f.suffix.lower() == ".hype"
+                         and f.resolve() != main_r)
+    return names + foreign, bool(foreign)
+
+
+def clash_subfolder(main_file) -> Path:
+    """Fresh-subfolder target the clash dialog offers: <folder>/<stem>/<name>."""
+    main_file = Path(main_file)
+    # rstrip: Win32 silently strips trailing dots/spaces when creating directory names
+    stem = main_file.stem.rstrip(" .") or "Project"
+    return main_file.parent / stem / main_file.name
+
+
+def copy_project_tree(src_folder, dst_folder) -> list[str]:
+    """Copy every PROJECT_DIRS member that exists under `src_folder` into `dst_folder`
+    (the desktop Save As). Only the contract dirs travel — the old main .hype, the
+    transient scene/, and stray user files never do. Existing destination dirs are
+    merged into (dirs_exist_ok); on failure the dirs THIS call created fresh are
+    removed, dirs that already existed keep whatever merged in before the error (the
+    clash dialog already warned about that folder), and the OSError propagates.
+    Returns the copied dir names."""
+    src, dst = Path(src_folder), Path(dst_folder)
+    copied: list[str] = []
+    fresh: list[Path] = []
+    try:
+        for d in PROJECT_DIRS:
+            s = src / d
+            if not s.is_dir():
+                continue
+            t = dst / d
+            if not t.exists():
+                fresh.append(t)
+            shutil.copytree(s, t, dirs_exist_ok=True)
+            copied.append(d)
+    except OSError:
+        for t in fresh:
+            shutil.rmtree(t, ignore_errors=True)
+        raise
+    return copied
+
+
+def save_bundle_to(work_dir, target_path, *, vectors: dict, params: dict | None = None,
+                   run_config: dict | None = None, state: dict | None = None,
+                   assessment_input: dict | None = None,
+                   scoring_profile: dict | None = None) -> None:
+    """Write a settings-only bundle to `target_path` atomically (the desktop in-place Save).
+
+    zip_workspace builds its temp file on %TEMP%, which is routinely a different volume than
+    the project folder — os.replace can't cross volumes. So: copy the finished zip to a
+    sibling `<name>.tmp` first, then swap it in with a same-directory os.replace. A crash
+    mid-save leaves the previous main file untouched.
+    """
+    target = Path(target_path)
+    tmp = zip_workspace(work_dir, vectors=vectors, params=params, run_config=run_config,
+                        state=state, assessment_input=assessment_input,
+                        scoring_profile=scoring_profile, include_computed=False)
+    side = target.with_name(target.name + ".tmp")
+    try:
+        shutil.copyfile(tmp, side)
+        os.replace(side, target)
+    except BaseException:
+        try:
+            side.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass

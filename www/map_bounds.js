@@ -35,8 +35,19 @@
     } catch (e) { /* map not ready — next moveend will report */ }
   }
 
-  function attach(map) {
+  function attach(map, tries) {
     if (window.__hypeMap === map) return;
+    // Only THE main map (inside #map) may claim __hypeMap: the service modals (USGS flow,
+    // NRCS soils) build their own throwaway Leaflet maps, and the init hook fires for those
+    // too — binding one would point the heal/fly/measure machinery at a dead detached map.
+    var el;
+    try { el = map.getContainer(); } catch (e) { return; }
+    if (!el) return;
+    if (!el.isConnected) {                 // init hook can fire before the DOM insert
+      if ((tries || 0) < 25) setTimeout(function () { attach(map, (tries || 0) + 1); }, 200);
+      return;
+    }
+    if (!el.closest || !el.closest("#map")) return;   // a modal map — never bind
     window.__hypeMap = map;
     map.on("moveend zoomend", function () { report(map); });
     report(map);
