@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "version": "dev",
+  "builtFromCommit": "dev",
+  "requiresEnv": "dev",
+  "apps": [
+    {
+      "id": "hype",
+      "dir": ".",
+      "entry": "app.py",
+      "name": "HYPE",
+      "fullName": "Hyporheic Exchange Explorer",
+      "tier": "",
+      "tierNum": 0,
+      "role": "Hyporheic exchange modeling app",
+      "description": "Builds and runs a HEC-RAS + MODFLOW 6 + MODPATH 7 hyporheic model from a map-defined reach.",
+      "status": "live",
+      "webUrl": "https://019f019d-998f-1edd-cf76-f3d4c9e3248e.share.connect.posit.cloud"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>HypeDesktop</AssemblyName>
+    <RootNamespace>Hype.Desktop</RootNamespace>
+    <Product>HYPE Desktop</Product>
+    <Company>gtmenichino</Company>
+    <Version>0.1.0</Version>
+    <!-- English-only: drops the cs/de/es/... satellite resource folders from publish output. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <ApplicationIcon>..\..\resources\icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Hype.Desktop.Core\Hype.Desktop.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4022.49" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
+  </ItemGroup>
+
+  <!-- Launcher page assets, served in-app via SetVirtualHostNameToFolderMapping. -->
+  <ItemGroup>
+    <Content Include="..\..\launcher\**" Link="launcher\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- The WebView2 package also references its WPF assembly; this is a WinForms-only app and the
+       stray reference triggers MSB3277 (WindowsBase version conflict). Drop it. -->
+  <Target Name="TrimWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="$([System.String]::Copy('%(Reference.Identity)').Contains('Microsoft.Web.WebView2.Wpf'))" />
+    </ItemGroup>
+  </Target>
+
+</Project>

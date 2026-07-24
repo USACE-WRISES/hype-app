@@ -7,3 +7,7 @@ bin/linux/** filter=lfs diff=lfs merge=lfs -text
 # manifest stays plain text.
 bin/ras2025/** filter=lfs diff=lfs merge=lfs -text
 bin/ras2025/MANIFEST.md -filter -diff -merge text
+# Bundled Windows MODFLOW 6 / MODPATH 7 (mf6.exe + mp7.exe, ~48 MB) — the desktop
+# dev-mode / fresh-checkout counterpart of bin/linux (installed desktops override via
+# the payload's tools\ dir; the cloud deploy globs exclude this dir).
+bin/win/** filter=lfs diff=lfs merge=lfs -text

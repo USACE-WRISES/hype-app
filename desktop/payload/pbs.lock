@@ -1,0 +1,7 @@
+{
+  "comment": "Pinned python-build-standalone runtime for the env payload. Changing anything here changes ENV_VERSION (content hash of env.lock + pbs.lock) and triggers an env rebuild in CI.",
+  "pythonVersion": "3.12.13",
+  "file": "cpython-3.12.13+20260623-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+  "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.12.13%2B20260623-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+  "sha256": "de3e362376859b060fa8b856c434efa81fcf6d4ede3d6e177c7e2169670cac50"
+}

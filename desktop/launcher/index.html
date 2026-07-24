@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:;">
+  <title>HYPE Desktop</title>
+  <link rel="stylesheet" href="launcher.css">
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <h1>HYPE</h1>
+      <p class="tagline">Hyporheic Exchange Explorer — Desktop</p>
+    </div>
+
+    <!-- App is being launched (the normal path: this page shows only briefly) -->
+    <section id="starting-view" class="panel">
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="starting-message">Preparing…</p>
+      <p id="starting-detail" class="muted"></p>
+    </section>
+
+    <!-- First-run payload setup / update install (driven by the shell's payload manager) -->
+    <section id="setup-view" class="panel" hidden>
+      <h2>Setting up HYPE Desktop</h2>
+      <p id="setup-message">Preparing…</p>
+      <div class="progress" id="setup-progress"><div id="setup-bar" class="progress-bar" style="width: 0%"></div></div>
+      <p id="setup-detail" class="muted"></p>
+      <div id="setup-actions" class="setup-actions" hidden>
+        <button id="setup-retry" class="btn btn-primary" type="button">Try again</button>
+        <button id="setup-from-file" class="btn btn-secondary" type="button" title="Install from an offline bundle folder">Install from file…</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="shell-footer">
+    <span id="footer-mode" class="muted"></span>
+    <a href="#" id="open-logs">Logs</a>
+  </footer>
+
+  <script src="launcher.js"></script>
+</body>
+</html>

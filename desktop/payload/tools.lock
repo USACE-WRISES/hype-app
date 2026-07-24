@@ -1,0 +1,17 @@
+{
+  "comment": "Pinned Windows solver runtimes, folded into the env payload under tools\\. The zips live on the desktop-tools-* prerelease (uploaded once, by hand — reference/ is gitignored so CI cannot rebuild them from the repo). Changing anything here changes ENV_VERSION and triggers an env rebuild + re-ship in CI. To bump: zip the new runtime, upload to a new desktop-tools-N prerelease, update url+sha256 here, push.",
+  "tools": [
+    {
+      "name": "ras2025-win",
+      "url": "https://github.com/gtmenichino/hype-app/releases/download/desktop-tools-1/hype-tools-ras2025-win-1.zip",
+      "sha256": "60ea7909a9feb2852fbc78d62071b6cbe9aa2515a7d6bb07494a62395724a82b",
+      "extractTo": "tools/ras2025"
+    },
+    {
+      "name": "modflow-win",
+      "url": "https://github.com/gtmenichino/hype-app/releases/download/desktop-tools-1/hype-tools-modflow-win-1.zip",
+      "sha256": "fea9dc0ce2ff3b3aa8bfb9b46acc3831529b3d0eccc098c6d927547589e642e6",
+      "extractTo": "tools/modflow"
+    }
+  ]
+}

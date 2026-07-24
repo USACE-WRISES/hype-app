@@ -1,0 +1,161 @@
+# Builds and publishes the HYPE Desktop payload (env + apps components) as a GitHub PRERELEASE,
+# then refreshes the rolling `desktop-current` manifest that installed shells poll.
+#
+# HARD RULE: payload releases, desktop-tools-*, and desktop-current are ALWAYS prereleases. Only
+# shell releases (tags v*) are normal releases — Velopack and humans resolve "latest release" to
+# an installer.
+#
+# Routine app update: just push to main (the paths filter below scopes it to app code). ~8 min
+# later every installed desktop's next update check offers the new apps zip. The env component
+# (python runtime + wheels + Windows solver tools) is rebuilt only when
+# desktop/payload/{env.lock,pbs.lock,prune.txt,tools.lock} change (content-hashed ENV_VERSION),
+# with the relocation smoke gate: the real app must boot from the relocated interpreter with the
+# relocated tools before anything publishes.
+name: desktop-payload
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'hype_app/**'
+      - 'hypetool/**'
+      - 'www/**'
+      - 'requirements.txt'
+      - 'desktop/payload/**'
+      - 'desktop/scripts/**'
+  workflow_dispatch:
+    inputs:
+      force_env_rebuild:
+        description: Rebuild the env component even if ENV_VERSION is unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-payload
+  cancel-in-progress: false
+
+jobs:
+  payload:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # Deterministic: every direct requirement in requirements.txt must be present in env.lock
+      # at a version satisfying its floor. (A full re-compile diff would fail spuriously as
+      # PyPI's transitive versions drift between lock time and push time.)
+      - name: Lock consistency gate
+        run: uv run --with packaging -- python desktop/scripts/check_lock_consistency.py .
+
+      - name: Compute versions and release tag
+        id: ver
+        shell: pwsh
+        run: |
+          $envLine = & desktop\scripts\build-env-payload.ps1 -VersionOnly | Select-String '^ENV_VERSION='
+          $envVersion = $envLine.ToString().Split('=')[1]
+          $shortSha = (git rev-parse --short HEAD).Trim()
+          $appsVersion = "apps-$(Get-Date -Format 'yyyy.MM.dd')-$shortSha"
+          $tag = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}' }
+                 else { "desktop-payload-$(Get-Date -Format 'yyyy.MM.dd')-$shortSha" }
+          "env_version=$envVersion" >> $env:GITHUB_OUTPUT
+          "apps_version=$appsVersion" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "ENV_VERSION=$envVersion APPS_VERSION=$appsVersion TAG=$tag"
+
+      - name: Fetch previous manifest (for env carry-over)
+        id: prev
+        shell: pwsh
+        run: |
+          # gh exits nonzero (without throwing) when the release doesn't exist - first run ever.
+          $found = 'false'
+          gh release download desktop-current --pattern latest-desktop.json --output previous-latest.json
+          if ($LASTEXITCODE -eq 0 -and (Test-Path previous-latest.json)) {
+            $found = 'true'
+          } else {
+            Write-Host 'no previous desktop-current manifest (first payload release)'
+          }
+          "found=$found" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Decide whether the env component must be rebuilt
+        id: envplan
+        shell: pwsh
+        run: |
+          $needed = 'true'
+          if ('${{ steps.prev.outputs.found }}' -eq 'true' -and '${{ inputs.force_env_rebuild }}' -ne 'true') {
+            $previous = Get-Content previous-latest.json -Raw | ConvertFrom-Json
+            if ($previous.components.env.version -eq '${{ steps.ver.outputs.env_version }}') { $needed = 'false' }
+          }
+          "needed=$needed" >> $env:GITHUB_OUTPUT
+          Write-Host "env rebuild needed: $needed"
+
+      - name: Build env payload (relocation smoke gate inside)
+        if: steps.envplan.outputs.needed == 'true'
+        shell: pwsh
+        run: desktop\scripts\build-env-payload.ps1 -NoUvCache
+
+      - name: Build apps payload
+        shell: pwsh
+        run: desktop\scripts\build-apps-payload.ps1 -EnvVersion '${{ steps.ver.outputs.env_version }}' -AppsVersion '${{ steps.ver.outputs.apps_version }}' -PythonExe python
+
+      - name: Compose latest-desktop.json
+        shell: pwsh
+        run: |
+          $base = 'https://github.com/${{ github.repository }}/releases/download/${{ steps.ver.outputs.tag }}'
+          $appsZip = "desktop\build\release\hype-${{ steps.ver.outputs.apps_version }}.zip"
+          $args = @(
+            'desktop/scripts/gen_latest_manifest.py',
+            '--apps-zip', $appsZip,
+            '--apps-version', '${{ steps.ver.outputs.apps_version }}',
+            '--apps-url', "$base/hype-${{ steps.ver.outputs.apps_version }}.zip",
+            '--out', 'latest-desktop.json'
+          )
+          # Previous manifest (when present) carries the shell block + minShellVersion forward;
+          # a freshly built env-zip takes precedence over its env block automatically.
+          if ('${{ steps.prev.outputs.found }}' -eq 'true') {
+            $args += @('--carry-env-from', 'previous-latest.json')
+          }
+          if ('${{ steps.envplan.outputs.needed }}' -eq 'true') {
+            $args += @(
+              '--env-zip', "desktop\build\release\hype-${{ steps.ver.outputs.env_version }}.zip",
+              '--env-version', '${{ steps.ver.outputs.env_version }}',
+              '--env-url', "$base/hype-${{ steps.ver.outputs.env_version }}.zip",
+              '--python', (Get-Content desktop\payload\pbs.lock -Raw | ConvertFrom-Json).pythonVersion
+            )
+          }
+          uv run python @args
+          Get-Content latest-desktop.json
+
+      - name: Publish payload prerelease
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $assets = @("desktop\build\release\hype-${{ steps.ver.outputs.apps_version }}.zip")
+          if ('${{ steps.envplan.outputs.needed }}' -eq 'true') {
+            $assets += "desktop\build\release\hype-${{ steps.ver.outputs.env_version }}.zip"
+          }
+          # --prerelease is load-bearing: a normal release here would hijack releases/latest
+          # away from the shell installers (see desktop/RELEASING.md).
+          gh release create $tag --prerelease --target ${{ github.sha }} `
+            --title "HYPE Desktop payload $tag" `
+            --notes "Internal payload for HYPE Desktop (env: ${{ steps.ver.outputs.env_version }}, apps: ${{ steps.ver.outputs.apps_version }}). Install the app from the latest v* release instead." `
+            @assets
+
+      - name: Refresh rolling desktop-current manifest
+        shell: pwsh
+        run: |
+          gh release view desktop-current *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create desktop-current --prerelease `
+              --title 'desktop-current (rolling payload manifest)' `
+              --notes 'Machine-read by HYPE Desktop to discover payload updates. Not for humans - install the app from the latest v* release.'
+          }
+          gh release upload desktop-current latest-desktop.json --clobber

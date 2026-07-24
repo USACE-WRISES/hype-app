@@ -1,0 +1,98 @@
+# Builds, packages (Velopack), and publishes the HYPE Desktop shell when a v* tag is pushed.
+# v* tags are reserved for the shell in this repo; the release created here is a NORMAL release
+# (never prerelease) so `releases/latest` — used by Velopack's updater and by humans — always
+# resolves to an installer. Payload releases live on desktop-payload-* prereleases.
+#
+# Release recipe (solo dev): bump <Version> in desktop/src/Hype.Desktop/Hype.Desktop.csproj if
+# you care about the assembly metadata, then:  git tag v0.2.0 && git push origin v0.2.0
+name: desktop-shell
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-shell
+  cancel-in-progress: false
+
+jobs:
+  shell:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { Write-Host "::error::tag must be vX.Y.Z"; exit 1 }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Unit tests
+        run: dotnet test desktop/Hype.Desktop.slnx -c Release --nologo
+
+      - name: Publish self-contained
+        run: >
+          dotnet publish desktop/src/Hype.Desktop -c Release -r win-x64 --self-contained
+          -p:Version=${{ steps.ver.outputs.version }}
+          -o desktop/publish
+
+      - name: Install Velopack CLI
+        run: dotnet tool install --global vpk
+
+      - name: Download previous release (enables delta packages)
+        continue-on-error: true   # first release has nothing to delta against
+        run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ github.token }}
+
+      - name: Pack (Setup.exe + self-updating portable zip + deltas)
+        shell: pwsh
+        run: |
+          # Code signing is deliberately dormant (unsigned v1 decision). When a certificate
+          # materializes, add its vpk signing flags here — e.g. --signParams or
+          # --azureTrustedSignFile — gated on repo secrets.
+          vpk pack --packId HypeDesktop `
+            --packVersion ${{ steps.ver.outputs.version }} `
+            --packDir desktop/publish `
+            --mainExe HypeDesktop.exe `
+            --packTitle 'HYPE Desktop' `
+            --packAuthors 'gtmenichino' `
+            --icon desktop/resources/icon.ico
+
+      - name: Upload release (installer, portable, deltas, RELEASES feed)
+        run: >
+          vpk upload github --repoUrl https://github.com/${{ github.repository }}
+          --token ${{ github.token }} --publish
+          --releaseName "HYPE Desktop v${{ steps.ver.outputs.version }}"
+          --tag ${{ github.ref_name }}
+
+      - name: Update shell block on the rolling desktop-current manifest
+        shell: pwsh
+        run: |
+          gh release download desktop-current --pattern latest-desktop.json --output latest-desktop.json
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path latest-desktop.json)) {
+            Write-Host 'no desktop-current manifest yet (payload workflow has not run) - skipping shell block update'
+            exit 0
+          }
+          $version = '${{ steps.ver.outputs.version }}'
+          $base = 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}'
+          $manifest = Get-Content latest-desktop.json -Raw | ConvertFrom-Json
+          $shell = [ordered]@{
+            version      = $version
+            installerUrl = "$base/HypeDesktop-win-Setup.exe"
+            portableUrl  = "$base/HypeDesktop-win-Portable.zip"
+            sha256       = ''
+          }
+          $manifest | Add-Member -NotePropertyName shell -NotePropertyValue $shell -Force
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 latest-desktop.json
+          gh release upload desktop-current latest-desktop.json --clobber

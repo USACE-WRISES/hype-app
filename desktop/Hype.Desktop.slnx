@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Hype.Desktop.Core/Hype.Desktop.Core.csproj" />
+    <Project Path="src/Hype.Desktop/Hype.Desktop.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Hype.Desktop.Core.Tests/Hype.Desktop.Core.Tests.csproj" />
+  </Folder>
+</Solution>

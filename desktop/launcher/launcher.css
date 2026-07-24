@@ -1,0 +1,76 @@
+/* HYPE Desktop launcher page — same palette as the app's design tokens (www/styles.css). */
+:root {
+  --accent: #2f4b7c;
+  --accent-dark: #243a61;
+  --accent-soft: #eef3fb;
+  --border: #d5deea;
+  --rule: #e5e8ee;
+  --text: #33415c;
+  --text-strong: #2a3344;
+  --text-muted: #6d7889;
+  --err: #b42318;
+  --err-soft: #fdecea;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column;
+  font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+  color: var(--text); background: #f6f8fb;
+}
+
+main {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 22px; padding: 24px;
+}
+
+.brand { text-align: center; }
+.brand h1 {
+  margin: 0; font-size: 34px; letter-spacing: .04em; color: var(--accent-dark);
+}
+.tagline { margin: 4px 0 0; color: var(--text-muted); }
+
+.panel {
+  width: min(520px, 92vw); text-align: center;
+  background: #fff; border: 1px solid var(--border); border-radius: 10px;
+  padding: 26px 28px; box-shadow: 0 8px 28px rgba(15, 23, 42, .10);
+}
+.panel h2 { margin: 0 0 10px; font-size: 17px; color: var(--text-strong); }
+.panel.error { border-color: var(--err); background: var(--err-soft); }
+
+.muted { color: var(--text-muted); font-size: 12.5px; }
+
+/* Indeterminate spinner for the (normally brief) app-start wait. */
+.spinner {
+  width: 34px; height: 34px; margin: 0 auto 12px;
+  border: 3px solid var(--accent-soft); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.progress {
+  height: 8px; margin: 12px 0 8px; border-radius: 4px;
+  background: var(--accent-soft); overflow: hidden;
+}
+.progress[hidden] { display: none; }
+.progress-bar { height: 100%; background: var(--accent); transition: width .3s ease; }
+
+.setup-actions { margin-top: 14px; display: flex; gap: 10px; justify-content: center; }
+
+.btn {
+  font: 600 13px/1 "Segoe UI", system-ui, sans-serif;
+  padding: 8px 14px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: #fff; color: var(--text);
+}
+.btn:hover { background: var(--accent-soft); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: var(--accent-dark); }
+
+.shell-footer {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px; border-top: 1px solid var(--rule); background: #fff;
+  font-size: 12px;
+}
+.shell-footer a { color: var(--accent); text-decoration: none; }
+.shell-footer a:hover { text-decoration: underline; }
