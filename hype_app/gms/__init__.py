@@ -8,5 +8,6 @@ the project-explorer encoding and tools/make_gms_template.py for the template's
 provenance.
 """
 from .export import GmsExportError, export_gms_project
+from .publish import GMS_DIRNAME, refresh_gms_tree
 
-__all__ = ["export_gms_project", "GmsExportError"]
+__all__ = ["export_gms_project", "GmsExportError", "refresh_gms_tree", "GMS_DIRNAME"]

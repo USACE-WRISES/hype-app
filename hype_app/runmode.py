@@ -18,6 +18,16 @@ def hz_particle_cap() -> int:
     return int(os.environ.get("HYPE_HZ_MAX_PARTICLES", "2000000"))
 
 
+def picker_mode() -> str:
+    """No-shell desktop picker flavor: "auto" (default) spawns the tkinter child
+    dialog; "modal" keeps the typed-path fallback (E2E drives this via HYPE_PICKER).
+    Never "auto" outside desktop mode: cloud must not spawn dialogs on a server."""
+    if not IS_DESKTOP:
+        return "modal"
+    env = os.environ.get("HYPE_PICKER", "auto").strip().lower()
+    return "modal" if env == "modal" else "auto"
+
+
 def cloud_limits() -> list[tuple[str, str]]:
     """(name, value) rows for the stage-bar Cloud Run hover card. Reads the live
     env-overridable caps at render time so the hover never goes stale."""

@@ -11,6 +11,11 @@ from .contracts import AssessmentResultsV2
 from .provenance import HypeWarning, Severity
 
 
+#: Tolerance for the §27.8 screening identities. Not `tol_pct`: these are exact algebraic
+#: identities rather than physical balances, so anything above rounding noise is a real defect.
+IDENTITY_TOL = 1e-3
+
+
 def _finite(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
@@ -98,7 +103,45 @@ def validate_results(results: AssessmentResultsV2, *, hz_accounting: dict | None
         if min(p10, p50, p90) < 0:
             warn("residence_negative", "Residence-time percentiles include a negative value.")
 
+    # 27.8 function-screening identities ---------------------------------------
+    # These two are exact algebraic identities, not physical balances: the path weights SUM to
+    # Q_HEF, and the reported areal-rate decomposition IS mass over area, when both sides come
+    # from the same pass. Float summation lands near 1e-12, so IDENTITY_TOL is generous. They are
+    # computed in screen.py precisely because drift here rescales every screening mass by one
+    # factor and nothing else would notice; until now nothing surfaced them either.
+    fn = results.functions
+    if fn is not None:
+        sections = [x for x in (fn.nutrient, *fn.dissolved_endpoints(), fn.thermal, fn.habitat)
+                    if x is not None]
+        # One diagnostic, not one per section: every section carries the same weight sum, so
+        # three identical warnings would just be noise.
+        ids = [float(x.weight_identity_rel_diff) for x in sections
+               if _finite(getattr(x, "weight_identity_rel_diff", None))]
+        if ids:
+            worst = max(ids)
+            diag["screening_weight_identity_rel_diff"] = worst
+            if worst > IDENTITY_TOL:
+                warn("weight_identity",
+                     f"Flow-path weights sum to a returning hyporheic flow that differs from the "
+                     f"reported value by {worst:.3g} (relative). Every screening mass is scaled "
+                     f"by that same factor; the usual cause is m3/s passed where m3/day was "
+                     f"expected, or the reverse.", Severity.error)
+        closures = [float(x.chain_closure_rel_diff) for x in sections
+                    if _finite(getattr(x, "chain_closure_rel_diff", None))]
+        if closures:
+            worst = max(closures)
+            diag["screening_chain_closure_rel_diff"] = worst
+            if worst > IDENTITY_TOL:
+                warn("chain_closure",
+                     f"The reported areal removal rate does not reproduce mass divided by "
+                     f"streambed area within {IDENTITY_TOL:.0e} (off by {worst:.3g}). The stored "
+                     f"exchange flux and the flow-path weights came from different passes.")
+        # storage_cross_check_rel_diff is deliberately NOT checked: it compares RTD-derived mobile
+        # storage against bulk pore volume, two genuinely different quantities that differ by
+        # tens of percent on healthy runs. Warning on it would train users to ignore this panel,
+        # which is where the weight-identity signal has to land.
+
     return warnings, diag
 
 
-__all__ = ["validate_results"]
+__all__ = ["validate_results", "IDENTITY_TOL"]

@@ -1297,6 +1297,13 @@ def build_gwf_model(
     if k33_array is None:
         k33_array = base_k33 if base_k33 is not None else \
             np.full((cfg.nlay, cfg.nrow, cfg.ncol), float(cfg.kv), dtype=float)
+    # Post-resolution uniform scale (Hydraulic Alternatives sweep): one multiply here covers
+    # every K source at once, so no scenario can scale one source and miss another.
+    ks = float(getattr(cfg, "k_scale", 1.0) or 1.0)
+    if ks != 1.0:
+        k_array = np.asarray(k_array, dtype=float) * ks
+        k33_array = np.asarray(k33_array, dtype=float) * ks
+        print(f"[k_scale] all K/K33 values scaled x{ks:g}")
     flopy.mf6.ModflowGwfnpf(
         gwf,
         icelltype=2,

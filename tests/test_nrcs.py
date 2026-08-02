@@ -30,6 +30,16 @@ def test_parse_table_missing_key_raises():
     from hype_app.services.http import PayloadError
     with pytest.raises(PayloadError):
         parse_table({"nope": []})
+    with pytest.raises(PayloadError):
+        parse_table("not a dict")
+
+
+def test_parse_table_zero_row_shapes():
+    # SDA answers a zero-row query with a bare {} (verified live 2026-08-02); tolerate the
+    # explicit-null and empty-list spellings too. None of these are malformed payloads.
+    assert parse_table({}) == []
+    assert parse_table({"Table": None}) == []
+    assert parse_table({"Table": []}) == []
 
 
 def test_resolve_columns_schema_adapter():
@@ -108,6 +118,97 @@ def test_digit_validation_filters_bad_mukeys(sda_handler):
     out = client.fetch_tabular(["281221", "bad-key", "'; DROP TABLE"])
     # only the valid digit mukey survives to the query; the call still returns structured data
     assert "horizons" in out
+
+
+def test_fetch_survives_zero_row_restrictions(sda_handler):
+    # THE user-reported failure (2026-08-02): map units with no corestrictions records make
+    # SDA answer that query with a bare {} and the whole fetch used to die on PayloadError.
+    def handler(request):
+        if "corestrictions" in json.loads(request.content).get("query", ""):
+            return httpx.Response(200, json={})
+        return sda_handler(request)
+
+    snap = _client(handler).fetch_soil_snapshot(_domain_box(), working_crs_epsg=26919)
+    assert snap.polygons and snap.map_units
+    assert all(not c.restrictions for mu in snap.map_units for c in mu.components)
+
+
+def test_fetch_no_coverage_returns_empty_snapshot(sda_handler):
+    # A domain outside SSURGO coverage: the mupolygon query itself returns zero rows ({}).
+    def handler(request):
+        if "FROM mupolygon" in json.loads(request.content).get("query", ""):
+            return httpx.Response(200, json={})
+        return sda_handler(request)
+
+    snap = _client(handler).fetch_soil_snapshot(_domain_box(), working_crs_epsg=26919)
+    assert snap.polygons == [] and snap.map_units == []
+    assert any(w.code == "no_soil_coverage" for w in snap.missing_diagnostics)
+
+
+def test_bad_geometry_rows_warned_not_silent(sda_handler):
+    # One unparseable WKT row must surface as a geometry_parse warning, not vanish.
+    mupolygon = _load("mupolygon.json")
+    cols = [str(c) for c in mupolygon["Table"][0]]
+    gi = cols.index("geom")
+    rows = [list(r) for r in mupolygon["Table"][1:]]
+    rows[0][gi] = "POLYGON((not wkt"
+    doctored = {"Table": [cols, *rows]}
+
+    def handler(request):
+        if "FROM mupolygon" in json.loads(request.content).get("query", ""):
+            return httpx.Response(200, json=doctored)
+        return sda_handler(request)
+
+    snap = _client(handler).fetch_soil_snapshot(_domain_box(), working_crs_epsg=26919)
+    assert snap.polygons, "remaining rows still parse"
+    warn = next(w for w in snap.missing_diagnostics if w.code == "geometry_parse")
+    assert "1 soil polygon" in warn.message
+
+
+# --------------------------------------------------------------------------- child runner
+class _ListQueue:
+    def __init__(self):
+        self.items = []
+
+    def put(self, item):
+        self.items.append(item)
+
+
+def test_child_run_reports_friendly_error(monkeypatch):
+    from hype_app import soil_run
+    from hype_app.services import nrcs as nrcs_mod
+    from hype_app.services.http import ServiceTimeout
+
+    class Boom:
+        def __init__(self, *a, **k):
+            pass
+
+        def fetch_soil_snapshot(self, *a, **k):
+            raise ServiceTimeout("ReadTimeout contacting https://sda.example")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(nrcs_mod, "NRCSClient", Boom)
+    q = _ListQueue()
+    soil_run.child_run({"domain_geojson": {
+        "type": "Polygon", "coordinates": [[[0, 0], [0, 1], [1, 1], [0, 0]]]}}, q)
+    kind, err = q.items[-1]
+    assert kind == "error"
+    assert isinstance(err, dict)
+    assert "did not respond" in err["message"] and "internet connection" in err["message"]
+    assert "ServiceTimeout" in err["trace"]
+
+
+def test_child_run_friendly_lines():
+    from hype_app.services.http import PayloadError, RateLimited
+    from hype_app.soil_run import _friendly
+
+    assert _friendly(PayloadError("SDA response missing 'Table'.")).startswith(
+        "NRCS Soil Data Access returned an unexpected response.")
+    assert _friendly(RateLimited("Rate limited by x (HTTP 429).")) == \
+        "Rate limited by x (HTTP 429)."
+    assert _friendly(ValueError("nope")) == "ValueError: nope"
 
 
 def test_bedrock_restriction_flagged():

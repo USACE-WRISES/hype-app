@@ -17,8 +17,11 @@ def _make_workspace(root):
     (root / "inputs" / "dem.tif").write_bytes(b"FAKE-DEM")
     (root / "data_sources" / "usgs").mkdir(parents=True)
     (root / "data_sources" / "usgs" / "delineate.json").write_text('{"ok": true}')
-    (root / "sensitivity").mkdir(parents=True)
-    (root / "sensitivity" / "manifest.json").write_text('{"scenarios": []}')
+    (root / "alternatives").mkdir(parents=True)
+    (root / "alternatives" / "index.json").write_text('{"scenarios": []}')
+    (root / "alternatives" / "k10_gradient1" / "summary" / "hz").mkdir(parents=True)
+    (root / "alternatives" / "k10_gradient1" / "summary" / "hz" / "hz_stats.json"
+     ).write_text('{"classes": {}}')
     (root / "report").mkdir(parents=True)
     (root / "report" / "report.html").write_text("<html></html>")
     # heavy computed trees — what the settings-only scope leaves behind
@@ -100,11 +103,13 @@ def test_v2_roundtrip(tmp_path):
     # v2 trees restored to the workspace layout
     assert (dst / "inputs" / "dem.tif").read_bytes() == b"FAKE-DEM"
     assert (dst / "data_sources" / "usgs" / "delineate.json").exists()
-    assert (dst / "sensitivity" / "manifest.json").exists()
+    assert (dst / "alternatives" / "index.json").exists()
+    assert (dst / "alternatives" / "k10_gradient1" / "summary" / "hz"
+            / "hz_stats.json").exists()
     # the restored-manifest the app gates stage state on
     assert "inputs/dem.tif" in out["restored"]
     assert "model/gwf_workspace/sim.nam" in out["restored"]
-    assert any(p.startswith("sensitivity/") for p in out["restored"])
+    assert any(p.startswith("alternatives/") for p in out["restored"])
 
 
 def test_site_metadata_survives_roundtrip(tmp_path):
@@ -142,7 +147,7 @@ def test_full_scope_includes_computed_trees(tmp_path):
                 f"{bundle.ROOT}/4_Surface_Water/HEC-RAS/project.prj",
                 f"{bundle.ROOT}/5_Groundwater/model/gwf_workspace/sim.nam",
                 f"{bundle.ROOT}/5_Groundwater/Results/head/head_L1.tif",
-                f"{bundle.ROOT}/sensitivity/manifest.json",
+                f"{bundle.ROOT}/alternatives/index.json",
                 f"{bundle.ROOT}/6_Site_Report/report.html"):
         assert arc in names
 
@@ -164,7 +169,7 @@ def test_settings_only_scope(tmp_path):
     assert f"{bundle.ROOT}/1_Reach_Centerline/reach_centerline.geojson" in names
     assert f"{bundle.ROOT}/data_sources/usgs/delineate.json" in names
     heavy = ("2_Terrain/", "4_Surface_Water/", "5_Groundwater/", "6_Site_Report/",
-             "sensitivity/")
+             "alternatives/")
     assert not [n for n in names if any(f"/{h}" in n for h in heavy)]
     assert "Saved without computed data" in zf.read(f"{bundle.ROOT}/README.txt").decode()
 
@@ -176,9 +181,32 @@ def test_settings_only_scope(tmp_path):
     assert out["vectors"]["reach"] == _FEATURE
     assert not (dst / "inputs" / "dem.tif").exists()
     assert not (dst / "model" / "gwf_workspace").exists()
-    # no computed artifacts in the restored-manifest -> the app restores gw/sens as not-done
-    assert not any(p.startswith(("model/gwf_workspace/", "sensitivity/"))
+    # no computed artifacts in the restored-manifest -> the app restores gw/alts as not-done
+    assert not any(p.startswith(("model/gwf_workspace/", "alternatives/"))
                    for p in out["restored"])
+
+
+def test_legacy_sensitivity_arcs_are_dropped(tmp_path):
+    """Archives from the retired gradient-bounds sweep carry sensitivity/ arcs. They restore
+    with no error and produce NO output tree: old sensitivity results do not come back, and
+    a stray on-disk sensitivity/ folder never trips the clash check as foreign content."""
+    src = tmp_path / "legacy"
+    (src / "sensitivity").mkdir(parents=True)
+    (src / "sensitivity" / "manifest.json").write_text('{"scenarios": []}')
+    (src / "inputs").mkdir()
+    (src / "inputs" / "dem.tif").write_bytes(b"FAKE-DEM")
+    zip_path = bundle.zip_workspace(src, vectors={}, state={"format_version": 2},
+                                    extra_trees=(("sensitivity", src / "sensitivity"),))
+    dst = tmp_path / "d"
+    dst.mkdir()
+    out = bundle.restore_workspace(zip_path, dst)
+    assert not (dst / "sensitivity").exists()
+    assert not any(p.startswith("sensitivity/") for p in out["restored"])
+    # clash check: a leftover sensitivity/ dir is ours (LEGACY_DIRS), not foreign content
+    proj = tmp_path / "proj"
+    (proj / "sensitivity").mkdir(parents=True)
+    names, foreign, others = bundle.folder_clash(proj, proj / "Site.hype")
+    assert not foreign and "sensitivity" not in others and "sensitivity" not in names
 
 
 def test_v1_archive_opens_via_legacy_adapter(tmp_path):

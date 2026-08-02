@@ -5,8 +5,7 @@ points, head = nearest-WSE + gradient × distance previewed app-side by hype_app
 
 These tests pin the pure pieces: the multiplier scale, the points→engine profile parity, the
 preview edge sampler vs the engine's validity mask, the -9999-sentinel hardening, the
-click→station math, the kept-input restore migration, and the default sensitivity bounds
-(without which every scenario hashes identical and the manifest silently collapses to 1)."""
+click→station math, and the kept-input restore migration."""
 import numpy as np
 import pytest
 
@@ -20,7 +19,6 @@ from hype_app.contracts import (
 )
 from hype_app.gradients import (
     anchor_head,
-    apply_default_bounds,
     downstream_wse_warnings,
     migrate_kept_gradients,
     signed_multiplier,
@@ -213,44 +211,6 @@ def test_migrate_preserves_explicit_bounds():
             "g_left_ctl": "0, 0.01\n0.5, 0.02, 0.015, 0.025\n1, 0.03"}
     pts = migrate_kept_gradients(kept, None)
     assert pts[0]["lower"] == 0.015 and pts[0]["upper"] == 0.025
-
-
-# --- default sensitivity bounds ---------------------------------------------------------------
-
-def _ctl(g, station=0.0, lower=None, upper=None):
-    return GradientControl(id=f"left-{station:g}", side=Side.left, station=station,
-                           preferred=g, lower=lower, upper=upper)
-
-
-def test_points_default_bounds():
-    with_ref = apply_default_bounds([_ctl(0.004), _ctl(0.0, station=1.0)],
-                                    ref_slope_value=0.004, slight=0.5)
-    assert with_ref[0].lower == pytest.approx(0.004 - 0.002)    # ± slight × ref slope
-    assert with_ref[1].upper == pytest.approx(+0.002)           # even for a zero gradient
-    no_ref = apply_default_bounds([_ctl(0.004)], ref_slope_value=None)
-    assert no_ref[0].lower == pytest.approx(0.002)              # ±50% of the gradient
-    assert no_ref[0].upper == pytest.approx(0.006)
-    kept = apply_default_bounds([_ctl(0.004, lower=0.001, upper=0.002)],
-                                ref_slope_value=0.004)
-    assert kept[0].lower == 0.001 and kept[0].upper == 0.002    # explicit bounds preserved
-    dead = apply_default_bounds([_ctl(0.0)], ref_slope_value=None)
-    assert dead[0].lower is None and dead[0].upper is None      # zero g + no slope -> unset
-
-
-def test_manifest_collapses_without_bounds():
-    """Documents the _start_sens guard's premise: all-None bounds make the lower/upper variants
-    hash identical to Preferred, so build_manifest(linked) yields exactly one scenario."""
-    from hype_app.contracts import GeneratorType
-    from hype_app.sensitivity import build_manifest
-    cfg = GradientBoundaryConfigV2(
-        mode="quantitative",
-        left_controls=[_ctl(0.0), _ctl(0.0, station=1.0)],
-        right_controls=[GradientControl(id="right-0", side=Side.right, station=0.0,
-                                        preferred=0.0),
-                        GradientControl(id="right-1", side=Side.right, station=1.0,
-                                        preferred=0.0)])
-    manifest = build_manifest(cfg, GeneratorType.linked)
-    assert len(manifest.scenarios) == 1
 
 
 # --- downstream-WSE monotonicity warnings --------------------------------------------------

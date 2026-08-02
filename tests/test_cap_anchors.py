@@ -4,14 +4,11 @@ the corner on the cap line — instead of the globally nearest wetted edge (whic
 be a bank partway down the reach). Intermediate points keep the nearest-edge snap.
 
 These tests pin the two mirrored samplers (preview `wse_index.valid_samples_along_line` vs
-engine `my_utils.nearest_valid_wse_along_line`: same half-pixel density, same validity mask),
-the engine's f0/f1 anchor override in `compute_boundary_heads_from_profile` (with a no-anchor
-regression pin), and the method-version-aware scenario hash that keeps restored sensitivity
-results from mixing anchor semantics with fresh runs."""
+engine `my_utils.nearest_valid_wse_along_line`: same half-pixel density, same validity mask)
+and the engine's f0/f1 anchor override in `compute_boundary_heads_from_profile` (with a
+no-anchor regression pin)."""
 import numpy as np
 import pytest
-
-from hype_app.contracts import GradientBoundaryConfigV2, GradientControl, Side
 
 # Raster convention (mirrors test_gradient_points): EPSG:32618 (metric), 2 m pixels, origin
 # (100, 100) top-left — pixel (row, col) center = (101 + 2*col, 99 - 2*row).
@@ -175,21 +172,3 @@ def test_compute_boundary_heads_with_anchors(tmp_path):
     _, only_f0, still_b1 = compute_boundary_heads_from_profile(
         cells, gx, gy, line, prof, idx, log=quiet, f0_anchor=(7.0, 215.0))
     assert only_f0 == pytest.approx(215.07) and still_b1 == pytest.approx(b_f1)
-
-
-# --- scenario hash ---------------------------------------------------------------------------
-
-def test_scenario_hash_includes_method_version():
-    """Same gradients under a different head-anchor rule = a different scenario: restored
-    sensitivity results must not be mixed with fresh runs after the anchor revision."""
-    from hype_app.sensitivity import canonical_scenario_hash
-
-    def _side(side):
-        return [GradientControl(id=f"{side.value}-0", side=side, station=0.0, preferred=0.004),
-                GradientControl(id=f"{side.value}-1", side=side, station=1.0, preferred=0.006)]
-    cfg = GradientBoundaryConfigV2(mode="quantitative",
-                                   left_controls=_side(Side.left),
-                                   right_controls=_side(Side.right))
-    assert canonical_scenario_hash(cfg) == canonical_scenario_hash(cfg.model_copy())
-    old = cfg.model_copy(update={"method_version": "head-anchor/1.0"})
-    assert canonical_scenario_hash(cfg) != canonical_scenario_hash(old)

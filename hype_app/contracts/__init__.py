@@ -2,7 +2,8 @@
 
 Import site for every Pydantic model that crosses a persistence or process boundary: the frozen
 input snapshot, USGS flow lookup, NRCS soils + derived conductivity, structured gradients,
-sensitivity manifest, and canonical results. All are Shiny-independent and JSON-round-trippable.
+hydraulic-alternatives manifest, and canonical results. All are Shiny-independent and
+JSON-round-trippable.
 
 `migrate(kind, data)` is the single explicit migration entry point — later phases register
 version-upgrade functions here rather than reinterpreting old payloads implicitly (§7.7, §4.4).
@@ -42,17 +43,24 @@ from .results import (
     RESULTS_SCHEMA_VERSION,
     AssessmentResultsV2,
     ConnectivityMetrics,
+    ContaminantScreening,
+    FunctionScreening,
+    HabitatScreening,
+    MicroplasticRetention,
+    NutrientScreening,
+    OpportunityPoint,
+    ReactiveScreening,
     ResidenceTimeMetrics,
+    ThermalOpportunity,
     ThresholdResult,
     ZoneMetrics,
 )
-from .sensitivity import (
-    DEFAULT_MAX_SCENARIOS,
-    SENSITIVITY_MANIFEST_SCHEMA_VERSION,
-    GeneratorType,
-    ScenarioSpec,
-    ScenarioStatus,
-    SensitivityScenarioManifest,
+from .alternatives import (
+    ALT_STATUS_LABEL,
+    ALTERNATIVES_MANIFEST_SCHEMA_VERSION,
+    AltScenario,
+    AltStatus,
+    HydraulicAlternativesManifest,
 )
 from .soils import (
     SOIL_SNAPSHOT_SCHEMA_VERSION,
@@ -76,7 +84,7 @@ SCHEMA_VERSIONS: dict[str, str] = {
     "flow-lookup-snapshot": FLOW_SNAPSHOT_SCHEMA_VERSION,
     "soil-data-snapshot": SOIL_SNAPSHOT_SCHEMA_VERSION,
     "gradient-boundary-config": GRADIENT_SCHEMA_VERSION,
-    "sensitivity-scenario-manifest": SENSITIVITY_MANIFEST_SCHEMA_VERSION,
+    "hydraulic-alternatives": ALTERNATIVES_MANIFEST_SCHEMA_VERSION,
     "assessment-results": RESULTS_SCHEMA_VERSION,
 }
 
@@ -104,14 +112,49 @@ def migrate(kind: str, data: dict[str, Any]) -> dict[str, Any]:
 def _drop_hfci_2_0(data: dict[str, Any]) -> dict[str, Any]:
     """assessment-results 2.0 -> 2.1: the HFCI composite index was removed. Drop the field so an
     older results payload validates under the current model (the report leads with the three
-    hydraulic dimensions; there is no combined score)."""
+    hydraulic dimensions; there is no combined score).
+
+    Hands off to the 2.1 step rather than stamping the current version, so the chain keeps
+    running as further migrations are registered."""
     out = dict(data)
     out.pop("hfci", None)
-    out["schema_version"] = RESULTS_SCHEMA_VERSION
+    out["schema_version"] = "assessment-results/2.1"
+    return out
+
+
+def _add_functions_2_1(data: dict[str, Any]) -> dict[str, Any]:
+    """assessment-results 2.1 -> 2.2: the hyporheic function screening container was added.
+
+    Nothing to move: `functions` is optional and defaults to None, so a 2.1 payload is already
+    valid under the 2.2 model and this only stamps the version. The step exists so the bump is
+    explicit and so a later migration has a documented predecessor to chain from.
+
+    Stamps the LITERAL 2.2, not `RESULTS_SCHEMA_VERSION`, for the same reason `_drop_hfci_2_0`
+    does. `migrate()` makes a single pass and matches on the version it finds, so stamping the
+    current version here would carry a 2.1 payload straight past every step registered after this
+    one, silently skipping them."""
+    out = dict(data)
+    out["schema_version"] = "assessment-results/2.2"
+    return out
+
+
+def _swap_sensitivity_2_2(data: dict[str, Any]) -> dict[str, Any]:
+    """assessment-results 2.2 -> 2.3: the gradient-bounds sensitivity manifest was replaced by
+    the Hydraulic Alternatives sweep. Old payloads carry `"sensitivity": null` (or, rarely, a
+    stale manifest that the new model cannot validate); the new `alternatives` field starts
+    None either way, so dropping the key is the whole migration.
+
+    Stamps the LITERAL 2.3, not `RESULTS_SCHEMA_VERSION`, per the chain rule documented on
+    `_add_functions_2_1`."""
+    out = dict(data)
+    out.pop("sensitivity", None)
+    out["schema_version"] = "assessment-results/2.3"
     return out
 
 
 register_migration("assessment-results", "2.0", _drop_hfci_2_0)
+register_migration("assessment-results", "2.1", _add_functions_2_1)
+register_migration("assessment-results", "2.2", _swap_sensitivity_2_2)
 
 
 __all__ = [
@@ -131,10 +174,13 @@ __all__ = [
     "AssessmentInputSnapshot", "INPUT_SNAPSHOT_SCHEMA_VERSION",
     # results
     "ConnectivityMetrics", "ResidenceTimeMetrics", "ZoneMetrics", "ThresholdResult",
+    "OpportunityPoint", "ReactiveScreening", "NutrientScreening", "ContaminantScreening",
+    "HabitatScreening", "MicroplasticRetention", "ThermalOpportunity",
+    "FunctionScreening",
     "AssessmentResultsV2", "RESULTS_SCHEMA_VERSION",
-    # sensitivity
-    "GeneratorType", "ScenarioStatus", "ScenarioSpec", "SensitivityScenarioManifest",
-    "SENSITIVITY_MANIFEST_SCHEMA_VERSION", "DEFAULT_MAX_SCENARIOS",
+    # alternatives
+    "AltStatus", "ALT_STATUS_LABEL", "AltScenario", "HydraulicAlternativesManifest",
+    "ALTERNATIVES_MANIFEST_SCHEMA_VERSION",
     # registry
     "SCHEMA_VERSIONS", "register_migration", "migrate",
 ]

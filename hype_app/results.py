@@ -65,6 +65,44 @@ def _valid_mask(a, nodata):
     return m & (a > -9000.0)                            # guard -9999 sentinel / HDRY
 
 
+def full_coverage_layer(tifs) -> int:
+    """1-based index of the FIRST head layer whose valid cells cover the whole 2-D active
+    footprint (union of valid cells across all layers). Upper layers are often clipped by
+    the above-ground idomain deactivation, so contours drawn from them stop mid-domain;
+    this picks the shallowest layer that spans the full model. Falls back to the layer
+    with the largest coverage, and to 1 when nothing is readable."""
+    import numpy as np
+    import rasterio
+
+    masks = []
+    for f in tifs or []:
+        try:
+            with rasterio.open(f) as s:
+                a = s.read(1).astype("float64")
+                masks.append(_valid_mask(a, s.nodata))
+        except Exception:  # noqa: BLE001 — unreadable layer counts as empty
+            masks.append(None)
+    shaped = [m for m in masks if m is not None]
+    if not shaped:
+        return 1
+    footprint = np.zeros_like(shaped[0], dtype=bool)
+    for m in shaped:
+        if m.shape == footprint.shape:
+            footprint |= m
+    if not footprint.any():
+        return 1
+    best_k, best_cov = 1, -1.0
+    for k, m in enumerate(masks, start=1):
+        if m is None or m.shape != footprint.shape:
+            continue
+        if bool(m[footprint].all()):
+            return k
+        cov = float(m[footprint].sum())
+        if cov > best_cov:
+            best_k, best_cov = k, cov
+    return best_k
+
+
 def head_value_range(paths) -> tuple[float, float]:
     """Global (vmin, vmax) of head across all layers, ignoring nodata — keeps colors comparable."""
     import numpy as np
@@ -106,6 +144,26 @@ def raster_overlay(path, *, vmin, vmax, cmap="viridis", max_dim: int = 1024,
     rgba = cmap_obj(Normalize(vmin=vmin, vmax=vmax)(np.where(valid, z, vmin)))
     rgba[..., 3] = valid.astype(float)
     return rgba_to_overlay(rgba, xs, ys)
+
+
+def probe_grid(path, *, max_dim: int = 1024) -> dict:
+    """Float32 value grid for the client-side hover probe (www/raster_probe.js): the SAME
+    EPSG:4326 warp the overlay PNG was colored from, so hover values always agree with the
+    displayed pixels. Returns {"bytes": row-major little-endian float32 (row 0 = north),
+    "w", "h", "bounds": [s, w, n, e]} with bounds at the CELL-CENTER extents — the exact
+    numbers rgba_to_overlay hands the ImageOverlay, so the client's lat/lon -> cell math is
+    pixel-registered with the display. Invalid cells (declared nodata, -9999-family
+    sentinels, HDRY-scale magnitudes) become NaN; the client shows no chip there."""
+    import numpy as np
+
+    from .dem import load_raster_4326
+    z, xs, ys, _dx, _dy = load_raster_4326(path, max_dim=max_dim)
+    z = np.asarray(z, dtype="float64")
+    z[~(np.isfinite(z) & (z > -9000.0) & (np.abs(z) < 1e20))] = np.nan
+    return {"bytes": z.astype("<f4").tobytes(),
+            "w": int(z.shape[1]), "h": int(z.shape[0]),
+            "bounds": [float(ys.min()), float(xs.min()),
+                       float(ys.max()), float(xs.max())]}
 
 
 def head_contours_geojson(path, *, levels):

@@ -62,10 +62,26 @@ def load() -> list[dict]:
     return out[:MAX_RECENTS]
 
 
+def _write(items: list[dict]) -> None:
+    """Atomic same-dir tmp + os.replace so a crash mid-write can't corrupt the list."""
+    root = data_root()
+    root.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".recents-", suffix=".tmp", dir=str(root))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"projects": items}, fh, indent=2)
+        os.replace(tmp, _path())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def touch(path: str | os.PathLike[str]) -> None:
     """Record a project open/create: dedupe by normalized path, insert front, cap, write.
 
-    Atomic same-dir tmp + os.replace so a crash mid-write can't corrupt the list.
     Silently a no-op on any IO failure.
     """
     try:
@@ -74,23 +90,22 @@ def touch(path: str | os.PathLike[str]) -> None:
         entry = {"path": str(p), "name": p.stem,
                  "last_opened": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         kept = [it for it in load() if os.path.normcase(it["path"]) != key]
-        items = [entry, *kept][:MAX_RECENTS]
-
-        root = data_root()
-        root.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=".recents-", suffix=".tmp", dir=str(root))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"projects": items}, fh, indent=2)
-            os.replace(tmp, _path())
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _write([entry, *kept][:MAX_RECENTS])
     except Exception:
         pass
 
 
-__all__ = ["MAX_RECENTS", "data_root", "load", "touch"]
+def forget(path: str | os.PathLike[str]) -> None:
+    """Drop *path* from the list (same normalized-path match as touch's dedupe).
+
+    Only edits recent_projects.json; never touches the project itself. Silently a
+    no-op on any IO failure.
+    """
+    try:
+        key = os.path.normcase(str(Path(path).resolve()))
+        _write([it for it in load() if os.path.normcase(it["path"]) != key])
+    except Exception:
+        pass
+
+
+__all__ = ["MAX_RECENTS", "data_root", "load", "touch", "forget"]

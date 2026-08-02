@@ -874,7 +874,7 @@
   function idleHint() {
     if (container() && !S.grw) {
       showHint("Nothing in 3D yet — fetch terrain (Terrain ▸ DEM) or compute the model grid " +
-               "(Groundwater ▸ Model grid), then toggle 3D view.");
+               "(Groundwater Modeling ▸ Model grid), then toggle 3D view.");
     }
   }
 

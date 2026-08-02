@@ -176,6 +176,39 @@ def path_depth_metrics(max_depths, weights) -> dict:
             "max_m": float(d.max())}
 
 
+def equivalent_active_depth(volume_m3, streambed_area_m2) -> float | None:
+    """D_HZ, the volume-normalized equivalent depth of the hyporheic zone (report §7.4).
+
+    V_HZ / A_bed. The framework's primary NORMALIZED extent measure, so reaches of different width
+    and length can be compared: dividing by the streambed area already carries both reach length
+    and channel width, which §7.5 requires.
+
+    It is NOT the physical depth of the zone at any point, and must never be labelled as one. A
+    zone that is 2 m deep over a third of the bed and absent elsewhere has the same D_HZ as a
+    uniform 0.67 m layer.
+
+    None (not NaN) when either input is missing or the area is non-positive, because every caller
+    stores this straight onto an optional contract field."""
+    if volume_m3 is None or not streambed_area_m2 or streambed_area_m2 <= 0:
+        return None
+    return float(volume_m3) / float(streambed_area_m2)
+
+
+def pore_volume(bulk_volume_m3, porosity) -> float | None:
+    """Mobile pore-water storage: the WATER inside a bulk sediment volume.
+
+    V_HZ * n. The distinction matters because the two are reported side by side and differ by a
+    factor of three: `bulk_saturated_volume_m3` is sediment plus water, and this is the water alone.
+
+    `porosity` must be the value MODPATH actually tracked at, not a live UI field. Porosity sets
+    pore velocity, which set the travel times, which set which particles returned inside the
+    tracking window, which set `bulk_volume_m3` itself. Scaling a frozen volume by a since-edited
+    field reports a pore volume the flow model never produced."""
+    if bulk_volume_m3 is None or porosity is None:
+        return None
+    return float(bulk_volume_m3) * float(porosity)
+
+
 def exceedance_fraction(values, weights, threshold) -> float:
     """Flux-weighted exceedance P(value >= threshold) (report §6.1). NaN on empty/zero total weight.
 
@@ -189,6 +222,51 @@ def exceedance_fraction(values, weights, threshold) -> float:
     if v.size == 0 or tot <= 0:
         return float("nan")
     return float(w[v >= threshold].sum() / tot)
+
+
+def weighted_reaction_fraction(values, weights, *, timescale, onset=0.0) -> float:
+    """Flux-weighted mean of 1 - exp(-(t - onset)/timescale), clamped at `onset`.
+
+    The continuous analogue of `exceedance_fraction`: rather than counting the flow whose value
+    clears a threshold, it weights each path by how far past `onset` it goes. `values` are
+    residence times and `timescale` is the process's characteristic reaction time, both in the
+    SAME unit (days everywhere in this codebase).
+
+    Used by the nutrient screen (onset = the observed source-to-sink residence-time threshold)
+    and by the thermal screen's B_Q (onset = 0).
+
+    Monotone non-decreasing in 1/timescale and non-increasing in `onset`. NaN on empty input or
+    zero total weight, matching `exceedance_fraction`. A non-positive `timescale` is the
+    instantaneous-reaction limit and returns the strictly-above-onset flow fraction, which is
+    what the general formula tends to (paths sitting exactly at `onset` contribute zero either
+    way, so the '>' here is consistent rather than a departure from the '>=' convention)."""
+    v = np.asarray(values, float)
+    w = (np.ones_like(v) if weights is None else np.asarray(weights, float))
+    ok = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    v, w = v[ok], w[ok]
+    tot = w.sum()
+    if v.size == 0 or tot <= 0:
+        return float("nan")
+    reactive = np.clip(v - float(onset), 0.0, None)          # time spent past onset
+    if timescale is None or float(timescale) <= 0:
+        return float(w[reactive > 0].sum() / tot)
+    f = -np.expm1(-reactive / float(timescale))              # 1 - exp(-x), stable for small x
+    return float((w * f).sum() / tot)
+
+
+def reactive_exposure(values, weights, *, onset=0.0) -> float:
+    """Σ wᵢ · max(0, tᵢ - onset): reaction opportunity with no rate constant at all.
+
+    With weights in m3/day and residence times in days the product is m3, i.e. the volume of
+    water standing in the reactive window at any instant (Little's law applied to the
+    past-onset portion of the residence-time distribution). NaN on empty/zero-weight input."""
+    v = np.asarray(values, float)
+    w = (np.ones_like(v) if weights is None else np.asarray(weights, float))
+    ok = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    v, w = v[ok], w[ok]
+    if v.size == 0 or w.sum() <= 0:
+        return float("nan")
+    return float((w * np.clip(v - float(onset), 0.0, None)).sum())
 
 
 # --------------------------------------------------------------------------- residence-time distribution
@@ -259,5 +337,6 @@ __all__ = [
     "weighted_mean", "weighted_quantile", "weighted_ecdf", "ExchangeAccounting",
     "classify_weighted_flux", "Connectivity", "connectivity", "residence_time_metrics",
     "exchange_flux", "path_depth_metrics", "exceedance_fraction", "mobile_pore_storage",
+    "weighted_reaction_fraction", "reactive_exposure",
     "METERS_PER_MILE", "METERS_PER_KM", "SECONDS_PER_DAY",
 ]

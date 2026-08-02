@@ -111,10 +111,56 @@ def snap(lat: float, lon: float, flowlines_gdf=None) -> Optional[dict]:
     row = g.loc[idx]
     da = _prop(row, ("totdasqkm", "TotDASqKm", "TotDASqKM"))
     comid = _prop(row, ("nhdplusid", "NHDPlusID", "comid", "COMID"))
+    name = _prop(row, ("gnis_name", "GNIS_Name", "GNIS_NAME"))
     return {"lat": float(back.y), "lon": float(back.x),
             "comid": (int(comid) if comid is not None else None),
             "da_sqkm": (float(da) if da is not None else None),
+            "name": (str(name) if name else None),
             "dist_ft": dist_ft}
+
+
+def snap_reach_da(p_up: dict, p_dn: dict, flowlines_gdf=None,
+                  max_ft: float = 500.0) -> Optional[dict]:
+    """Drainage area for a hand-drawn reach: among flowlines within `max_ft` of EITHER endpoint,
+    take the largest `totdasqkm`. Nearest-only snapping (plain `snap`) is wrong for this — at a
+    confluence a tributary mouth can out-snap a wide river whose artificial path runs
+    mid-channel, and the mainstem splits into segments there so no single feature need be near
+    both endpoints. The mainstem dominates every qualifying tributary by drainage area.
+    Returns {da_sqkm, name, comid, dist_ft} (dist to the nearer endpoint) or None."""
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    gdf = flowlines_gdf
+    if gdf is None or getattr(gdf, "empty", True):
+        pad = 0.01
+        lons, lats = [p_up["lon"], p_dn["lon"]], [p_up["lat"], p_dn["lat"]]
+        gj = flowlines_bbox(min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad,
+                            max_area_deg2=2.0)
+        if not gj or not gj.get("features"):
+            return None
+        gdf = gpd.GeoDataFrame.from_features(gj["features"], crs=CRS_WGS84)
+    g = gdf.to_crs(CRS_ALBERS)
+    g = g[g.geometry.notna() & ~g.geometry.is_empty]
+    if g.empty:
+        return None
+    pts = gpd.GeoSeries([Point(p["lon"], p["lat"]) for p in (p_up, p_dn)],
+                        crs=CRS_WGS84).to_crs(CRS_ALBERS)
+    max_m = float(max_ft) / FT_PER_M
+    best = None
+    for _, row in g.iterrows():
+        d = min(row.geometry.distance(pts.iloc[0]), row.geometry.distance(pts.iloc[1]))
+        if d > max_m:
+            continue
+        da = _prop(row, ("totdasqkm", "TotDASqKm", "TotDASqKM"))
+        if da is None:
+            continue
+        if best is None or float(da) > best["da_sqkm"]:
+            comid = _prop(row, ("nhdplusid", "NHDPlusID", "comid", "COMID"))
+            name = _prop(row, ("gnis_name", "GNIS_Name", "GNIS_NAME"))
+            best = {"da_sqkm": float(da), "dist_ft": float(d * FT_PER_M),
+                    "comid": (int(comid) if comid is not None else None),
+                    "name": (str(name) if name else None)}
+    return best
 
 
 def reach_between(up: dict, dn: dict) -> dict:

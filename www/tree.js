@@ -15,8 +15,11 @@
  *   • ready    → posted on connect so the server (re-)pushes the full tree state
  *
  * Expand/collapse state is CLIENT-owned (this DOM is never re-rendered by Shiny, so it just
- * persists in memory); the whole-panel collapse chevrons are also handled here — BOTH panels
- * start collapsed and a selection change re-opens the props card. The "hype_fly" message
+ * persists in memory); the one server-driven reset is "hype_tree_collapse" (project open),
+ * which re-collapses every group id it names — including groups not visible yet, so results
+ * groups surfacing from the restored state still arrive collapsed. The whole-panel collapse
+ * chevrons are also handled here — BOTH panels start collapsed and a selection change
+ * re-opens the props card. The "hype_fly" message
  * animates the map to a node's extent via window.__hypeMap.flyToBounds with padding measured
  * from the live panel widths.
  */
@@ -325,6 +328,14 @@
   function register() {
     if (window.Shiny && Shiny.addCustomMessageHandler) {
       Shiny.addCustomMessageHandler("hype_tree", onMessage);
+      // Project open: reset the client-owned expansion so the restored tree starts with
+      // every group collapsed. The server sends ALL group ids (ui_tree.GROUP_IDS) — the
+      // hidden ones too, so groups that only surface with the restored results (fn,
+      // gw.res.*) are already collapsed when their rows first render.
+      Shiny.addCustomMessageHandler("hype_tree_collapse", function (msg) {
+        ((msg && msg.groups) || []).forEach(function (id) { collapsed[id] = true; });
+        refreshCollapse(lastSelected);
+      });
       Shiny.addCustomMessageHandler("hype_fly", function (msg) { flyTo(msg && msg.bounds); });
       // Tab title mirrors the project name; the page's own title returns when unset.
       // Captured lazily: at script parse the <title> element may not exist yet (this
@@ -351,6 +362,20 @@
           });
           var w = tr.querySelector(".gpt-warn");
           if (w) w.style.display = cells[uid].warn ? "" : "none";
+        });
+      });
+      // Hydraulic Alternatives runs table: live status words patched in place during a
+      // sweep. Re-rendering the table per tick would reset its horizontal scroll (and the
+      // pane's vertical scroll), so the server pushes {sid: word} instead — same discipline
+      // as hype_gpt_cells above.
+      Shiny.addCustomMessageHandler("hype_alt_status", function (msg) {
+        var st = (msg && msg.statuses) || {};
+        Object.keys(st).forEach(function (sid) {
+          var tr = document.querySelector('.hype-alt-table tr[data-alt-sid="' + sid + '"]');
+          if (!tr) return;
+          var td = tr.querySelector("td.alt-status");
+          if (td && td.textContent !== st[sid]) td.textContent = st[sid];
+          tr.classList.toggle("alt-running", st[sid] === "Running");
         });
       });
       return true;

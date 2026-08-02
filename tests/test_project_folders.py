@@ -162,15 +162,16 @@ def test_save_bundle_to_swaps_via_sibling(tmp_path, monkeypatch):
 
 def test_tokenize_roundtrip_across_bases(tmp_path):
     """A project moved to a different folder (or machine) must re-land every stored path
-    under the new root — the sens/soil/flow shapes are exactly what state.json carries."""
+    under the new root — the alternatives/soil/flow shapes are exactly what state.json
+    carries."""
     base_a = tmp_path / "old" / "SiteA"
     base_b = tmp_path / "new_home" / "SiteA_renamed"
     obj = {
-        "dir": str(base_a / "sensitivity" / "s01"),
-        "hz_dir": str(base_a / "sensitivity" / "s01" / "hz_workspace"),
+        "dir": str(base_a / "alternatives" / "k10_gradient1"),
+        "hz_dir": str(base_a / "alternatives" / "k10_gradient1" / "summary" / "hz"),
         "artifact_paths": {"head": str(base_a / "summary" / "head" / "head_L1.tif")},
         "raw_response_paths": [str(base_a / "data_sources" / "usgs" / "delineate.json")],
-        "n": 3, "label": "Slight", "nested": [{"p": str(base_a / "inputs" / "dem.tif")}],
+        "n": 3, "label": "Higher K", "nested": [{"p": str(base_a / "inputs" / "dem.tif")}],
     }
     tok = bundle.tokenize_paths(obj, base_a)
     flat = json.dumps(tok)
@@ -178,12 +179,13 @@ def test_tokenize_roundtrip_across_bases(tmp_path):
     assert flat.count(bundle.WS_TOKEN) == 5
 
     back = bundle.detokenize_paths(tok, base_b)
-    assert back["dir"] == str(base_b / "sensitivity" / "s01")
-    assert back["hz_dir"] == str(base_b / "sensitivity" / "s01" / "hz_workspace")
+    assert back["dir"] == str(base_b / "alternatives" / "k10_gradient1")
+    assert back["hz_dir"] == str(base_b / "alternatives" / "k10_gradient1"
+                                 / "summary" / "hz")
     assert back["artifact_paths"]["head"] == str(base_b / "summary" / "head" / "head_L1.tif")
     assert back["raw_response_paths"] == [str(base_b / "data_sources" / "usgs" / "delineate.json")]
     assert back["nested"][0]["p"] == str(base_b / "inputs" / "dem.tif")
-    assert back["n"] == 3 and back["label"] == "Slight"
+    assert back["n"] == 3 and back["label"] == "Higher K"
 
 
 def test_tokenize_leaves_foreign_paths_alone(tmp_path):
@@ -226,19 +228,20 @@ def test_main_hype_never_enters_its_own_zip(tmp_path):
 def test_folder_clash_empty_and_missing(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
-    assert bundle.folder_clash(empty, empty / "New.hype") == ([], False)
+    assert bundle.folder_clash(empty, empty / "New.hype") == ([], False, [])
     # the subfolder-recursion target: neither folder nor main file exists yet
     missing = tmp_path / "nope"
-    assert bundle.folder_clash(missing, missing / "New.hype") == ([], False)
+    assert bundle.folder_clash(missing, missing / "New.hype") == ([], False, [])
 
 
 def test_folder_clash_detects_content_dirs(tmp_path):
     folder = tmp_path / "SiteA"
     folder.mkdir()
     _make_workspace(folder)
-    names, foreign = bundle.folder_clash(folder, folder / "SiteA.hype")
+    names, foreign, others = bundle.folder_clash(folder, folder / "SiteA.hype")
     assert names == ["inputs", "model", "ras", "data_sources"]   # PROJECT_DIRS order
     assert foreign is False
+    assert others == []                       # contract dirs never double-report
 
 
 def test_folder_clash_foreign_hype_excludes_target(tmp_path):
@@ -247,17 +250,19 @@ def test_folder_clash_foreign_hype_excludes_target(tmp_path):
     (folder / "SiteA.hype").write_bytes(b"zip")
     (folder / "Other.hype").write_bytes(b"zip")
     # existing target excluded, sibling reported
-    assert bundle.folder_clash(folder, folder / "SiteA.hype") == (["Other.hype"], True)
+    assert bundle.folder_clash(folder, folder / "SiteA.hype") == \
+        (["Other.hype"], True, [])
     # nonexistent target: both on-disk projects are foreign, sorted
     assert bundle.folder_clash(folder, folder / "New.hype") == \
-        (["Other.hype", "SiteA.hype"], True)
+        (["Other.hype", "SiteA.hype"], True, [])
 
 
 def test_folder_clash_suffix_case_insensitive(tmp_path):
     folder = tmp_path / "shared"
     folder.mkdir()
     (folder / "UPPER.HYPE").write_bytes(b"zip")
-    assert bundle.folder_clash(folder, folder / "New.hype") == (["UPPER.HYPE"], True)
+    assert bundle.folder_clash(folder, folder / "New.hype") == \
+        (["UPPER.HYPE"], True, [])
 
 
 @pytest.mark.skipif(os.name != "nt", reason="case-insensitive path identity is NTFS behavior")
@@ -266,14 +271,17 @@ def test_folder_clash_target_excluded_across_casing(tmp_path):
     folder.mkdir()
     (folder / "SiteA.hype").write_bytes(b"zip")
     # differently-cased reference to the same file must not count as a foreign project
-    assert bundle.folder_clash(folder, folder / "sitea.HYPE") == ([], False)
+    assert bundle.folder_clash(folder, folder / "sitea.HYPE") == ([], False, [])
 
 
-def test_folder_clash_ignores_hype_named_directory(tmp_path):
+def test_folder_clash_hype_named_directory_is_content(tmp_path):
+    """A DIRECTORY named *.hype is not a foreign project (no `foreign` flag) but it IS
+    folder content now — the ownership gate reports it in `others`."""
     folder = tmp_path / "shared"
     folder.mkdir()
     (folder / "Not.hype").mkdir()
-    assert bundle.folder_clash(folder, folder / "New.hype") == ([], False)
+    assert bundle.folder_clash(folder, folder / "New.hype") == \
+        ([], False, ["Not.hype"])
 
 
 def test_folder_clash_orders_dirs_then_sorted_hypes(tmp_path):
@@ -283,7 +291,57 @@ def test_folder_clash_orders_dirs_then_sorted_hypes(tmp_path):
     (folder / "b.hype").write_bytes(b"zip")
     (folder / "a.hype").write_bytes(b"zip")
     assert bundle.folder_clash(folder, folder / "New.hype") == \
-        (["inputs", "a.hype", "b.hype"], True)
+        (["inputs", "a.hype", "b.hype"], True, [])
+
+
+def test_folder_clash_detects_export_dirs(tmp_path):
+    folder = tmp_path / "shared"
+    folder.mkdir()
+    (folder / "GMS").mkdir()
+    assert bundle.folder_clash(folder, folder / "New.hype") == (["GMS"], False, [])
+    # contract dirs come first, export dirs after (PROJECT_DIRS + EXPORT_DIRS order)
+    (folder / "inputs").mkdir()
+    assert bundle.folder_clash(folder, folder / "New.hype") == \
+        (["inputs", "GMS"], False, [])
+
+
+def test_folder_clash_reports_other_files(tmp_path):
+    """Unrelated files AND directories land in `others` (the Desktop-dump guard);
+    the target main file itself never does."""
+    folder = tmp_path / "Desktop"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("x")
+    (folder / "photos").mkdir()
+    (folder / "SiteA.hype").write_bytes(b"zip")   # the target itself
+    assert bundle.folder_clash(folder, folder / "SiteA.hype") == \
+        ([], False, ["notes.txt", "photos"])
+
+
+def test_folder_clash_ignores_os_cruft(tmp_path):
+    folder = tmp_path / "F"
+    folder.mkdir()
+    for n in ("desktop.ini", "Thumbs.db", ".DS_Store"):
+        (folder / n).write_text("")
+    assert bundle.folder_clash(folder, folder / "New.hype") == ([], False, [])
+
+
+def test_folder_clash_mixed_names_and_others(tmp_path):
+    folder = tmp_path / "F"
+    folder.mkdir()
+    (folder / "inputs").mkdir()
+    (folder / "readme.md").write_text("x")
+    assert bundle.folder_clash(folder, folder / "New.hype") == \
+        (["inputs"], False, ["readme.md"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="case-insensitive dedupe is NTFS behavior")
+def test_folder_clash_no_double_report_across_casing(tmp_path):
+    folder = tmp_path / "F"
+    folder.mkdir()
+    (folder / "Inputs").mkdir()   # `names` catches it via case-insensitive exists()
+    names, foreign, others = bundle.folder_clash(folder, folder / "New.hype")
+    assert names == ["inputs"]
+    assert others == []
 
 
 def test_project_dirs_match_restore_layout():
@@ -293,6 +351,16 @@ def test_project_dirs_match_restore_layout():
     derived |= {dest.split("/")[0] for _, dest in bundle._RESTORE_TREES}
     assert set(bundle.PROJECT_DIRS) == derived
     assert len(set(bundle.PROJECT_DIRS)) == len(bundle.PROJECT_DIRS)
+
+
+def test_export_dirs_contract():
+    """EXPORT_DIRS are one-way outputs: in the folder contract for clash/copy purposes,
+    but NEVER restore targets (restore must keep dropping their arcs)."""
+    assert bundle.EXPORT_DIRS == ("GMS",)
+    assert not set(bundle.EXPORT_DIRS) & set(bundle.PROJECT_DIRS)
+    restored_roots = {v.split("/")[0] for v in bundle._RESTORE_FILES.values()}
+    restored_roots |= {dest.split("/")[0] for _, dest in bundle._RESTORE_TREES}
+    assert not set(bundle.EXPORT_DIRS) & restored_roots
 
 
 def test_clash_subfolder_derivation(tmp_path):
@@ -328,6 +396,25 @@ def test_copy_project_tree_copies_only_contract_dirs(tmp_path):
     assert not (dst / "SiteA.hype").exists()
     assert not (dst / "notes.txt").exists()
     assert not (dst / "scene").exists()
+
+
+def test_copy_project_tree_carries_gms(tmp_path):
+    """Save As carries the one-way GMS export, but never its GMS.tmp-* staging."""
+    src = tmp_path / "SiteA"
+    src.mkdir()
+    _make_workspace(src)
+    (src / "GMS").mkdir()
+    (src / "GMS" / "Site.gpr").write_bytes(b"GPR")
+    (src / "GMS.tmp-deadbeef").mkdir()
+    (src / "GMS.tmp-deadbeef" / "half.gpr").write_bytes(b"partial")
+
+    dst = tmp_path / "SiteB"
+    dst.mkdir()
+    copied = bundle.copy_project_tree(src, dst)
+
+    assert copied == ["inputs", "model", "ras", "data_sources", "GMS"]
+    assert (dst / "GMS" / "Site.gpr").read_bytes() == b"GPR"
+    assert not (dst / "GMS.tmp-deadbeef").exists()
 
 
 def test_copy_project_tree_merges_into_existing_dirs(tmp_path):

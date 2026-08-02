@@ -154,6 +154,12 @@ def test_interface_pass_returning_loop(tmp_path):
     assert flux["rtd"] is not None and flux["rtd"]["weighted_mean_days"] > 0
     # active streambed area: only the net-downwelling stream column (col 2) feeds returning paths
     assert acc["active_streambed_area_m2"] == pytest.approx(1.0)
+    # ...and the loop surfaces at col 8, a DIFFERENT column, so the entry and exit sets are
+    # disjoint here and the connected area is their union. Every cell is 1 m2 in this fixture, so
+    # these are cell counts: 1 in, 1 out, 2 engaged. Counting only entry would report half the bed
+    # that is actually exchanging.
+    assert acc["return_streambed_area_m2"] == pytest.approx(1.0)
+    assert acc["connected_streambed_area_m2"] == pytest.approx(2.0)
     # the optional second (pathline) pass attached a per-particle max penetration depth
     assert "max_depth_m" in pp
     md = pp["max_depth_m"][ret]

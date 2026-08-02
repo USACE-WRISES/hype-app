@@ -166,9 +166,9 @@ def test_migrate_is_noop_for_unregistered_kind():
     assert migrate("assessment-input-snapshot", data) == data
 
 
-def test_results_migration_drops_hfci_2_0_to_2_1():
+def test_results_migration_drops_hfci_from_2_0():
     """An older results payload carrying the removed HFCI index still opens: migrate() pops the
-    field and stamps the current schema version so the current model validates it."""
+    field and chains 2.0 -> 2.1 -> current so the current model validates it."""
     from hype_app.contracts import AssessmentResultsV2
     old = {"schema_version": "assessment-results/2.0", "assessment_id": "A1",
            "input_hash": "a" * 64, "hfci": {"hfci": 0.67, "hfci_class": "Moderate"}}

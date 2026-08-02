@@ -139,10 +139,3 @@ class TestControlLinesAndSerialization:
         assert parse_fraction_gradient_profile(s_lo)[0] == (0.0, 0.0)     # lower bound used
         assert parse_fraction_gradient_profile(s_lo)[1] == (0.5, -0.015)  # falls back preferred
 
-    def test_qualitative_neighbors_clamped(self):
-        from hype_app.contracts import GradientQualitative as Q
-        from hype_app.gradients import qualitative_neighbors
-        lo, hi = qualitative_neighbors(Q.neutral)
-        assert lo == Q.slightly_losing and hi == Q.slightly_gaining
-        lo, hi = qualitative_neighbors(Q.strongly_gaining)
-        assert lo == Q.slightly_gaining and hi == Q.strongly_gaining   # clamped at the end

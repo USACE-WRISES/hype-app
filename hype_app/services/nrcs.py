@@ -44,10 +44,15 @@ _BEDROCK_KINDS = {"lithic bedrock", "paralithic bedrock", "densic bedrock", "den
 
 
 def parse_table(data: dict) -> list[dict]:
-    """Turn SDA's {"Table": [[colnames], [row], ...]} into a list of dicts."""
-    if not isinstance(data, dict) or "Table" not in data:
+    """Turn SDA's {"Table": [[colnames], [row], ...]} into a list of dicts.
+
+    A query matching ZERO rows comes back as a bare {} — SDA omits "Table" entirely. That
+    is an empty result set, not a malformed payload (verified live 2026-08-02: a
+    corestrictions query over restriction-free map units returns exactly {}). Only a
+    non-dict body or a non-empty dict without "Table" raises."""
+    if not isinstance(data, dict) or (data and "Table" not in data):
         raise PayloadError("SDA response missing 'Table'.")
-    table = data["Table"] or []
+    table = data.get("Table") or []
     if not table:
         return []
     cols = [str(c) for c in table[0]]
@@ -170,13 +175,15 @@ class NRCSClient:
 
         seen: set[str] = set()
         geoms, keys, mukeys_of = [], [], []
+        n_bad = 0
         for r in rows:
             key = str(r.get("mupolygonkey"))
             if not key or key in seen:
                 continue
             try:
                 g = shapely_wkt.loads(r["geom"])
-            except Exception:  # noqa: BLE001 — skip unparseable geometry
+            except Exception:  # noqa: BLE001 — skip unparseable geometry (counted below)
+                n_bad += 1
                 continue
             if not g.is_valid:
                 g = g.buffer(0)                       # safe repair only
@@ -184,6 +191,13 @@ class NRCSClient:
             geoms.append(g)
             keys.append(key)
             mukeys_of.append(str(r.get("mukey")))
+        if n_bad:
+            # A systematic geometry change on SDA's side must not read as clean success.
+            plural = "s" if n_bad != 1 else ""
+            warnings.append(HypeWarning(
+                code="geometry_parse", severity=Severity.warning,
+                message=f"{n_bad} soil polygon{plural} could not be read from the "
+                        "service response."))
         if not geoms:
             return [], set()
 

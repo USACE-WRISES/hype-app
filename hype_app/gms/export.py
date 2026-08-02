@@ -31,6 +31,9 @@ __all__ = ["export_gms_project", "GmsExportError"]
 # The sampled display pathlines hz_analysis persists into summary/hz (Phase B of the
 # GMS-export feature); absent files simply mean "no particle sets in the export".
 MPPTH_FILES = {"forward": "hz_pl_fwd.mppth", "backward": "hz_pl_bwd.mppth"}
+# Pre-2026-07-26 runs persisted the raw MP7 simulation names (hz_pl_{direction[:3]});
+# accept them so existing projects export particle sets without a re-delineation.
+MPPTH_LEGACY = {"forward": "hz_pl_for.mppth", "backward": "hz_pl_bac.mppth"}
 
 
 def export_gms_project(work_dir: str | Path, out_dir: str | Path, *, name: str,
@@ -107,6 +110,9 @@ def export_gms_project(work_dir: str | Path, out_dir: str | Path, *, name: str,
         hz_dir = Path(hz_dir)
         for direction, fname in MPPTH_FILES.items():
             src = hz_dir / fname
+            if not src.is_file():
+                src = hz_dir / MPPTH_LEGACY[direction]
+                fname = src.name
             if not src.is_file():
                 continue
             try:

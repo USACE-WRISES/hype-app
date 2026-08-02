@@ -184,13 +184,6 @@ _QUAL_ORDER = [GradientQualitative.strongly_losing, GradientQualitative.slightly
                GradientQualitative.strongly_gaining]
 
 
-def qualitative_neighbors(cat: GradientQualitative) -> tuple[GradientQualitative,
-                                                             GradientQualitative]:
-    """(one step toward losing, one step toward gaining), clamped at the scale ends."""
-    i = _QUAL_ORDER.index(cat)
-    return _QUAL_ORDER[max(0, i - 1)], _QUAL_ORDER[min(len(_QUAL_ORDER) - 1, i + 1)]
-
-
 def signed_multiplier(cat: GradientQualitative, *, slight: float = 0.5,
                       strong: float = 1.0) -> float:
     """Signed multiplier for a category on a (possibly user-overridden) slight/strong scale.
@@ -200,23 +193,6 @@ def signed_multiplier(cat: GradientQualitative, *, slight: float = 0.5,
             GradientQualitative.neutral: 0.0,
             GradientQualitative.slightly_losing: -float(slight),
             GradientQualitative.strongly_losing: -float(strong)}[cat]
-
-
-def apply_default_bounds(controls: list[GradientControl], *, ref_slope_value=None,
-                         slight: float = 0.5) -> list[GradientControl]:
-    """Fill missing lower/upper sensitivity bounds on gradient-point controls (§10.1 default):
-    ± slight × reference slope when a slope is available, else ±50% of the control's own
-    gradient. Explicit bounds are preserved; a zero gradient with no slope leaves the bounds
-    unset (the sensitivity manifest then collapses and the app explains why)."""
-    out = []
-    for c in controls:
-        if c.lower is not None or c.upper is not None:
-            out.append(c)
-            continue
-        d = float(slight) * float(ref_slope_value) if ref_slope_value else 0.5 * abs(c.preferred)
-        out.append(c if d <= 0 else c.model_copy(update={"lower": c.preferred - d,
-                                                         "upper": c.preferred + d}))
-    return out
 
 
 def config_from_legacy_corners(corner_gradients: dict, *, side: Side) -> list[GradientControl]:
@@ -304,7 +280,7 @@ def downstream_wse_warnings(rows) -> set:
 __all__ = [
     "anchor_head", "ControlGeometry", "interpolate_to_stations", "realized_side_heads",
     "reference_slope_from_samples", "validate_config", "config_from_legacy_corners",
-    "parse_control_lines", "serialize_profile", "qualitative_neighbors",
-    "signed_multiplier", "apply_default_bounds", "migrate_kept_gradients",
+    "parse_control_lines", "serialize_profile",
+    "signed_multiplier", "migrate_kept_gradients",
     "downstream_wse_warnings",
 ]

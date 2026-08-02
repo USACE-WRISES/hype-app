@@ -37,19 +37,19 @@ def test_full_assembly_computes_all_metrics():
         active_streambed_area_m2=4000.0, porosity=0.3)
 
     c, z = res.connectivity, res.zone
-    # exchange frequency
+    # frequency of hyporheic exchange
     assert c.excursions_per_mile == pytest.approx(0.028 / 0.736 * 1609.344 / 500)
     assert c.turnovers_per_km == pytest.approx(0.028 / 0.736 * 1000.0 / 500.0)
     assert c.turnovers_per_km == pytest.approx(1.0 / c.turnover_length_km)   # reciprocal
     assert c.exchange_flux_mm_day == pytest.approx(0.028 * 86400.0 / 8000.0 * 1000.0)
     assert c.active_streambed_fraction == pytest.approx(0.5)
     assert c.mass_balance_error == pytest.approx(0.0, abs=1e-9)
-    # active capacity: D_HZ = V_HZ / A_bed (bulk basis)
+    # extent of hyporheic zone: D_HZ = V_HZ / A_bed (bulk basis)
     assert z.bulk_saturated_volume_m3 == 8200.0
     assert z.equivalent_active_depth_m == pytest.approx(8200.0 / 8000.0)
     assert z.active_volume_basis == "bulk sediment"
     assert z.mobile_pore_storage_m3 == 2460.0
-    # exposure duration
+    # duration in hyporheic zone
     assert res.residence_time.weighted_median_days == pytest.approx(1.5)
     # frozen provenance
     assert res.input_hash == _snapshot().input_hash

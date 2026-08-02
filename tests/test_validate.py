@@ -73,3 +73,53 @@ def test_spatial_volume_exceeds_domain():
 def test_high_censored_flow_warns():
     res = _results(connectivity=ConnectivityMetrics(censored_flow_fraction=0.4))
     assert "censored_flow" in _codes(validate_results(res)[0])
+
+
+# --------------------------------------------------------------- §27.8 screening identities
+# These exist because drift in the flow-path weights rescales EVERY screening mass by one factor
+# and nothing else would notice. They were computed in screen.py and surfaced nowhere, so a
+# silent 86400x unit error could ship.
+def _with_nutrient(**over):
+    from hype_app.contracts import FunctionScreening, NutrientScreening
+    return _results(functions=FunctionScreening(nutrient=NutrientScreening(**over)))
+
+
+def test_weight_identity_drift_warns():
+    """86399 is the m3/day-passed-as-m3/s signature; 0.99999 is the reverse."""
+    for bad in (86399.0, 0.99999):
+        w, diag = validate_results(_with_nutrient(weight_identity_rel_diff=bad))
+        assert "weight_identity" in _codes(w), bad
+        assert diag["screening_weight_identity_rel_diff"] == bad
+    msg = next(x.message for x in validate_results(
+        _with_nutrient(weight_identity_rel_diff=86399.0))[0] if x.code == "weight_identity")
+    assert "every screening mass" in msg.lower()      # names the consequence, not the symptom
+
+
+def test_weight_identity_within_tolerance_is_recorded_but_silent():
+    """Float summation over many paths lands near 1e-12. Warning there would be noise."""
+    w, diag = validate_results(_with_nutrient(weight_identity_rel_diff=1e-12))
+    assert "weight_identity" not in _codes(w)
+    assert diag["screening_weight_identity_rel_diff"] == 1e-12
+
+
+def test_chain_closure_drift_warns():
+    w, diag = validate_results(_with_nutrient(chain_closure_rel_diff=0.4))
+    assert "chain_closure" in _codes(w)
+    assert diag["screening_chain_closure_rel_diff"] == 0.4
+
+
+def test_screening_checks_are_absent_when_screening_did_not_run():
+    w, diag = validate_results(_results())
+    assert not ({"weight_identity", "chain_closure"} & _codes(w))
+    assert not [k for k in diag if k.startswith("screening_")]
+
+
+def test_the_storage_cross_check_never_warns():
+    """It compares RTD-derived mobile storage against bulk pore volume: two genuinely different
+    quantities that differ by tens of percent on healthy runs. Warning on it would train users
+    to ignore the panel where the weight-identity signal has to land."""
+    from hype_app.contracts import FunctionScreening, ThermalOpportunity
+    res = _results(functions=FunctionScreening(
+        thermal=ThermalOpportunity(storage_cross_check_rel_diff=0.72)))
+    w, _ = validate_results(res)
+    assert not _codes(w)

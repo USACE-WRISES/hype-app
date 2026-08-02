@@ -68,6 +68,9 @@ class Settings(BaseModel):
     # Hydraulic parameters
     kh: PositiveFloat = 10.0
     kv: PositiveFloat = 1.0
+    # Uniform multiplier applied to the RESOLVED K/K33 arrays (all sources: global, K-zone
+    # polygons, soil-derived). Used by the app's Hydraulic Alternatives sweep; 1.0 = no-op.
+    k_scale: PositiveFloat = 1.0
     # Optional: spatially varying K from polygon shapefile
     kh_polygon: bool = False
     kh_polygon_shapefile: Optional[Path] = None

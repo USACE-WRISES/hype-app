@@ -61,6 +61,37 @@ def test_load_prunes_missing_files(root, tmp_path):
     assert len(raw["projects"]) == 2
 
 
+def test_forget_removes_entry(root, tmp_path):
+    a, b = _mk(tmp_path, "A"), _mk(tmp_path, "B")
+    recents.touch(a)
+    recents.touch(b)
+    recents.forget(a)
+    assert [it["name"] for it in recents.load()] == ["B"]
+    # Unlike load()'s display-only prune, forget rewrites the store.
+    raw = json.loads((root / "recent_projects.json").read_text(encoding="utf-8"))
+    assert [it["name"] for it in raw["projects"]] == ["B"]
+
+
+def test_forget_unknown_path_keeps_list(root, tmp_path):
+    recents.touch(_mk(tmp_path, "A"))
+    recents.forget(tmp_path / "never-added.hype")
+    assert [it["name"] for it in recents.load()] == ["A"]
+
+
+def test_forget_with_no_store_is_nonfatal(root, tmp_path):
+    recents.forget(tmp_path / "whatever.hype")   # must not raise
+    assert recents.load() == []
+
+
+@pytest.mark.skipif(os.path.normcase("A") == "A",
+                    reason="needs a case-folding path convention (Windows)")
+def test_forget_matches_case_insensitively(root, tmp_path):
+    p = _mk(tmp_path, "Site")
+    recents.touch(p)
+    recents.forget(str(p).upper())
+    assert recents.load() == []
+
+
 def test_atomic_write_leaves_no_tmp_litter(root, tmp_path):
     recents.touch(_mk(tmp_path, "A"))
     recents.touch(_mk(tmp_path, "B"))

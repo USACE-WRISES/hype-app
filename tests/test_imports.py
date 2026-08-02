@@ -41,10 +41,13 @@ HYPE_APP_MODULES = [
     "hype_app.gradients",
     "hype_app.soil_run",
     "hype_app.metrics",
+    "hype_app.pathpick",
+    "hype_app.pick_run",   # must import WITHOUT tkinter (child imports it lazily)
     "hype_app.report",
     "hype_app.figures",
     "hype_app.validate",
-    "hype_app.sensitivity",
+    "hype_app.alternatives",
+    "hype_app.alt_run",    # must import WITHOUT the engine present (child resolves lazily)
     "hype_app.assess",
 ]
 

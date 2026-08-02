@@ -22,8 +22,10 @@ ROOT = "hype_workspace"
 
 FORMAT_VERSION = 2        # bump when the archive layout or state.json schema changes
 #   v1 -> v2 (HYPE revision): adds config/assessment_input.json (frozen run snapshot) +
-#   config/scoring_profile.json, and the data_sources/{usgs,nrcs}/, sensitivity/, and
+#   config/scoring_profile.json, and the data_sources/{usgs,nrcs}/, alternatives/, and
 #   6_Site_Report/ trees. v1 archives still open (their new pieces are simply absent).
+#   2026-08: sensitivity/ became alternatives/ (no format bump — old sensitivity arcs are
+#   simply dropped on restore).
 
 
 class ProjectError(ValueError):
@@ -167,7 +169,8 @@ def _readme(run_config: dict | None, seen: set, include_computed: bool = True) -
         "  GMS/                 Aquaveo GMS 10.7 project, when a groundwater run exists.",
         "                       Extract the archive and open GMS/<name>.gpr in GMS.",
         "  data_sources/        Recorded USGS StreamStats/NSS and NRCS SDA responses, when fetched.",
-        "  sensitivity/         Gradient-sensitivity scenario outputs, when run.",
+        "  alternatives/        Hydraulic Alternatives sweep outputs (index.json + one",
+        "                       results folder per scenario), when run.",
         "  config/              params.json (engine inputs) + run_config.json (CRS/origin/modes)",
         "                       + state.json (session state - lets HYPE reopen this archive)",
         "                       + assessment_input.json (frozen run snapshot) + scoring_profile.json.",
@@ -207,7 +210,7 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
     scoring_profile  : HFCI scoring profile            -> config/scoring_profile.json   (v2)
     include_computed : False = settings-only save — vectors + config/ + data_sources/ but none of
                        the computed/derived trees (2_Terrain, 4_Surface_Water, 5_Groundwater,
-                       sensitivity/, 6_Site_Report). Restore is file-existence-gated per stage,
+                       alternatives/, 6_Site_Report). Restore is file-existence-gated per stage,
                        so such an archive reopens with those stages simply not done yet.
     extra_trees      : ((arc_prefix, src_dir), ...) — extra directory trees packed under ROOT.
                        Intentionally NOT registered in the restore maps below: restore ignores
@@ -252,9 +255,9 @@ def zip_workspace(work_dir, *, vectors: dict, params: dict | None = None,
                 _add_tree(zf, root / "summary" / "hz",
                           _arc("5_Groundwater", "Results", "hyporheic_zone"), seen)
 
-                # v2 derived trees — sensitivity outputs and the site report. Each skips
-                # silently when its source dir doesn't exist yet (feature not run).
-                _add_tree(zf, root / "sensitivity", _arc("sensitivity"), seen)
+                # v2 derived trees — the hydraulic-alternatives sweep and the site report.
+                # Each skips silently when its source dir doesn't exist yet (feature not run).
+                _add_tree(zf, root / "alternatives", _arc("alternatives"), seen)
                 _add_tree(zf, root / "report", _arc("6_Site_Report"), seen)
 
             for arc_prefix, src_dir in extra_trees:
@@ -321,17 +324,34 @@ _RESTORE_TREES = (
     ("5_Groundwater/Results/head/",           "summary/head/"),
     ("5_Groundwater/Results/pathlines/",      "summary/"),
     ("5_Groundwater/Results/hyporheic_zone/", "summary/hz/"),
-    # v2 trees
+    # v2 trees. Legacy archives' sensitivity/ arcs map to nothing and are silently dropped:
+    # the retired gradient-bounds sweep's results do not restore (by design).
     ("data_sources/",                         "data_sources/"),
-    ("sensitivity/",                          "sensitivity/"),
+    ("alternatives/",                         "alternatives/"),
     ("6_Site_Report/",                        "report/"),
 )
 
 # Folder-layout contract: every directory a project folder can own. Must stay the union of
 # the first path components of the _RESTORE_FILES targets and _RESTORE_TREES destinations
-# above (tested in test_project_folders.py).
-PROJECT_DIRS: tuple[str, ...] = ("inputs", "model", "ras", "summary", "sensitivity",
+# above (tested in test_project_folders.py). EXPORT_DIRS is deliberately excluded from
+# that restore-union invariant.
+PROJECT_DIRS: tuple[str, ...] = ("inputs", "model", "ras", "summary", "alternatives",
                                  "report", "data_sources")
+
+# One-way exports: live in the project folder, travel with Save As and the clash checks,
+# but NEVER restore from bundles (restore drops their arcs by design — see extra_trees
+# in zip_workspace). The app regenerates them from run artifacts instead.
+EXPORT_DIRS: tuple[str, ...] = ("GMS",)
+
+# Dirs OLD versions of the app owned. They keep folder_clash quiet on legacy projects (a
+# stray sensitivity/ tree is ours, not foreign content) but never zip, restore, or travel
+# with Save As — a Save As sheds the dead tree.
+LEGACY_DIRS: tuple[str, ...] = ("sensitivity",)
+
+# OS metadata files that never count as folder content: Explorer drops desktop.ini into
+# customized folders, so an "empty" folder made in Explorer may legitimately hold one.
+# Compared case-insensitively; pathpick shares this so both layers agree on "empty".
+OS_CRUFT: frozenset[str] = frozenset({"desktop.ini", "thumbs.db", ".ds_store"})
 
 
 def _target_for(rel: str) -> str | None:
@@ -454,21 +474,35 @@ def classify_bundle(zip_path) -> str:
     return "project" if payload["state"].get("desktop_project") is True else "standalone"
 
 
-def folder_clash(folder, main_file) -> tuple[list[str], bool]:
+def folder_clash(folder, main_file) -> tuple[list[str], bool, list[str]]:
     """What already lives in `folder` that a project rooted at `main_file` would collide
-    with: (names, has_foreign_hype). Names = existing PROJECT_DIRS entries plus every
-    .hype file other than `main_file` itself (a second main file means another project
-    already owns the folder's content dirs). Read-only; safe when `folder` or `main_file`
-    does not exist yet (the create/import clash checks probe targets before any mkdir)."""
+    with: (names, has_foreign_hype, others). Names = existing PROJECT_DIRS + EXPORT_DIRS
+    entries plus every .hype file other than `main_file` itself (a second main file means
+    another project already owns the folder's content dirs). Others = every remaining
+    entry (files and directories) that is not a contract dir, not a .hype file, and not
+    OS_CRUFT — a project should own its folder, so unrelated content gets the same
+    subfolder offer. The target main file never gates its own overwrite (the pickers own
+    that confirm). Read-only; safe when `folder` or `main_file` does not exist yet (the
+    create/import clash checks probe targets before any mkdir)."""
     folder = Path(folder)
-    names = [d for d in PROJECT_DIRS if (folder / d).exists()]
+    names = [d for d in PROJECT_DIRS + EXPORT_DIRS if (folder / d).exists()]
     foreign: list[str] = []
+    others: list[str] = []
     if folder.is_dir():
         main_r = Path(main_file).resolve()   # strict=False: fine for nonexistent targets
-        foreign = sorted(f.name for f in folder.iterdir()
-                         if f.is_file() and f.suffix.lower() == ".hype"
-                         and f.resolve() != main_r)
-    return names + foreign, bool(foreign)
+        contract = {d.lower() for d in PROJECT_DIRS + EXPORT_DIRS + LEGACY_DIRS}
+        for e in folder.iterdir():
+            low = e.name.lower()
+            if e.is_file() and e.suffix.lower() == ".hype":
+                if e.resolve() != main_r:
+                    foreign.append(e.name)
+            # contract dirs are already in `names` via the case-insensitive exists();
+            # a DIRECTORY named *.hype is not a project file, so it counts as content
+            elif low not in contract and low not in OS_CRUFT:
+                others.append(e.name)
+        foreign.sort()
+        others.sort()
+    return names + foreign, bool(foreign), others
 
 
 def clash_subfolder(main_file) -> Path:
@@ -480,18 +514,18 @@ def clash_subfolder(main_file) -> Path:
 
 
 def copy_project_tree(src_folder, dst_folder) -> list[str]:
-    """Copy every PROJECT_DIRS member that exists under `src_folder` into `dst_folder`
-    (the desktop Save As). Only the contract dirs travel — the old main .hype, the
-    transient scene/, and stray user files never do. Existing destination dirs are
-    merged into (dirs_exist_ok); on failure the dirs THIS call created fresh are
-    removed, dirs that already existed keep whatever merged in before the error (the
-    clash dialog already warned about that folder), and the OSError propagates.
-    Returns the copied dir names."""
+    """Copy every PROJECT_DIRS + EXPORT_DIRS member that exists under `src_folder` into
+    `dst_folder` (the desktop Save As). Only those exact names travel — the old main
+    .hype, the transient scene/, GMS.tmp-* staging, and stray user files never do.
+    Existing destination dirs are merged into (dirs_exist_ok); on failure the dirs THIS
+    call created fresh are removed, dirs that already existed keep whatever merged in
+    before the error (the clash dialog already warned about that folder), and the
+    OSError propagates. Returns the copied dir names."""
     src, dst = Path(src_folder), Path(dst_folder)
     copied: list[str] = []
     fresh: list[Path] = []
     try:
-        for d in PROJECT_DIRS:
+        for d in PROJECT_DIRS + EXPORT_DIRS:
             s = src / d
             if not s.is_dir():
                 continue

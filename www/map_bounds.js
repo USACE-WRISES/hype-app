@@ -51,6 +51,34 @@
     window.__hypeMap = map;
     map.on("moveend zoomend", function () { report(map); });
     report(map);
+    guardVectors(map);
+  }
+
+  // ---- big-zoom vector guard --------------------------------------------------------------
+  // During a zoom animation Leaflet CSS-scales the vector panes instead of re-projecting the
+  // paths. Flying from the far-out default view to a site (project open → hype_fly) scales
+  // every stroke by 2^Δzoom, so the few-pixel reach centerline becomes a screen-filling wash
+  // of pink until the flight settles. Hide the vector renderers (SVG/canvas panes) whenever
+  // the in-flight zoom is ≥3 levels from the last settled zoom; on settle the paths
+  // re-project and reappear crisp. Tiles and divIcon labels live in other panes and keep
+  // animating, so the fly-in still reads as a flight. Single-step zooming (Δ1) never trips it.
+  function guardVectors(map) {
+    var settled = map.getZoom();
+    function setVis(v) {
+      var els = map.getContainer().querySelectorAll(
+        ".leaflet-pane > svg, .leaflet-pane > canvas");
+      for (var i = 0; i < els.length; i++) els[i].style.visibility = v;
+    }
+    map.on("zoom zoomanim", function (e) {     // `zoom` fires per frame during flyTo
+      var z = (e && typeof e.zoom === "number") ? e.zoom : map.getZoom();
+      if (Math.abs(z - settled) >= 3) setVis("hidden");
+    });
+    map.on("moveend zoomend viewreset", function () {
+      settled = map.getZoom();
+      // Deferred past this event's dispatch: the renderers' own settle listeners re-project
+      // the paths in the same turn, so the reveal lands after geometry is correct again.
+      setTimeout(function () { setVis(""); }, 0);
+    });
   }
 
   function lateCapture() {

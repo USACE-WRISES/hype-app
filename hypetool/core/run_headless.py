@@ -157,6 +157,7 @@ def run_hyporheic(*,
                   model_origin_elev: float | None = None,
                   kh: float = 10.0,
                   kv: float = 1.0,
+                  k_scale: float = 1.0,
                   porosity: float = 0.3,
                   run_particles: bool = True,   # False (the app) = no per-run MP7 pass —
                   #   hyporheic delineation happens post-run from ALL cells (hz_analysis)
@@ -242,6 +243,7 @@ def run_hyporheic(*,
         model_origin_elev=model_origin_elev,
         kh=kh,
         kv=kv,
+        k_scale=k_scale,
         porosity=porosity,
         run_particles=run_particles,
         particles_per_cell=particles_per_cell,
@@ -275,6 +277,8 @@ def run_hyporheic(*,
     log(f"Headless run - work_dir={work_dir}")
     log(f"Target CRS: {crs_obj.to_string()}")
     log(f"Terrain DEM: {dem_path.name}")
+    if float(k_scale) != 1.0:
+        log(f"K scaling: all K/K33 values x{float(k_scale):g}")
     if wse_path:
         log(f"WSE source: uploaded ({wse_resolved.name})")
     elif wse_mode == "channel" and wse_resolved != dem_path:

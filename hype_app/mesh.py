@@ -338,13 +338,14 @@ def _boundary_markers(sides, crs, x_anchor, y_anchor, delr_d, inside_d, top0_d, 
     return out
 
 
-def _fetch_basemap(crs, x_anchor, y_anchor, width_m, height_m, *, max_px: int = 1024,
-                   timeout_s: float = 30.0, service: str = "USGSImageryOnly", log=print):
-    """A USGS basemap export over the preview extent as a base64 JPEG for the 3-D drape:
-    {"url", "x0", "y0", "x1", "y1"} in preview-local metres (y0 = south edge; the image's
-    top row is the NORTH edge). `service` picks the ArcGIS service (USGSImageryOnly for the
-    aerial, USGSTopo for the topo drape). None on any failure — drapes are a nice-to-have."""
-    import base64
+def fetch_basemap_image(crs, x0, y0, x1, y1, *, service: str = "USGSImageryOnly",
+                        fmt: str = "jpg", max_px: int = 1024, timeout_s: float = 30.0,
+                        log=print):
+    """A USGS basemap export over an absolute model-CRS bbox as raw image bytes:
+    {"data": <bytes>, "extent": (x0, x1, y0, y1)} with the image's top row at the NORTH
+    edge (y1). `service` picks the ArcGIS service (USGSImageryOnly for the aerial,
+    USGSTopo for the topo); `fmt` picks the export format ("jpg" for photographic,
+    "png" for linework). None on any failure — basemaps are a nice-to-have."""
     import urllib.parse
     import urllib.request
 
@@ -354,27 +355,45 @@ def _fetch_basemap(crs, x_anchor, y_anchor, width_m, height_m, *, max_px: int = 
         epsg = CRS.from_user_input(crs).to_epsg()
         if epsg is None:
             return None
-        aspect = height_m / width_m if width_m > 0 else 1.0
+        width_m, height_m = float(x1) - float(x0), float(y1) - float(y0)
+        if width_m <= 0 or height_m <= 0:
+            return None
+        aspect = height_m / width_m
         if aspect <= 1.0:
             w_px, h_px = max_px, max(64, int(round(max_px * aspect)))
         else:
             w_px, h_px = max(64, int(round(max_px / aspect))), max_px
         params = urllib.parse.urlencode({
-            "bbox": f"{x_anchor},{y_anchor},{x_anchor + width_m},{y_anchor + height_m}",
+            "bbox": f"{x0},{y0},{x1},{y1}",
             "bboxSR": epsg, "imageSR": epsg, "size": f"{w_px},{h_px}",
-            "format": "jpg", "transparent": "false", "f": "image"})
+            "format": fmt, "transparent": "false", "f": "image"})
         url = (f"https://basemap.nationalmap.gov/arcgis/rest/services/{service}/"
                "MapServer/export?" + params)
         with urllib.request.urlopen(url, timeout=timeout_s) as r:
             data = r.read()
         if not data or len(data) < 1000:                 # error page / empty tile
             return None
-        log(f"[mesh] {service} drape fetched ({len(data) // 1024} KB, {w_px}x{h_px} px)")
-        return {"url": "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"),
-                "x0": 0.0, "y0": 0.0, "x1": float(width_m), "y1": float(height_m)}
+        log(f"[mesh] {service} basemap fetched ({len(data) // 1024} KB, {w_px}x{h_px} px)")
+        return {"data": data, "extent": (float(x0), float(x1), float(y0), float(y1))}
     except Exception as e:  # noqa: BLE001
-        log(f"[mesh] {service} drape unavailable: {e}")
+        log(f"[mesh] {service} basemap unavailable: {e}")
         return None
+
+
+def _fetch_basemap(crs, x_anchor, y_anchor, width_m, height_m, *, max_px: int = 1024,
+                   timeout_s: float = 30.0, service: str = "USGSImageryOnly", log=print):
+    """The 3-D drape packaging of fetch_basemap_image: {"url", "x0", "y0", "x1", "y1"} with a
+    base64 JPEG data URI and the extent in preview-LOCAL metres (y0 = south edge; the image's
+    top row is the NORTH edge). None on any failure — drapes are a nice-to-have."""
+    import base64
+
+    fetched = fetch_basemap_image(crs, x_anchor, y_anchor, x_anchor + width_m,
+                                  y_anchor + height_m, service=service, fmt="jpg",
+                                  max_px=max_px, timeout_s=timeout_s, log=log)
+    if not fetched:
+        return None
+    return {"url": "data:image/jpeg;base64," + base64.b64encode(fetched["data"]).decode("ascii"),
+            "x0": 0.0, "y0": 0.0, "x1": float(width_m), "y1": float(height_m)}
 
 
 def child_build(payload: dict, q) -> None:

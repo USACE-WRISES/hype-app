@@ -12,12 +12,41 @@ import pytest
 
 from hypetool.functions.hz_analysis import (
     FLUX_CLS,
+    IFACE_PARTICLES_PER_CELL,
     MEMBER,
+    _IFACE_TEMPLATES,
+    _PLAN_CENTER,
+    _PLAN_TRIANGLE,
     classify_flux_endpoints,
     path_max_depth,
     side_interior_cell,
     stream_exchange_gdf,
 )
+
+
+def test_interface_release_density_is_the_screening_resolution():
+    """This constant alone sets how finely the flux-weighted residence-time distribution is
+    sampled -- the distribution behind every screening function and the report's Duration
+    dimension. `hz_ppc` seeds the zone-EXTENT pass and never reaches here.
+
+    4 is chosen because its template is a strict SUPERSET of the 3-particle triangle: it adds a
+    center sample without moving the existing three, so raising it can only refine the result.
+    """
+    assert IFACE_PARTICLES_PER_CELL == 4
+    assert _IFACE_TEMPLATES[4] == _PLAN_CENTER + _PLAN_TRIANGLE
+    assert set(_IFACE_TEMPLATES[3]) < set(_IFACE_TEMPLATES[4])
+    assert len(_IFACE_TEMPLATES[4]) == 4
+
+
+def test_the_orchestrator_passes_the_release_density_explicitly():
+    """Left to the signature default it silently reverted to 3, and nothing in the call site
+    told a reader that the screening resolution was being decided there."""
+    import inspect
+
+    from hypetool.functions import hz_analysis
+
+    src = inspect.getsource(hz_analysis.run_hz_analysis)
+    assert "particles_per_cell=IFACE_PARTICLES_PER_CELL" in src
 
 
 def test_path_max_depth():

@@ -144,3 +144,25 @@ class TestResidenceTime:
 def test_mobile_pore_storage():
     """§8.2: Σ hyporheic_fraction · saturated volume · porosity."""
     assert mobile_pore_storage([0.5, 1.0], [10.0, 20.0], 0.3) == pytest.approx(7.5)
+
+
+def test_equivalent_active_depth():
+    """D_HZ = V_HZ / A_bed (report §7.4). The framework's primary NORMALIZED extent metric: the
+    streambed area already carries both reach length and channel width, which §7.5 requires."""
+    from hype_app.metrics import equivalent_active_depth
+    assert equivalent_active_depth(2460.0, 6000.0) == pytest.approx(0.41)
+    # None, not NaN: every caller stores this straight onto an optional contract field.
+    assert equivalent_active_depth(None, 6000.0) is None
+    assert equivalent_active_depth(2460.0, None) is None
+    assert equivalent_active_depth(2460.0, 0) is None
+    assert equivalent_active_depth(2460.0, -1.0) is None
+
+
+def test_pore_volume():
+    """V_HZ · n. Sediment plus water in, water alone out; the two differ by a factor of three and
+    are reported side by side, so mislabelling one as the other is the failure to guard."""
+    from hype_app.metrics import pore_volume
+    assert pore_volume(2460.0, 0.31) == pytest.approx(762.6)
+    assert pore_volume(None, 0.3) is None
+    assert pore_volume(2460.0, None) is None
+    assert pore_volume(2460.0, 0.0) == 0.0          # a real answer, not a missing one

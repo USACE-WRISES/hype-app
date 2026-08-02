@@ -402,6 +402,18 @@ def read_river_downwelling(gwf_ws: str | Path, member: np.ndarray) -> dict[int, 
 _IFACE_TEMPLATES: dict[int, tuple[tuple[float, float], ...]] = {
     1: _PLAN_CENTER, 3: _PLAN_TRIANGLE, 4: _PLAN_CENTER + _PLAN_TRIANGLE}
 
+#: Interface-pass release density. This is the ONLY control on the resolution of the flux-weighted
+#: residence-time distribution -- the one that drives the screening functions, the report's
+#: Duration dimension, and every reactive estimate. The zone-extent pass's `hz_ppc` does NOT reach
+#: here (different question, different seeds), so the number has to be right by construction.
+#:
+#: 4 rather than 3 because `_IFACE_TEMPLATES[4]` is `_PLAN_CENTER + _PLAN_TRIANGLE`, a strict
+#: SUPERSET of the 3-particle triangle: it adds a center sample without moving the existing three,
+#: so the change can only refine the distribution. 4 is also the ceiling the templates offer.
+#: Sites commonly downwell through only a handful of streambed cells (9 of 32 in the reference
+#: run), so each extra sample per cell is a meaningful share of the whole distribution.
+IFACE_PARTICLES_PER_CELL = 4
+
 # Interface-pass per-particle class codes (hz_flux.npz "cls"). 1/2 predate the four-way
 # extension and must keep their meaning — the report's transit rows read them.
 FLUX_CLS = {"unresolved": 0, "returning": 1, "losing": 2, "gaining": 3, "throughflow": 4}
@@ -425,6 +437,22 @@ def side_interior_cell(k: int, i: int, j: int, idomain: np.ndarray,
         if idomain[kk, i, j] == 1 and member3[kk, i, j] == 0:
             return kk, i, j
     return None
+
+
+def _plan_area(nodes, *, nrow: int, ncol: int, cell_area2d: np.ndarray) -> float:
+    """Plan-view area of a set of flat node indices, deduplicated to distinct (row, col).
+
+    The layer index is deliberately discarded: these are streambed areas, so a column that appears
+    at two layers must be counted once. Empty in, 0.0 out — no cells is a real answer, distinct
+    from `cell_area2d` being unavailable, which the callers signal with None."""
+    nodes = np.unique(np.asarray(nodes, dtype=np.int64))
+    if not nodes.size:
+        return 0.0
+    _, rem = np.divmod(nodes, nrow * ncol)
+    ii, jj = np.divmod(rem, ncol)
+    plan = np.zeros((nrow, ncol), dtype=bool)
+    plan[ii, jj] = True
+    return float(np.asarray(cell_area2d, dtype=float)[plan].sum())
 
 
 def classify_flux_endpoints(origin_code: np.ndarray, exit_code: np.ndarray,
@@ -465,6 +493,32 @@ def path_max_depth(streambed_top: float, z_along_path: np.ndarray) -> float:
     if z.size == 0:
         return float("nan")
     return max(0.0, float(streambed_top) - float(np.nanmin(z)))
+
+
+def _path_length(rec) -> float:
+    """Distance travelled along one pathline, summing 3-D segment lengths. NaN when unknowable.
+
+    THE INDEPENDENT VARIABLE FOR PARTICULATE RETENTION, which is why this is distance and not the
+    straight-line displacement, not the depth, and emphatically not the travel time. Deep-bed
+    filtration removes a fixed fraction per unit of travel THROUGH the medium, so a path that
+    doubles back through the bed has twice the capture opportunity of one that does not, however
+    close its endpoints sit.
+
+    MODPATH x and y are model coordinates and z is a plain elevation, all in model length units
+    (metres here), so no row flip and no unit conversion applies. A single-vertex record has no
+    travel and returns 0.0, which is a real answer distinct from an absent one."""
+    rec = np.asarray(rec)
+    if rec.size == 0:
+        return float("nan")
+    try:
+        xyz = np.column_stack([np.asarray(rec[c], dtype=float) for c in ("x", "y", "z")])
+    except (KeyError, ValueError, IndexError):
+        return float("nan")
+    if xyz.shape[0] < 2:
+        return 0.0
+    steps = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+    total = float(np.nansum(steps))
+    return total if np.isfinite(total) else float("nan")
 
 
 def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np.ndarray,
@@ -578,7 +632,8 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
         raise RuntimeError(f"Interface pass endpoint count {ep.shape[0]} != seeds {n}")
 
     member_flat = np.asarray(member)
-    exit_code = member_flat[np.asarray(ep["node"], dtype=np.int64)]
+    end_node = np.asarray(ep["node"], dtype=np.int64)     # the cell each particle terminated in
+    exit_code = member_flat[end_node]
     status = np.asarray(ep["status"], dtype=np.int16)
     time_days = np.asarray(ep["time"], dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -630,29 +685,31 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
     streambed_area = None
     stream_nodes = np.asarray(sorted(flows["stream_net"]), dtype=np.int64)
     if cell_area2d is not None and stream_nodes.size:
-        _, rem = np.divmod(stream_nodes, nrow * ncol)
-        ii, jj = np.divmod(rem, ncol)
-        plan = np.zeros((nrow, ncol), dtype=bool)
-        plan[ii, jj] = True
-        streambed_area = float(np.asarray(cell_area2d, dtype=float)[plan].sum())
+        streambed_area = _plan_area(stream_nodes, nrow=nrow, ncol=ncol, cell_area2d=cell_area2d)
 
-    # Active streambed area: distinct stream columns whose downwelling feeds RETURNING paths.
-    active_streambed_area = None
+    # Where returning exchange meets the bed, on three bases. `src` is the release cell (water IN)
+    # and `end_node` is the termination cell (water OUT); for a returning particle the latter is a
+    # top-member CHD cell by construction, so both live in the same flat index space.
+    #
+    # A_active stays ENTRY ONLY because framework §4.7 defines it that way ("the streambed area
+    # through which water ENTERS returning hyporheic flow paths") and the report card publishes it.
+    # The connected area is the union, which is what "how much of this bed is engaged" actually
+    # asks: in a gaining reach the water returns across far more bed than it entered through, and
+    # counting only the entry side reported a reach that returns 100% of its downwelling as 28%
+    # connected.
+    active_streambed_area = return_streambed_area = connected_streambed_area = None
     if cell_area2d is not None:
-        ret_src = np.unique(src[returning_mask]) if returning_mask.any() else np.empty(0, np.int64)
-        if ret_src.size:
-            _, rem_a = np.divmod(ret_src, nrow * ncol)
-            iia, jja = np.divmod(rem_a, ncol)
-            plan_a = np.zeros((nrow, ncol), dtype=bool)
-            plan_a[iia, jja] = True
-            active_streambed_area = float(np.asarray(cell_area2d, dtype=float)[plan_a].sum())
-        else:
-            active_streambed_area = 0.0
+        ret_src = src[returning_mask] if returning_mask.any() else np.empty(0, np.int64)
+        ret_end = end_node[returning_mask] if returning_mask.any() else np.empty(0, np.int64)
+        kw = {"nrow": nrow, "ncol": ncol, "cell_area2d": cell_area2d}
+        active_streambed_area = _plan_area(ret_src, **kw)
+        return_streambed_area = _plan_area(ret_end, **kw)
+        connected_streambed_area = _plan_area(np.concatenate((ret_src, ret_end)), **kw)
 
     # Optional per-particle maximum penetration depth (report §7.4): a SECOND pass in pathline mode
     # over the SAME seeds. The endpoint pass above has no trajectory, and build_hz_mp7_sim forbids
     # combined mode. Best-effort: on any failure the depth stays absent and the report degrades.
-    max_depth_m = None
+    max_depth_m = path_length_m = None
     if with_path_depth:
         try:
             mp_pl = build_hz_mp7_sim(gwf, seeds, mp7_ws=hz_ws, exe=exe, direction="forward",
@@ -665,6 +722,12 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
             (Path(hz_ws) / f"{mp_pl.name}.sloc").unlink(missing_ok=True)
             Tarr = np.asarray(T, dtype=float)
             depths = np.full(n, np.nan, dtype=np.float32)
+            # Travelled DISTANCE, not depth and not time. Microplastic retention in a streambed is
+            # deep-bed filtration, whose coefficient is per centimetre of travel through the
+            # medium: Munz et al. (2024) measured retention profiles that did not change with flow
+            # duration beyond a couple of pore volumes, so path length is the only variable that
+            # carries the answer. Free here because this loop already holds the trajectory.
+            lengths = np.full(n, np.nan, dtype=np.float32)
             for m in range(n):                       # flopy zero-bases pids: seed index m == pid m
                 rec = by_pid.get(m)
                 if rec is None or np.asarray(rec).size == 0:
@@ -672,18 +735,25 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
                 k_d, rem_d = divmod(int(src[m]), nrow * ncol)
                 i_d, j_d = divmod(rem_d, ncol)
                 depths[m] = path_max_depth(Tarr[k_d, i_d, j_d], np.asarray(rec["z"], float))
-            max_depth_m = depths
+                lengths[m] = _path_length(rec)
+            max_depth_m, path_length_m = depths, lengths
             log(f"Interface pass: captured max penetration depth for {int(np.isfinite(depths).sum())}"
-                f"/{n} particles")
+                f"/{n} particles, path length for {int(np.isfinite(lengths).sum())}/{n}")
         except Exception as e:  # noqa: BLE001 — depth is best-effort; the report renders without it
             log(f"Interface pass: path-depth pass skipped ({type(e).__name__}: {e})")
-            max_depth_m = None
+            max_depth_m = path_length_m = None
 
-    per_particle = {"source_node": src, "weight": w, "cls": cls,
+    # `return_node` is where the particle ended, as `source_node` is where it started. The endpoint
+    # pass has always known it (exit_code is derived from it above) but never persisted it; the
+    # thermal-mosaic map needs it to aggregate buffering by return location. Readers must treat it
+    # as optional, like max_depth_m, so pre-existing artifacts still load.
+    per_particle = {"source_node": src, "return_node": end_node, "weight": w, "cls": cls,
                     "time_days": time_days, "status": status,
                     "exit_code": exit_code.astype(np.uint8), "origin_code": origin_code}
     if max_depth_m is not None:
         per_particle["max_depth_m"] = np.asarray(max_depth_m, dtype=np.float32)
+    if path_length_m is not None:
+        per_particle["path_length_m"] = np.asarray(path_length_m, dtype=np.float32)
 
     log(f"Interface pass: stream downwelling {total_down:.3g} -> returning {ret_w:.3g}, "
         f"losing {los_w:.3g}, unresolved {unres_w:.3g} (mbe {mbe:.2e}); side inflow "
@@ -715,6 +785,14 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
                                              if streambed_area is not None else None),
                        "active_streambed_area_m2": (round(active_streambed_area, 2)
                                                     if active_streambed_area is not None else None),
+                       # Where returning water LEAVES the bed, and the union of both sides. Absent
+                       # from artifacts written before these existed, so readers must treat them
+                       # as optional exactly like max_depth_m.
+                       "return_streambed_area_m2": (round(return_streambed_area, 2)
+                                                    if return_streambed_area is not None else None),
+                       "connected_streambed_area_m2": (
+                           round(connected_streambed_area, 2)
+                           if connected_streambed_area is not None else None),
                        "n_stream_cells_upwelling": int(sum(
                            1 for v in flows["stream_net"].values() if v < 0)),
                        "n_side_cells_inflow": len(side_in)},
@@ -1118,12 +1196,16 @@ def _persist_display_pathlines(pl_paths: dict, hz_dir: Path, *, keep_raw: bool) 
     translates them into GMS particle sets later. Move by default (hz_ws is deleted
     at the end of the run regardless); copy when keep_raw is set so the raw
     workspace keeps its files too. Returns artifact-manifest entries."""
+    # Canonical result names, independent of the MP7 simulation naming upstream
+    # (which yields hz_pl_for/hz_pl_bac via direction[:3] — the GMS export contract
+    # is hz_pl_fwd/hz_pl_bwd, and the mismatch silently dropped every particle set).
+    canon = {"forward": "hz_pl_fwd.mppth", "backward": "hz_pl_bwd.mppth"}
     out: dict[str, str] = {}
     for direction, src in pl_paths.items():
         src = Path(src)
         if not src.is_file():
             continue
-        dst = Path(hz_dir) / src.name
+        dst = Path(hz_dir) / canon.get(direction, src.name)
         if keep_raw:
             shutil.copyfile(src, dst)
         else:
@@ -1255,9 +1337,13 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
     t0 = time.monotonic()
     flux = None
     try:
+        # Passed explicitly, never left to the signature default: this is the release density of
+        # the distribution every screening number rests on, so it belongs where a reader of the
+        # orchestrator can see it. `sample_per_class`/`hz_ppc` govern the OTHER pass.
         flux = run_interface_pass(gwf, member=member, idomain=idomain, head=head, T=T, B=B,
                                   gwf_ws=gwf_ws, hz_ws=hz_ws, exe=exe, porosity=porosity,
                                   max_time_days=max_time_days,
+                                  particles_per_cell=IFACE_PARTICLES_PER_CELL,
                                   cell_area2d=np.outer(delc, delr), log=log)
     except Exception as e:  # noqa: BLE001 — the classification results stand on their own
         log(f"Interface pass failed (continuing without flux metrics): {e}")
