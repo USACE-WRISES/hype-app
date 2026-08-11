@@ -142,7 +142,15 @@ def headline_cards(results: AssessmentResultsV2) -> list[dict]:
                         ("Residence time P10", fmt(lo), "hr"),
                         ("Residence time P90", fmt(hi), "hr")]},
         {"dimension": DIM_EXTENT,
-         "primary_name": "Equivalent active depth",
+         # THE BASIS IS PART OF THE NAME. Habitat Creation headlines "Equivalent pore-water depth",
+         # which is this number times porosity, and the two sat in one document with nothing on
+         # this card saying they were different quantities: the screening recap renders the card
+         # with no supporting rows and no "What this means", and the PDF identity table carries no
+         # volume-basis chip at all, so a reader had "7.671 m" and "2.30 m" and no way to reconcile
+         # them. `signature.EXTENT_HELP` already authors the phrase as ("Basis", "bulk sediment").
+         # NOT `metric_rows`, which owns its own copy of this label: `alternatives.metric_ranges`
+         # keys saved scenario ranges by that vocabulary, and it prints its own Volume basis row.
+         "primary_name": "Equivalent active depth (bulk sediment)",
          "primary_value": fmt(z.equivalent_active_depth_m), "primary_unit": "m",
          "primary_range": None,
          "definition": "Active hyporheic volume normalized by streambed area. It is a "
@@ -169,6 +177,53 @@ def threshold_rows(results: AssessmentResultsV2) -> list[dict]:
             "functional_per_km": fmt(t.functional_connectivity_per_km),
         })
     return rows
+
+
+def _fmt_grad(g) -> str:
+    """Gradients are a 4-decimal quantity everywhere in the app; missing is n/a."""
+    return "n/a" if g is None else f"{g:.4f}"
+
+
+def calibration_well_rows(results: AssessmentResultsV2) -> list[dict]:
+    """Groundwater Model Calibration wells, pre-formatted. Used by BOTH renderers (the
+    HTML/PDF split has drifted before — change these builders, never one template)."""
+    cal = results.calibration
+    if cal is None:
+        return []
+    return [{
+        "name": w.name,
+        "screen": fmt(w.screen_elevation_m),
+        "layer": "n/a" if w.model_layer is None else str(w.model_layer),
+        "observed": fmt(w.observed_head_m),
+        "computed": fmt(w.computed_head_m),
+        "residual": "n/a" if w.residual_m is None else f"{w.residual_m:+.2f}",
+        "note": w.note or "",
+    } for w in cal.wells]
+
+
+def calibration_pair_rows(results: AssessmentResultsV2) -> list[dict]:
+    """Tracked head-gradient pairs for the calibration table (same shared-builder rule)."""
+    cal = results.calibration
+    if cal is None:
+        return []
+    return [{
+        "pair": f"{p.well_a} to {p.well_b}",
+        "distance": fmt(p.distance_m),
+        "computed_gradient": _fmt_grad(p.computed_gradient),
+        "observed_gradient": _fmt_grad(p.observed_gradient),
+        "note": p.note or "",
+    } for p in cal.pairs]
+
+
+def calibration_stats_line(results: AssessmentResultsV2) -> str | None:
+    """One-sentence residual summary, or None when no well carries both heads."""
+    st = results.calibration.stats if results.calibration else None
+    if st is None:
+        return None
+    return (f"Residuals over {st.n_observed} observed well"
+            f"{'' if st.n_observed == 1 else 's'}: mean error {st.mean_error_m:+.2f} m, "
+            f"mean absolute error {st.mean_absolute_error_m:.2f} m, "
+            f"RMSE {st.rmse_m:.2f} m.")
 
 
 def input_rows(results: AssessmentResultsV2) -> list[dict]:
@@ -258,6 +313,282 @@ def alternative_range_rows(results: AssessmentResultsV2) -> list[dict]:
     return rows
 
 
+def document_title(*, include_functions: bool, include_hydraulics: bool) -> str:
+    """What one built document calls itself, matching the names the tree already uses.
+
+    Both halves used to title themselves "Site Summary Report", so a screening report opened from
+    the node labelled Functional Screening Report announced itself as something else. The combined
+    form keeps the old name, which is what it is and what the existing artifacts are called."""
+    if include_functions and not include_hydraulics:
+        return "Functional Screening Report"
+    if include_hydraulics and not include_functions:
+        return "Hydraulics Report"
+    return "Site Summary Report"
+
+
+def function_section_key(field: str, model) -> str:
+    """The id one screening section is known by, in this document and in the envelope.
+
+    ONE RULE, ONE PLACE. `function_sections` below and `alt_screening._section_models` both call
+    it, so the envelope joins the document by construction instead of by two string literals
+    agreeing. A payload from before the multi-select carries no preset key and keeps the old id.
+
+    THE POLLUTANT KEY CARRIES THE ENDPOINT, which is what makes "a separate envelope per endpoint,
+    never combined" structural rather than a rule someone has to remember: two chemicals' masses
+    have no expression anywhere downstream in which they could meet."""
+    if field == "pollutant":
+        pk = getattr(model, "preset_key", None)
+        return f"pollutant.{pk}" if pk else "pollutant"
+    return field
+
+
+# --------------------------------------------------------------------- scenario envelope copy
+#
+# THE TWO RANGES NAME THE FACTOR EACH ONE VARIES. A screening section can now carry two ranges
+# that mean entirely different things, and the old generic wording ("Reported range") gave the
+# reader no way to tell them apart. "Process-input" rather than "process-rate" because thermal's
+# swept parameter is a response TIME, not a rate, so the narrower word is already wrong for one
+# module. Neither range is hidden: demoting the rate spread would make the hydraulic one look more
+# comprehensive than it is, and suppressing it would hide known process-input sensitivity.
+#
+# BOTH LABELS OPEN ON "RANGE" so the two read as a matched pair rather than two unrelated rows, and
+# the shared word carries the shared meaning: what follows it is the only thing that differs. They
+# used to carry parentheticals naming the factor each one HELD ("(Basecase hydraulics)",
+# "(process inputs held)"). Those doubled the length of every row to restate the other label's
+# subject, and a reader who had both rows in front of them could already see it.
+#
+# THE WORD "ENVELOPE" IS NOT IN ANY OF THESE. It named nothing the reader could point at: the
+# feature that produces the range is called Hydraulic Alternatives in the tree, in the pane and in
+# this report's own appendix, and a second word for it read as a second concept. The Python symbols
+# below still say envelope, deliberately -- they are internal, the contract is versioned under that
+# name, and renaming them would churn a schema for no reader benefit.
+SENSITIVITY_LABEL = "Range across process inputs"
+ENVELOPE_LABEL = "Range across hydraulic alternatives"
+#: A sweep that did not move the estimate, said in words. "87.7 to 87.7%" reads as a broken widget;
+#: a zero-width range is a FINDING (the sweep saturated), not a missing number, and it has to look
+#: like one. `_same_bound` decides, so all four functions and both renderers agree.
+SENSITIVITY_UNCHANGED = "unchanged across tested inputs"
+ENVELOPE_LIMITATION = ("The range across alternatives covers hydraulic variability only. It "
+                       "excludes process-input uncertainty.")
+
+
+#: The warning code `alt_screening` raises a withheld envelope under.
+ENVELOPE_WARNING_CODE = "function_envelope_unavailable"
+
+
+def envelope_map(results: AssessmentResultsV2) -> dict:
+    """{section key: SectionEnvelope} for the template, keyed the way `function_sections` keys."""
+    env = getattr(results, "function_envelope", None)
+    return env.by_key() if env is not None else {}
+
+
+def envelope_warnings(results: AssessmentResultsV2) -> list[str]:
+    """Why a requested envelope is not here, rendered IN PART B.
+
+    The general warnings block lives in the hydraulics half of the template, so a screening
+    document carried none: a reader who ticked the option on the screening report pane got a
+    normal-looking document with the envelope simply missing and no cause stated anywhere. The
+    explanation has to appear where the option was ticked."""
+    return [w.message for w in (results.warnings or [])
+            if getattr(w, "code", None) == ENVELOPE_WARNING_CODE]
+
+
+def envelope_scope_note(results: AssessmentResultsV2) -> bool:
+    """Whether a range across alternatives was folded at all.
+
+    IT NO LONGER RETURNS A SENTENCE. The one it used to return ("Every function below was
+    recalculated across N hydraulic alternatives...") stood between the reader and the results, and
+    everything it claimed is now stated where it can be checked: the held values in each function's
+    Inputs tab, the cautions in the appendix. What survives is the FACT, which still gates the
+    hydraulic-variability bullet under Shared screening assumptions.
+
+    `envelope_held_rows` went with the sentence. It listed nitrate, the rate, the oxygen settings,
+    every endpoint's concentration and the thermal response time -- and `function_input_rows` now
+    prints all of them under the function they belong to, so it had become a second copy."""
+    env = getattr(results, "function_envelope", None)
+    return env is not None and bool(env.sections)
+
+
+def _env_one(v, kind: str) -> str:
+    """One envelope number, formatted the way the section above it formats the same quantity.
+
+    Without the registry's `kind` a fraction prints "0.632" directly beneath a table saying
+    "63.2%"."""
+    if kind in ("pct", "pct_sig"):
+        return _pct(v) or "n/a"
+    if kind == "int":
+        return fmt(v) or "n/a"
+    return fmt_sig(v) or "n/a"
+
+
+def _env_unit(row) -> str:
+    """A percent row carries `unit=""` in the registry because the pane appends the sign itself.
+    Copying that here keeps "63.2 to 87.1 %" from reading as a bare pair of numbers."""
+    kind = getattr(row, "kind", "num")
+    return row.unit or ("%" if kind in ("pct", "pct_sig") else "")
+
+
+def unit_suffix(unit: str) -> str:
+    """A unit as it attaches to the number before it. Percent sets closed up, everything else
+    takes a space.
+
+    ONE RULE, because a card can show the same quantity twice: thermal's two ranges printed
+    "87.7% to 99.1%" directly above "83.7 to 99.8 %", which reads as two different conventions
+    for what is one number under two treatments."""
+    if not unit:
+        return ""
+    return unit if unit == "%" else f" {unit}"
+
+
+def _same_bound(lo, hi, fmt_fn) -> bool:
+    """Whether two sweep bounds are ONE NUMBER as the report prints it.
+
+    TWO TESTS, AND NEITHER IS REDUNDANT. Delete one and the other does not cover for it:
+
+      * Formatted equality catches the ordinary case. 0.06811838 and 0.06848999 are a real 0.5%
+        spread that both print "0.0683", and "0.0683 to 0.0683" reads as a broken widget.
+      * Numeric closeness catches the rounding boundary formatted equality misses. 0.1234999999999
+        and 0.1235000000001 are the same number to within 1e-12 but round to "0.123" and "0.124",
+        and printing that pair claims a 0.8% spread that does not exist.
+
+    `abs_tol=0.0` on purpose: two bounds straddling zero are a real sign change, not a collapse."""
+    if lo is None or hi is None:
+        return False
+    try:
+        if math.isclose(float(lo), float(hi), rel_tol=1e-12, abs_tol=0.0):
+            return True
+    except (TypeError, ValueError):
+        return lo == hi
+    return fmt_fn(lo) == fmt_fn(hi)
+
+
+def sensitivity_text(lo, hi, unit: str = "", fmt_fn=fmt_sig) -> str | None:
+    """One process-input sweep as the card prints it, or None when there is no sweep.
+
+    ONE COLLAPSE POLICY FOR ALL FOUR FUNCTIONS, which is the point of the function existing.
+    Nutrient and pollutant used to route through `fmt_range`, which collapses; thermal and
+    microplastic hand-built "lo to hi" and could NOT, so a thermal run whose two response-time
+    cases agreed printed "87.7 to 87.7%" while a nutrient run in the same state printed one number.
+    Each caller still passes its own formatter and unit, so every non-collapsed string is exactly
+    what it was before this was factored out.
+
+    BOTH BOUNDS ARE GUARDED. Thermal used to test only the low one, so a result carrying a low and
+    no high rendered the literal "87.7 to None%"."""
+    if lo is None or hi is None:
+        return None
+    if _same_bound(lo, hi, fmt_fn):
+        return SENSITIVITY_UNCHANGED
+    s_lo, s_hi = fmt_fn(lo), fmt_fn(hi)
+    if s_lo is None or s_hi is None:
+        return None
+    return f"{s_lo} to {s_hi}{unit_suffix(unit)}"
+
+
+def _env_fmt(row) -> str:
+    """One row's range, collapsing to a single value when both bounds format identically."""
+    kind = getattr(row, "kind", "num")
+    lo, hi = _env_one(row.lo, kind), _env_one(row.hi, kind)
+    return lo if lo == hi else f"{lo} to {hi}"
+
+
+def _env_collapsed(row) -> bool:
+    """Whether the sweep moved this folded row at all, at the precision printed beside it.
+
+    THE ROW-DROP TEST USED TO BE `r.lo == r.hi` ON THE RAW FLOATS while `_env_fmt` collapsed on the
+    formatted strings, so a row whose bounds differed in the last bit survived the drop, printed a
+    single value, and then named two DIFFERENT runs beside it. That is the exact contradiction the
+    blanking below it exists to prevent. One predicate, so the drop, the wording and the
+    attribution can no longer disagree about whether a row moved."""
+    kind = getattr(row, "kind", "num")
+    return _same_bound(row.lo, row.hi, lambda v: _env_one(v, kind))
+
+
+def envelope_line(sec_env, case_count: int) -> str | None:
+    """The range-across-alternatives value for one section, or None when it has no primary.
+
+    "RUNS", NOT "ALTERNATIVES". `case_count` counts the Basecase alongside the alternatives, and
+    this number has to agree with the Runs column of the table in the same tab, which counts the
+    same way."""
+    p = getattr(sec_env, "primary", None)
+    if p is None:
+        return None
+    if _env_collapsed(p):
+        return f"unchanged across {case_count} runs"
+    return f"{_env_fmt(p)}{unit_suffix(_env_unit(p))}"
+
+
+def function_headline(process_key: str, model) -> dict | None:
+    """{name, value, unit} for one screening section's ONE headline result.
+
+    THE CARD MUST NOT DEPEND ON THE SWEEP. It used to be printed from the envelope's primary row,
+    so a document built without a complete alternatives set had no headline at all and opened each
+    function on a metric table. This resolves the same row directly, through the same
+    `screen.row_specs` + `screen.resolve_row` the fold uses, which is what keeps the number above a
+    range and the number the range was folded around from ever being different rows.
+
+    None for a process the registry does not carry (microplastics is unregistered and dormant) and
+    for a section whose primary has no value, which is a real state: an endpoint screened with no
+    concentration entered produces a rate-free result and has no mass to headline."""
+    from .functions.screen import is_numeric, resolve_row, row_specs
+    try:
+        spec, _ = row_specs(process_key)
+    except (KeyError, AttributeError):
+        return None
+    if spec is None or model is None:
+        return None
+    r = resolve_row(spec, model)
+    if r is None:
+        return None
+    key, name, unit = r
+    v = getattr(model, key, None)
+    if not is_numeric(v):
+        return None
+    kind = getattr(spec, "kind", "num")
+    # A percent row carries `unit=""` in the registry because the pane appends the sign itself.
+    # Same rule as `_env_unit`, so the headline and the range beneath it are labelled alike.
+    return {"name": name, "value": _env_one(v, kind),
+            "unit": unit or ("%" if kind in ("pct", "pct_sig") else "")}
+
+
+def envelope_section_rows(sec_env, case_count: int) -> list[dict]:
+    """Supporting-range rows for ONE section, for that function's own Output Metrics table.
+
+    PER SECTION, NOT ONE FLAT APPENDIX. These used to be a single table at the foot of the
+    document with a leading Section column, which on a run screening three chemicals meant sixty
+    rows and thirty repetitions of "Dissolved Pollutants". A function's ranges belong with that
+    function's other metrics, where the reader is already looking at the numbers they bracket."""
+    if sec_env is None or sec_env.primary is None:
+        return []
+    out: list[dict] = []
+    for i, r in enumerate([sec_env.primary, *sec_env.supporting]):
+        collapsed = _env_collapsed(r)
+        # ROWS THE SWEEP DID NOT MOVE ARE DROPPED, except the primary, which anchors its section.
+        # This table exists to show what hydraulic variability changed, and a zero-width range is
+        # not a range: keeping them turned a five-section report into sixty-odd rows, most of them
+        # a number repeated beside itself.
+        if collapsed and i:
+            continue
+        unit = _env_unit(r)
+        out.append({
+            "name": r.name + (f" ({unit})" if unit else ""),
+            "base": _env_one(r.base, getattr(r, "kind", "num")) if r.base is not None else "n/a",
+            # The one row that can survive collapsed is the primary, and it sits directly under a
+            # card already saying "unchanged across N runs". A number in this cell there would read
+            # as a range contradicting the sentence above it. Bare, because the Runs column beside
+            # it already carries the count that sentence spells out.
+            "range": ("unchanged" if collapsed else _env_fmt(r)),
+            # A collapsed range names no runs: two different runs beside one number reads as a
+            # contradiction, and the single value already says the sweep did not move it.
+            "lo_case": "" if collapsed else r.lo_case,
+            "hi_case": "" if collapsed else r.hi_case,
+            # ALWAYS POPULATED. This was blank whenever the fold covered every run, which is the
+            # normal case, so the column promised coverage and delivered nothing on every row of a
+            # sixty-row table. A short fold still says so.
+            "runs": (str(r.n) if r.n >= case_count else f"{r.n} of {case_count}"),
+        })
+    return out
+
+
 def scenario_range_map(results: AssessmentResultsV2) -> dict:
     """{(section, name): range string} for the detailed-metric tables and the CSV."""
     return {(r["section"], r["name"]): r["range"] for r in alternative_range_rows(results)}
@@ -288,25 +619,21 @@ def alternatives_note(results: AssessmentResultsV2) -> str | None:
     manifest = results.alternatives
     if manifest is None:
         return None
-    return (f"{len(manifest.completed())} of {len(manifest.scenarios)} alternative runs "
-            "completed. Ranges cover the Basecase plus completed alternatives only.")
+    from .contracts import AltStatus
+    done, total = len(manifest.completed()), len(manifest.scenarios)
+    base = (f"{done} of {total} configured alternative runs completed. Ranges cover the Basecase "
+            "plus completed alternatives only.")
+    # NAME WHAT DID NOT RUN, for the same reason `alternatives.partial_note` does: a range whose
+    # missing half was the low-K end means something different from one missing a gradient variant.
+    missing = [s.label for s in manifest.scenarios if s.status != AltStatus.completed]
+    return base + (f" Not completed: {', '.join(missing)}." if missing else "")
 
 
 #: Which metric answers which question (functions plan §10). Static text; the values slot in.
-_DECISION_FRAMEWORK = [
-    ("Prioritize rivers to preserve", "total",
-     "You are protecting existing function, so the sites doing the most actual work win."),
-    ("Prioritize rivers for restoration", "areal",
-     "You are hunting for headroom. Large area with a weak areal flux has the most room to gain. "
-     "Total mass alone misleads here, because a healthy big river looks attractive but has little "
-     "room to improve."),
-    ("Compare restoration alternatives at one site", "total",
-     "Same site, so area and efficiency are both in play. The change in total mass is the benefit "
-     "metric for a cost comparison."),
-    ("Regulatory decision, for example a TMDL", "total",
-     "Load allocations are written in mass per time, so this is the number that plugs into the "
-     "accounting."),
-]
+# THE "WHICH NUMBER TO USE" TABLE WAS REMOVED (2026-08-02). It was one four-row list of decisions
+# whose reasoning text never varied, re-emitted under every mass-bearing section, so a document
+# screening nitrate plus three metals printed the same four paragraphs four times. Every section's
+# own total and areal figures are still in its detailed metrics, which is what the table pointed at.
 
 
 def _pct(x, digits: int = 1) -> str | None:
@@ -318,10 +645,38 @@ def _pct(x, digits: int = 1) -> str | None:
 def _conc(x) -> str | None:
     """A concentration a reader can act on. Saturated removal drives the outlet concentration to
     something like 7e-14 mg/L, and printing that reads as instrument noise rather than what it
-    means, which is that effectively none of the entering load came back out."""
+    means, which is that effectively none of the entering load came back out.
+
+    BULK CHEMISTRY ONLY (nitrate, dissolved oxygen). Trace contaminants go through `_ugl`."""
     if x is None:
         return None
     return "under 0.01" if 0 < x < 0.01 else fmt_sig(x)
+
+
+#: The one unit every concentration in the pollutant endpoint block is stated in. FIXED, never
+#: varied by endpoint or scenario: a table that switched unit row by row is exactly what let a
+#: µg/L label sit beside an mg/L value for six of the ten presets.
+POLLUTANT_CONC_UNIT = "µg/L"
+
+
+def _ugl(x_mg_l, *, floor: bool = False) -> str | None:
+    """One trace-contaminant concentration: stored and computed in mg/L, DISPLAYED in µg/L.
+
+    The block used to print `p.concentration_unit` (the endpoint's ENTRY unit, µg/L for every
+    organic) beside `inlet_concentration_mg_l` (the converted value), understating it by 1000x,
+    while the two rows below it were labeled mg/L and held mg/L. So the three could not be compared
+    with each other either. One unit for all three fixes both.
+
+    `floor` mirrors `_conc`'s guard ONE SCALE UP, and only the returning-water row asks for it:
+    saturated removal drives the outlet to ~1e-11 µg/L, which reads as instrument noise rather than
+    as "effectively none of the entering load came back out". It is evaluated on the CONVERTED
+    value, because reusing `_conc`'s mg/L threshold here would suppress a real 4 µg/L outlet as
+    "under 0.01". The inlet and the change never floor: the inlet is a number the user typed, and a
+    ng/L endpoint sits legitimately below the threshold."""
+    if x_mg_l is None:
+        return None
+    v = x_mg_l * 1000.0
+    return "under 0.01" if (floor and 0 < v < 0.01) else fmt_sig(v)
 
 
 def _pct_sig(x, sig: int = 3) -> str | None:
@@ -350,6 +705,77 @@ def _sig(x, sig: int = 3) -> str | None:
 def _rows(*pairs) -> list[dict]:
     """(name, value) pairs, dropping any whose value is missing."""
     return [{"name": n, "value": v} for n, v in pairs if v is not None]
+
+
+def function_input_rows(process_key: str, model) -> list[dict]:
+    """What one screening section was given, as consumed by the FROZEN result.
+
+    Read off the result model rather than re-read from live inputs, so a report built after the
+    user edited a box still shows the numbers the estimate was actually computed with.
+
+    HAND-AUTHORED PER PROCESS, and it has to be. The registry's `run_settings` is the field that
+    means "input", but it is populated for `habitat` alone: the nutrient rate, nitrate, oxygen and
+    threshold, and the pollutant concentration and rate, are live `ui.input_numeric` widgets that no
+    registry row list names. Habitat therefore goes through the registry (its rows are authored,
+    labelled and carry help) and the other three are spelled out here.
+
+    Every row here is DELETED from `function_sections`'s `rows`, or the document prints it twice."""
+    rows: list[dict] = []
+
+    def add(name, value, unit=""):
+        if value is not None:
+            rows.append({"name": name, "value": str(value), "unit": unit})
+
+    if process_key == "denitrification":
+        add("Stream nitrate", _conc(model.inlet_concentration_mg_l),
+            model.nitrate_basis_label or "mg/L as N")
+        # THE RATE CONSTANT, which `_F_NUTRIENT.assumption` names as the thing this estimate rests
+        # on and which appeared in neither `rows` nor `chain` before this table existed.
+        add("Denitrification rate", _num(model.rate_value), model.rate_unit or "1/day")
+        add("Oxygen limitation", ("on" if model.oxygen_gate else "off")
+            if model.oxygen_gate is not None else None)
+        if model.oxygen_gate:
+            add("Stream dissolved oxygen", _num(model.dissolved_oxygen_mg_l, 2), "mg/L")
+            add("Oxygen consumption", _num(model.oxygen_consumption_mg_l_day, 2), "mg/L/day")
+            add("Anoxic threshold", _num(model.anoxic_threshold_mg_l, 2), "mg/L")
+    elif process_key == "contaminant":
+        add("Endpoint", model.preset_label or model.contaminant_name)
+        add("Stream concentration", _ugl(model.inlet_concentration_mg_l), POLLUTANT_CONC_UNIT)
+        add("Attenuation rate", _num(model.rate_value), model.rate_unit or "1/day")
+        add("Rate provenance", None if model.rate_derived is None else
+            ("derived by unit conversion" if model.rate_derived else "reported by the authors"))
+    elif process_key == "thermal_regulation":
+        add("Thermal response time", _num(model.response_time_hours, 0), "hours")
+    else:
+        # THE REGISTRY ROUTE, which today means habitat and only habitat. `run_settings` is exactly
+        # this table's contents, already labelled, and no report has ever rendered it: the porosity
+        # and particle density that resolved the zone ARE habitat's inputs even though they are set
+        # on other panes.
+        from .functions import registry as reg
+        try:
+            spec = reg.get_process(process_key)
+        except (KeyError, AttributeError):
+            return rows
+        for r in getattr(spec, "run_settings", ()) or ():
+            lk = getattr(r, "label_key", "")
+            label = (getattr(model, lk, None) or r.label) if lk else r.label
+            v = getattr(model, r.key, None)
+            if v is None:
+                continue
+            add(str(label), _pct(v) if r.kind in ("pct", "pct_sig") else _num(v, r.digits),
+                r.unit or ("%" if r.kind in ("pct", "pct_sig") else ""))
+    return rows
+
+
+def function_input_note(process_key: str) -> str:
+    """Where a read-only input is set and what changing it costs. Registry-declared, and paired
+    with `run_settings` by `validate_registry`, so it travels with the rows above."""
+    from .functions import registry as reg
+    try:
+        spec = reg.get_process(process_key)
+    except (KeyError, AttributeError):
+        return ""
+    return getattr(spec, "run_settings_note", "") or ""
 
 
 def _references(section) -> list[str]:
@@ -382,22 +808,17 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
     if n is not None:
         rows = _rows(
             ("Returning flow paths", (None if n.n_paths is None else fmt(n.n_paths))),
-            # The gate is a user choice now, so the document has to say which way it was set. Only
-            # printed when the section actually answered: `fmt` turns None into "yes"/"no"'s
-            # cousin "n/a", which would read as a third state that does not exist.
-            ("Oxygen limitation applied",
-             (None if n.oxygen_gate is None else fmt(n.oxygen_gate))),
+            # THE GATE FLAG, THE DISSOLVED OXYGEN AND THE NITRATE MOVED TO `function_input_rows`.
+            # They are what the run was given, not what it produced, and printing them in both
+            # tables is the duplication the Inputs/Output Metrics split exists to remove.
             # `_num`, NOT `fmt`. `fmt` renders None as the string "n/a", which keeps the row and
             # makes it read as missing data. With the gate switched off there IS no onset and no
             # dissolved oxygen in play, so the rows have to leave entirely -- the line above
             # already says why, and "Time to anoxia: n/a" underneath it would suggest the run
             # tried to derive one and failed.
             ("Time to anoxia (h)", _num(n.time_to_anoxia_hours, 2)),
-            ("Stream dissolved oxygen (mg/L)", _num(n.dissolved_oxygen_mg_l)),
             ("Exchange reaching anoxia (%)", _pct(n.fraction_above_threshold)),
             ("Exchange staying oxic (%)", _pct(n.fraction_below_threshold)),
-            ("Stream nitrate", (None if n.inlet_concentration_mg_l is None else
-                                f"{fmt(n.inlet_concentration_mg_l)} {n.nitrate_basis_label or ''}")),
             ("Implied zero-order rate (mg N L⁻¹ day⁻¹)",
              fmt(n.implied_zero_order_rate_mg_l_day, 2)),
             ("Monod half-saturation (mg/L as N)", fmt(n.monod_half_saturation_mg_l, 2)),
@@ -414,11 +835,14 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
             ("Total removed (kg N day⁻¹)", fmt_sig(n.total_removed_kg_day)),
             ("Total removed (lb N day⁻¹)", fmt_sig(n.total_removed_lb_day)),
         )
-        values = {"total": (fmt_sig(n.total_removed_kg_day), "kg N day⁻¹"),
-                  "areal": (fmt_sig(n.areal_removal_rate_g_m2_day), "g N m⁻² day⁻¹")}
-        _rng = fmt_range(n.total_removed_low_kg_day, n.total_removed_high_kg_day)
+        # "kg N/day", NOT "kg N per day": the range across alternatives prints the registry's own
+        # unit string for the same quantity, and two spellings under one headline read as two
+        # different numbers.
+        _rng = sensitivity_text(n.total_removed_low_kg_day, n.total_removed_high_kg_day, "kg N/day")
         out.append({
-            "key": "nutrient", "title": n.process_label or "Nutrient Cycling",
+            "key": "nutrient", "process": "denitrification",
+            "title": n.process_label or "Nutrient Cycling",
+            "headline": function_headline("denitrification", n), "model": n,
             # THE LEDE FOLLOWS THE GATE. It used to assert the onset unconditionally, which is
             # simply false on a run screened with the oxygen limitation switched off -- and a
             # document that describes a mechanism the numbers below it did not use is worse than
@@ -430,17 +854,12 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
                 "dissolved oxygen falls below the anoxic threshold. Time to anoxia is derived, "
                 "not entered.")),
             "rows": rows, "chain": chain,
-            "range": (None if _rng is None else f"{_rng} kg N per day"),
+            "range": _rng,
             "range_note": ("Sensitivity bounds spanning both the denitrification rate and the "
                            "oxygen consumption rate, which together set when removal begins. Not "
-                           "a confidence interval. A single value means the sweep did not move "
-                           "the estimate, usually because removal has already run to completion "
-                           "on nearly every flow path."),
-            "decisions": [{"context": ctx,
-                           "metric": ("Total mass removed" if k == "total"
-                                      else "Areal removal rate"),
-                           "value": f"{values[k][0]} {values[k][1]}", "reasoning": why}
-                          for ctx, k, why in _DECISION_FRAMEWORK] if chain else [],
+                           "a confidence interval. An unchanged result means the sweep did not "
+                           "move the estimate, usually because removal has already run to "
+                           "completion on nearly every flow path."),
             "validity_note": n.first_order_validity_note,
             "unavailable_reason": n.unavailable_reason,
             "citation": n.citation, "references": _references(n),
@@ -460,14 +879,10 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
         # never reads "removal" here either: `pollutants.TERMS` supplies the noun and is validated
         # against the reference's banned-word table.
         act = (p.headline_label or "Concentration reduction")
+        # The endpoint, its concentration, its rate and the rate's provenance all moved to
+        # `function_input_rows`: they are the given, not the found.
         rows = _rows(
-            ("Endpoint", p.preset_label or p.contaminant_name),
-            ("Rate provenance", None if p.rate_derived is None else
-             ("derived by unit conversion" if p.rate_derived else "reported by the authors")),
             ("Returning flow paths", _num(p.n_paths)),
-            (f"Stream concentration ({p.concentration_unit or 'mg/L'})",
-             _num(p.inlet_concentration_mg_l)),
-            ("Attenuation rate (1/day)", _num(p.rate_value)),
             ("Reactive exposure (m³)", _sig(p.reactive_exposure_m3)),
             # Reference §4.4, rule 14. Whether the rate matters at all belongs beside the inputs,
             # because it decides how much weight the derivation below can carry.
@@ -479,32 +894,39 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
             (f"{act} (%)", _pct(p.removal_efficiency)),
             # Rule 5: name whose water this is. The stream figure sits two rows below, so the two
             # cannot be read as the same quantity.
-            ("Returning water concentration (mg/L)", _conc(p.outlet_concentration_mg_l)),
-            (f"{p.areal_label or 'Per streambed area'} ({p.areal_rate_unit or 'g/m²/day'})",
+            (f"Returning water concentration ({POLLUTANT_CONC_UNIT})",
+             _ugl(p.outlet_concentration_mg_l, floor=True)),
+            # THE UNIT IS HARDCODED CANONICAL, and `p.areal_rate_unit` one attribute away is the
+            # trap: it carries the DISPLAY scale (every organic preset is mass_scale="g", factor
+            # 1000) while the value here is the canonical one. Pairing them printed 0.126 beside
+            # "mg/m²/day" for a figure that is 126 mg/m²/day. The display twins cannot be printed
+            # instead, because `_build_functions` filters them out of `ContaminantScreening`.
+            # `screen._MASS_DISPLAY` states the rule: the report tables read kg/day and g/m2/day.
+            (f"{p.areal_label or 'Per streambed area'} (g m⁻² day⁻¹)",
              _sig(p.areal_removal_rate_g_m2_day)),
             ("Hyporheic streambed area (m²)", _num(p.reference_area_m2)),
-            (f"{p.per_km_label or 'Per stream km'} ({p.per_km_unit or 'kg/day/km'})",
+            (f"{p.per_km_label or 'Per stream km'} (kg day⁻¹ km⁻¹)",
              _sig(p.removal_per_km_kg_day)),
             (f"{p.mass_label or 'Total'} (kg day⁻¹)", _sig(p.total_removed_kg_day)),
             (f"{p.mass_label or 'Total'} (lb day⁻¹)", _sig(p.total_removed_lb_day)),
             ("Hyporheic return as a share of streamflow", _pct_sig(p.exchange_ratio)),
-            ("Stream concentration change (mg/L)", _sig(p.stream_concentration_change_mg_l)),
+            (f"Stream concentration change ({POLLUTANT_CONC_UNIT})",
+             _ugl(p.stream_concentration_change_mg_l)),
             ("Reach-scale reduction", _pct_sig(p.reach_removal_fraction)),
             ("Processing length (m)", _sig(p.processing_length_m)),
         )
-        values = {"total": (fmt_sig(p.total_removed_kg_day), "kg day⁻¹"),
-                  "areal": (fmt_sig(p.areal_removal_rate_g_m2_day), "g m⁻² day⁻¹")}
-        _span = fmt_range(p.total_removed_low_kg_day, p.total_removed_high_kg_day)
-        _rng_pol = None if _span is None else f"{_span} kg per day"
+        _rng_pol = sensitivity_text(p.total_removed_low_kg_day, p.total_removed_high_kg_day,
+                                    "kg/day")
         endpoint = p.preset_label or p.contaminant_name
         out.append({
-            # ONE ID PER ENDPOINT, since there are now as many sections as ticked endpoints. A
-            # payload from before the multi-select carries no preset key and keeps the old id.
-            "key": f"pollutant.{p.preset_key}" if p.preset_key else "pollutant",
+            # ONE ID PER ENDPOINT, since there are now as many sections as ticked endpoints.
+            "key": function_section_key("pollutant", p),
+            "process": "contaminant",
+            "headline": function_headline("contaminant", p), "model": p,
             "title": endpoint or p.process_label or "Dissolved Pollutants",
             # There are FOUR functions and several calculators. Pollutant Attenuation hosts the
             # dissolved endpoints and microplastic retention; `function` groups them and
-            # `mechanism` names this one, so the report renders one h3 with an h4 per endpoint
+            # `mechanism` names this one, so the report renders one h2 with an h3 per endpoint
             # rather than a row of peer sections.
             "function": "pollutant", "mechanism": endpoint or "Dissolved phase",
             "parent": "pollutant",
@@ -524,15 +946,10 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
             # the same rule, so the two surfaces cannot disagree.
             "range": (None if p.preset_key is None else _rng_pol),
             "range_note": ("Sensitivity bounds from the published spread of the rate constant, "
-                           "not a confidence interval. A single value means the sweep did not "
-                           "move the estimate, which above a Damkohler number of about 100 is "
+                           "not a confidence interval. An unchanged result means the sweep did "
+                           "not move the estimate, which above a Damkohler number of about 100 is "
                            "expected: there the exchange flux sets the answer and the rate "
                            "carries no information."),
-            "decisions": [{"context": ctx,
-                           "metric": (p.mass_label or "Total")
-                           if k == "total" else (p.areal_label or "Per streambed area"),
-                           "value": f"{values[k][0]} {values[k][1]}", "reasoning": why}
-                          for ctx, k, why in _DECISION_FRAMEWORK] if chain else [],
             "unavailable_reason": p.unavailable_reason,
             "citation": p.citation, "references": _references(p),
             "transferability_note": p.transferability_note,
@@ -563,9 +980,12 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
             ("Filter coefficient (1/cm)", _sig(mp.lambda_f_per_cm, 2)),
             ("Capture cap (%)", _pct(mp.capture_cap)),
         )
-        _rng_mp = fmt_range(mp.retained_fraction_low, mp.retained_fraction_high)
+        _rng_mp = sensitivity_text(mp.retained_fraction_low, mp.retained_fraction_high,
+                                   "percent", lambda v: fmt(100.0 * v, 1))
         out.append({
-            "key": "microplastic", "title": mp.process_label or "Microplastic Retention",
+            "key": "microplastic", "process": "microplastic",
+            "title": mp.process_label or "Microplastic Retention",
+            "headline": function_headline("microplastic", mp), "model": mp,
             # Nested under Pollutant Attenuation: retention is a MECHANISM, physical rather than
             # chemical, not a fifth hyporheic function. The calculator stays entirely separate
             # (distance-driven, never time-driven); only the presentation groups them.
@@ -578,12 +998,9 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
             "rows": rows, "chain": chain,
             "chain_title": "Two independent readings, never added",
             "chain_header": "Reading",
-            "range": (None if _rng_mp is None else
-                      f"{fmt(100 * (mp.retained_fraction_low or 0), 1)} to "
-                      f"{fmt(100 * (mp.retained_fraction_high or 0), 1)} percent"),
+            "range": _rng_mp,
             "range_note": ("Across the 3 to 8 percent per kilometre spread Drummond et al. report "
                            "between stream classes. Not a confidence interval."),
-            "decisions": [],
             "unavailable_reason": mp.unavailable_reason,
             "citation": mp.citation, "references": _references(mp),
             "transferability_note": mp.transferability_note,
@@ -592,16 +1009,32 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
     h = fn.habitat
     if h is not None:
         out.append({
-            "key": "habitat", "title": h.process_label or "Habitat Creation",
+            "key": "habitat", "process": "habitat",
+            "title": h.process_label or "Habitat Creation",
+            "headline": function_headline("habitat", h), "model": h,
+            # THE LEDE NO LONGER NAMES A HEADLINE. It asserted that pore-water volume was the
+            # headline while the registry headlines `connected_streambed_fraction`, which the card
+            # prints an inch below it. The registry is the authority on which result leads (it is
+            # the same choice the pane and the alternatives fold make), so the copy stopped
+            # claiming otherwise rather than the headline moving to match the copy.
             "lede": ("Hydraulically connected subsurface space, reported as potential habitat "
-                     "space standing in for habitat creation. Pore-water volume is the headline "
-                     "because it is the water-filled space an organism could occupy. This is "
-                     "potential habitat volume, never habitat quality or occupancy. Depths "
-                     "normalized over the streambed are volume divided by area, not a uniform "
-                     "layer of that thickness."),
+                     "space standing in for habitat creation. Pore-water volume is the "
+                     "water-filled part of it, the space an organism could actually occupy."),
+            "caveat": ("This is potential habitat space, never habitat quality or occupancy. "
+                       "Depths normalized over the streambed are volume divided by area, not a "
+                       "uniform layer of that thickness."),
             # Ordered and labelled to match the Screening pane: the pore-basis set first, then the
             # bulk-basis pair with its basis in the label. Framework §4.6 -- the two bases ship
             # together and neither is ever left for the reader to infer.
+            #
+            # THE RELATIONSHIP, stated where both numbers are. The table prints the pore-water
+            # depth and the bulk-basis depth four rows apart, and porosity is one tab away under
+            # Inputs, so the two read as a contradiction until someone says they are one zone
+            # measured two ways. `registry.HABITAT_BASIS_HELP` says it on the pane, in a tooltip
+            # no report has ever rendered.
+            "metrics_note": ("Both depths describe one zone on two bases. Bulk is sediment plus "
+                             "water, pore-water is the water alone: the bulk-basis depth times "
+                             "the porosity under Inputs."),
             "rows": _rows(
                 ("Connected streambed coverage (%)", _pct(h.connected_streambed_fraction)),
                 ("Equivalent pore-water depth (m)", fmt(h.pore_equivalent_depth_m)),
@@ -619,7 +1052,7 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
                 ("Water entry coverage (%)", _pct(h.active_streambed_fraction)),
                 ("Connected streambed area (m²)", fmt(h.connected_streambed_area_m2)),
                 ("Streambed area (m²)", fmt(h.streambed_area_m2))),
-            "chain": [], "range": None, "decisions": [],
+            "chain": [], "range": None,
             "unavailable_reason": h.unavailable_reason,
             "citation": h.citation, "references": _references(h),
             "transferability_note": h.transferability_note,
@@ -630,20 +1063,24 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
         bands = [{"name": b.get("label"), "value": _pct(b.get("flow_fraction"))}
                  for b in (tm.response_bands or []) if b.get("flow_fraction") is not None]
         out.append({
-            "key": "thermal", "title": tm.process_label or "Temperature Regulation",
+            "key": "thermal", "process": "thermal_regulation",
+            "title": tm.process_label or "Temperature Regulation",
+            "headline": function_headline("thermal_regulation", tm), "model": tm,
             "lede": ("How much of the daily temperature swing returning exchange has shed, how "
                      "much water comes back that way, and how much of it stays under past a full "
-                     "day. This reports buffering opportunity only: it is not degrees of cooling "
-                     "and not a reach temperature change, because stream temperature is set "
-                     "mainly by the surface energy budget."),
+                     "day."),
+            "caveat": ("This reports buffering opportunity only: it is not degrees of cooling and "
+                       "not a reach temperature change, because stream temperature is set mainly "
+                       "by the surface energy budget."),
             # WHY THE DAMPED SHARE ALONE IS NOT ENOUGH, said where a reader meets the number: past
             # about three response times it pins at its ceiling and stops telling reaches apart.
             "guard_notes": [n for n in (tm.damkohler_note,) if n],
             # The first three follow the Screening pane's headline order. `remaining_anomaly` and
             # the flow both left the pane, one to a card and one as a restatement of the line above
             # it, so this is where they still reach the reader.
+            # The response time moved to `function_input_rows`: it is the scenario this run was
+            # given, and it is the one parameter `_F_THERMAL.assumption` says the estimate rests on.
             "rows": _rows(
-                ("Thermal response time (h)", fmt(tm.response_time_hours, 0)),
                 ("Daily temperature swing damped (%)", _pct(tm.buffering_opportunity)),
                 ("Buffered flow returned to the stream (L/s)",
                  fmt(tm.attenuation_weighted_flow_l_s)),
@@ -656,18 +1093,198 @@ def function_sections(results: AssessmentResultsV2) -> list[dict]:
                 ("Exchange past three (%)", _pct(tm.fraction_above_3tau)),
                 ("Median thermal Damkohler", fmt(tm.thermal_damkohler_median, 2))),
             "chain": bands, "chain_title": "Response bands", "chain_header": "Band",
-            "range": (None if tm.buffering_opportunity_low is None else
-                      f"{_pct(tm.buffering_opportunity_low)}% to "
-                      f"{_pct(tm.buffering_opportunity_high)}%"),
+            # "87.7 to 99.1%", not "87.7% to 99.1%": the range across alternatives sits on the
+            # next line of the same card and prints one trailing unit, so a second convention here
+            # made one quantity look like two. `unit_suffix` closes the percent sign up for both.
+            "range": sensitivity_text(tm.buffering_opportunity_low,
+                                      tm.buffering_opportunity_high, "%", _pct),
             "range_note": ("Across the 4 to 16 hour thermal response-time cases. Sensitivity "
                            "bounds, not a confidence interval."),
-            "decisions": [],
             "unavailable_reason": tm.unavailable_reason,
             "citation": tm.citation, "references": _references(tm),
             "transferability_note": tm.transferability_note,
         })
     _attach_group_headings(out)
+    _hoist_shared(out)
+    _split_detail_notes(out)
+    # A section carries everything about itself, including what it was GIVEN. Attached here rather
+    # than in `function_report_groups` so `function_sections` remains the complete per-section
+    # model that tests and the PDF both read.
+    for s in out:
+        pk = s.get("process") or ""
+        s["inputs"] = function_input_rows(pk, s.get("model"))
+        s["supporting"] = _supporting_kpis(pk, s.get("model"))
+        s["input_note"] = function_input_note(pk)
     return out
+
+
+def _split_detail_notes(sections: list[dict]) -> None:
+    """Collect one section's caveats into ONE ordered list, for its Limitations disclosure.
+
+    Rather than have the template decide, section by section, which of six optional prose fields is
+    a caveat and which is a result, the split is made here once. `validity_note` keeps its own key
+    because it is the only one that renders as a warning rather than as muted text."""
+    for s in sections:
+        # `caveat` leads: it is what the estimate CANNOT tell you, and a reader who opened the
+        # disclosure to check a number should meet that before the numbers.
+        notes = [n for n in (s.get("caveat"),) if n] + list(s.get("guard_notes") or [])
+        for key in ("unavailable_reason", "range_note", "transferability_note"):
+            v = s.get(key)
+            if not v:
+                continue
+            # `range_note` explains bounds that only exist when there is a range to explain.
+            if key == "range_note" and not s.get("range"):
+                continue
+            notes.append(f"Transferability. {v}" if key == "transferability_note" else v)
+        s["detail_notes"] = notes
+
+
+#: The four groupings one function's detail is split into, in render order. THE SAME FOUR THE
+#: SCREENING PANE USES (`Advanced inputs` / `More metrics` / `Limitations` / `Sources`, app.py),
+#: under the plainer names a document wants: "More" and "Advanced" only mean something beside a
+#: visible pane. A reader who learns the grouping on screen finds it again in the report.
+FUNCTION_DETAIL_TITLES = ("Inputs", "Output Metrics", "Limitations", "References")
+
+
+def function_report_groups(results: AssessmentResultsV2) -> list[dict]:
+    """One entry per FUNCTION FAMILY, which is what the document draws as a card.
+
+    `function_sections` is one entry per calculator run, so Pollutant Attenuation arrives as three
+    sections when three chemicals are ticked. The card is the family: it carries one heading, its
+    endpoints side by side, and ONE set of four disclosures covering all of them. Grouping here
+    rather than in the template is what lets the endpoints be laid out as a grid at all.
+
+    Ordering follows `function_sections`, which follows the registry, so a family appears where its
+    first section does and unticking a chemical cannot reorder the document."""
+    from .functions import FUNCTIONS, get_function
+
+    sections = function_sections(results)
+    groups: list[dict] = []
+    by_key: dict[str, dict] = {}
+    for s in sections:
+        fam = s.get("function") or s["key"]
+        g = by_key.get(fam)
+        if g is None:
+            spec = get_function(fam) if fam in FUNCTIONS else None
+            g = {"key": fam,
+                 # The family's own name for a multi-endpoint function, the section's for the rest.
+                 "title": (spec.display_label if spec is not None and s.get("parent")
+                           else s["title"]),
+                 "limits": list(getattr(spec, "limits", ()) or []),
+                 "items": [], "references": [], "shared": {}, "note": ""}
+            groups.append(g)
+            by_key[fam] = g
+        g["items"].append(s)
+        g["shared"] = g["shared"] or s.get("group_shared") or {}
+        g["note"] = g["note"] or s.get("input_note") or ""
+        for r in s.get("references") or []:
+            if r not in g["references"]:
+                g["references"].append(r)
+
+    # The ranges each section folded across the sweep, attached HERE rather than on
+    # `function_sections`, which never consults the envelope. They ride in Output Metrics beside
+    # the single-run readings they bracket.
+    env = getattr(results, "function_envelope", None)
+    envs = envelope_map(results)
+    case_count = env.case_count if env is not None else 0
+    for g in groups:
+        # `multi` drives the side-by-side endpoint grid AND the per-endpoint sub-heading. One
+        # endpoint never repeats its family's name one level down.
+        g["multi"] = len(g["items"]) > 1
+        for s in g["items"]:
+            s["alt_rows"] = envelope_section_rows(envs.get(s["key"]), case_count)
+            # PRECOMPUTED, not called from each renderer. It used to be an `env_line` call in the
+            # template and an `envelope_line` call in the PDF, which was already two chances to
+            # word one sentence differently and became a real risk the moment the sentence started
+            # carrying the run count. One field, so the two documents cannot disagree.
+            s["alt_range"] = envelope_line(envs.get(s["key"]), case_count)
+        g["has_inputs"] = any(s["inputs"] for s in g["items"])
+        g["has_metrics"] = any(s["rows"] or s["chain"] or s["alt_rows"] for s in g["items"])
+        g["has_limits"] = bool(g["limits"]) or any(
+            s.get("lede") or s.get("conditions") or s.get("detail_notes") or s.get("validity_note")
+            for s in g["items"]) or bool(g["shared"])
+    return groups
+
+
+def _supporting_kpis(process_key: str, model) -> list[dict]:
+    """The TWO results that ride under the headline, from the registry's own KPI order.
+
+    Exactly two, capped here rather than in the template: the registry declares three KPIs per
+    process, one leads the card and the other two become chips. Resolved through the same
+    `screen.row_specs` + `screen.resolve_row` the headline and the alternatives fold use, so all
+    three surfaces name the same rows and carry the same display-twin fix."""
+    from .functions.screen import is_numeric, resolve_row, row_specs
+    if model is None:
+        return []
+    try:
+        _primary, _rest = row_specs(process_key)
+    except (KeyError, AttributeError):
+        return []
+    from .functions import registry as reg
+    try:
+        kpis = reg.get_process(process_key).kpis
+    except (KeyError, AttributeError):
+        return []
+    out: list[dict] = []
+    for spec in kpis[1:]:
+        r = resolve_row(spec, model)
+        if r is None:
+            continue
+        key, name, unit = r
+        v = getattr(model, key, None)
+        if not is_numeric(v):
+            continue
+        kind = getattr(spec, "kind", "num")
+        out.append({"label": name,
+                    "value": _env_one(v, kind),
+                    "unit": unit or ("%" if kind in ("pct", "pct_sig") else "")})
+        if len(out) == 2:
+            break
+    return out
+
+
+def _hoist_shared(sections: list[dict]) -> None:
+    """Print prose that is identical across every endpoint of one function ONCE, under the function.
+
+    Pollutant Attenuation screens one endpoint per ticked chemical, and four of its prose fields do
+    not vary with the chemical at all: the lede is a hardcoded constant, and the three metals share
+    an eligibility list, a manganese-oxide sorption caveat and a transferability note word for word.
+    A document screening zinc, cobalt and nickel therefore printed the same three paragraphs and the
+    same three bullets three times over, which is most of what makes that function long.
+
+    IDENTITY IS THE TEST, not membership of a hand-kept list. A group mixing a metal with an organic
+    shares none of these, so nothing hoists and every endpoint keeps its own words. That is the same
+    reasoning behind `PaneRow.shared` in the registry, which solved this for values on the pane.
+
+    `guard_notes` is compared entry by entry: the metals share `preset_note` (the sorption caveat)
+    but each has its own `calibration_note` (its own observed per-pass uptake), and hoisting the
+    whole list would need them to match on all three.
+
+    `range_note` is in the set because it explains where a section's sensitivity bounds come from,
+    and that provenance is a property of the CALCULATOR, not of the chemical: three metals printed
+    the same 40-word paragraph three times."""
+    groups: dict[str, list[dict]] = {}
+    for s in sections:
+        if s.get("parent"):
+            groups.setdefault(s["function"], []).append(s)
+    for members in groups.values():
+        if len(members) < 2:
+            continue                     # one endpoint: hoisting would just move it up a line
+        shared: dict = {}
+        for key in ("lede", "conditions", "transferability_note", "range_note"):
+            first = members[0].get(key)
+            if first and all(m.get(key) == first for m in members):
+                shared[key] = first
+                for m in members:
+                    m[key] = None
+        common = [n for n in (members[0].get("guard_notes") or [])
+                  if all(n in (m.get("guard_notes") or []) for m in members)]
+        if common:
+            shared["notes"] = common
+            for m in members:
+                m["guard_notes"] = [n for n in (m.get("guard_notes") or []) if n not in common]
+        if shared:
+            members[0]["group_shared"] = shared
 
 
 def _attach_group_headings(sections: list[dict]) -> None:
@@ -1036,7 +1653,7 @@ def write_rtd_distribution_json(transit_rows: list[dict], path) -> str:
 
 _HTML_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<title>{{ title_name }}: Site Summary Report</title>
+<title>{{ title_name }}: {{ report_title }}</title>
 <style>
  :root{--navy:#2f4b7c;--navy-d:#243a61;--ink:#1f2d3d;--muted:#5a6b7b;--rule:#e6e9ef;
   --card:#d8e0ec;--soft:#f6f8fb}
@@ -1053,23 +1670,33 @@ _HTML_TEMPLATE = """<!doctype html>
  h2{font-size:1.02rem;color:var(--navy-d);border-bottom:2px solid var(--navy);padding-bottom:.25rem;
   margin:1.7rem 0 .7rem;letter-spacing:.2px}
  h3{font-size:.92rem;color:var(--navy-d);margin:1rem 0 .4rem}
- h4{font-size:.86rem;color:var(--navy-d);margin:.9rem 0 .3rem}
  /* THE STRUCTURAL BREAK between what the model computed and what was inferred from it
     (revision spec §9.3, §19.1). Part A is the hyporheic hydraulic signature and always renders;
     Part B is the optional screening layer. Heavier than an h2 on purpose: a reader must not be
     able to quote a screening estimate without having crossed this line. */
  .part{margin:2.6rem 0 0;padding-top:1.1rem;border-top:3px solid var(--navy)}
  .part:first-of-type{margin-top:1.9rem}
+ /* A SECTION THAT FOLLOWS THE HEADER DIRECTLY HAS NOTHING ABOVE IT TO SEPARATE FROM, and the
+    header already draws its own rule, so the break landed as two lines a few millimetres apart.
+    Adjacent-sibling, not `:first-of-type`: where a document opens on Site Maps the first break
+    still divides the maps from the metrics and keeps its bar. */
+ .head + .part{border-top:0;padding-top:0}
+ /* SUPPORTING INFORMATION DRAWS ITS OWN LINE. Its h2 already carries a navy border-bottom, so the
+    part bar landed a few millimetres above it and put the heading between two rules. The h2 rule
+    is the one that marks where the answers stop and the working begins, and the PDF has no bar
+    here at all, so dropping it also brings the two documents closer. `padding-top` stays: without
+    it the h2's own top margin collapses through and pulls the section up into the text above. */
+ .part.supporting{border-top:0}
  .parteyebrow{font-size:10.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
   color:var(--navy);margin:0 0 3px}
  .parthead{font-size:1.22rem;color:var(--navy-d);margin:0;letter-spacing:.2px;border:0;padding:0}
  .partsub{color:var(--muted);font-size:.88rem;margin:.3rem 0 0;max-width:46rem}
  .part h2:first-of-type{margin-top:1.2rem}
  .muted{color:var(--muted);font-size:.85rem}
- /* the governing equation, printed so the headline is checkable by hand against it */
- .eq{font-family:"Cascadia Mono",Consolas,"SF Mono",monospace;font-size:.9rem;
-  background:var(--soft);border:1px solid var(--card);border-radius:6px;padding:.5rem .7rem;
-  margin:.5rem 0;display:inline-block}
+ /* A table's name inside a disclosure. Deliberately not a heading: these sit two levels down
+    behind a summary, and an h4 there would put working notes in the document outline beside the
+    four functions that are the document. */
+ .subhead{font-size:.86rem;font-weight:600;color:var(--navy-d);margin:.9rem 0 .2rem}
  .foot{margin-top:2.4rem;padding-top:.7rem;border-top:1px solid var(--rule);
   color:var(--muted);font-size:11.5px}
  /* reference list: one entry per line with a hanging indent, never a run-on paragraph */
@@ -1089,6 +1716,81 @@ _HTML_TEMPLATE = """<!doctype html>
  .card .sup{margin-top:10px;border-top:1px solid var(--rule);padding-top:7px}
  .card .sup .row{display:flex;justify-content:space-between;gap:8px;font-size:12px;padding:1.5px 0}
  .card .sup .k{color:var(--muted)} .card .sup .v{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+ /* ONE FUNCTION IS ONE CARD. A white card holding tinted result wells, so a function reads as an
+    object rather than as a heading followed by loose blocks. Nothing but the title and the results
+    live here: every word of explanation is behind the four disclosures at its foot. */
+ .function-list{display:grid;grid-template-columns:1fr;gap:16px;margin:.85rem 0}
+ .function-card{border:1px solid var(--card);border-radius:12px;background:#fff;padding:18px 20px;
+  box-shadow:0 2px 8px rgba(20,40,80,.055)}
+ .function-title{font-size:1.05rem;font-weight:750;color:var(--navy-d);margin:0 0 11px;
+  border:0;padding:0}
+ /* THE ENDPOINT GRID. A function screening three chemicals lays them side by side instead of
+    stacking three near-identical sections, which is the largest single density win here. */
+ .endpoint-grid{display:grid;grid-template-columns:1fr;gap:12px}
+ .endpoint-grid.multi{grid-template-columns:repeat(auto-fit,minmax(275px,1fr))}
+ .endpoint{background:var(--soft);border:1px solid var(--rule);border-radius:10px;padding:14px 15px;
+  min-width:0}
+ .endpoint h4{font-size:.9rem;color:var(--navy-d);margin:0 0 7px}
+ /* The case is welded into the label, so the number can never be quoted without it. That is what
+    lets the legend explaining Basecase versus the two ranges be deleted rather than just moved. */
+ .result-label{font-size:.72rem;letter-spacing:.045em;text-transform:uppercase;color:var(--muted);
+  font-weight:700}
+ .result-value{font-size:1.65rem;line-height:1.1;font-weight:800;color:#263957;
+  font-variant-numeric:tabular-nums;margin:2px 0 8px}
+ .result-value small{font-size:.78rem;color:var(--muted);font-weight:600}
+ .support-kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin:0 0 10px}
+ .support-kpi{background:#fff;border:1px solid var(--rule);border-radius:7px;padding:7px 8px}
+ .support-kpi .label{font-size:.68rem;color:var(--muted);line-height:1.25}
+ .support-kpi .value{font-size:.83rem;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
+ .sensitivity-list{border-top:1px solid #dce2eb;padding-top:7px;display:grid;gap:4px}
+ .sensitivity-row{display:grid;grid-template-columns:minmax(150px,.9fr) minmax(0,1.1fr);gap:8px;
+  font-size:.76rem;line-height:1.35}
+ .sensitivity-row .label{font-weight:650;color:var(--navy-d)}
+ .sensitivity-row .value{color:#405269;font-variant-numeric:tabular-nums}
+ /* Side by side, an endpoint is ~275px and the two-column row breaks these labels mid-phrase.
+    Stacked, the label wraps on its own line and the number keeps a line to itself. */
+ .endpoint-grid.multi .sensitivity-row{grid-template-columns:1fr;gap:0;padding:1px 0}
+ .endpoint-grid.multi .sensitivity-row .value{font-weight:650}
+ .withheld{font-size:.76rem;color:var(--muted);margin:7px 0 0}
+ /* The four disclosures, on one line at the foot of the card. A hairline and a bold word each,
+    NOT the boxed `details.sec` treatment: four boxes inside a card would out-shout the results.
+    Same four groupings the Screening pane uses, so the two surfaces teach one vocabulary. */
+ /* THE FOUR SECTIONS, AS TABS. Progressive enhancement, and the plain form is the good one: with
+    no script every panel shows under its own heading, which is a complete document. The script
+    hides them, builds a row of buttons from those same headings, and shows one at a time. Only
+    `.js`-scoped rules hide anything, and `<html class="js">` is set by an inline script in the
+    head, so the full document never flashes before the tabs are built.
+    Tabs rather than disclosures because an open disclosure claimed a whole flex row and pushed its
+    siblings onto the next line: the labels moved every time one was opened. */
+ .function-tabs{margin-top:13px;border-top:1px solid var(--rule);padding-top:10px}
+ .paneltitle{font-size:.86rem;font-weight:700;color:var(--navy-d);margin:.9rem 0 .3rem}
+ .tabpanel:first-child>.paneltitle{margin-top:0}
+ .tabpanel p,.tabpanel ul{font-size:.8rem}
+ .tab-row{display:flex;flex-wrap:wrap;gap:2px 20px;margin:0 0 2px}
+ .tab{appearance:none;background:none;border:0;padding:3px 0 5px;cursor:pointer;
+  font:inherit;font-size:.82rem;font-weight:700;color:var(--navy);
+  border-bottom:2px solid transparent}
+ .tab:hover{color:var(--navy-d)}
+ .tab[aria-selected="true"]{color:var(--navy-d);border-bottom-color:var(--navy)}
+ .tab:focus-visible{outline:2px solid var(--navy);outline-offset:2px;border-radius:2px}
+ .js .tab-row{border-bottom:1px solid var(--rule)}
+ .js .tabpanel{display:none}
+ .js .tabpanel.on{display:block;padding-top:2px}
+ .js .paneltitle{display:none}
+ /* THE DETAILS SWITCH. The button owns whether the card shows any working at all, so a card at
+    rest is a title and a result: not even a row of tab labels. The tabs are navigation INSIDE it,
+    which is why clicking the selected tab no longer closes anything -- two controls for one job
+    is the ambiguity this replaces. */
+ .detail-toggle{appearance:none;background:none;border:0;padding:0;cursor:pointer;font:inherit;
+  font-size:.82rem;font-weight:700;color:var(--navy);display:inline-flex;align-items:center;
+  gap:.45rem}
+ .detail-toggle:hover{color:var(--navy-d)}
+ .detail-toggle:focus-visible{outline:2px solid var(--navy);outline-offset:3px;border-radius:2px}
+ .detail-toggle::before{content:"";width:0;height:0;border-left:5px solid currentColor;
+  border-top:4px solid transparent;border-bottom:4px solid transparent;transition:transform .15s}
+ .detail-toggle[aria-expanded="true"]::before{transform:rotate(90deg)}
+ .js .function-tabs .tab-row{display:none}
+ .js .function-tabs.open .tab-row{display:flex;margin-top:10px}
  .card details{margin-top:8px} .card summary{font-size:11.5px;color:var(--navy);cursor:pointer;font-weight:600}
  .card details p{font-size:12px;color:#3a4a5a;margin:.35rem 0 0;line-height:1.45}
  table{border-collapse:collapse;width:100%;margin:.4rem 0;font-size:12.5px}
@@ -1105,7 +1807,6 @@ _HTML_TEMPLATE = """<!doctype html>
  details.sec[open]>summary::before{transform:rotate(90deg)}
  details.sec[open]>summary{margin-bottom:.45rem}
  .warn{color:#8a1c1c}
- .note{background:#fff7e6;border:1px solid #f0d59a;border-radius:8px;padding:.6rem .8rem;font-size:12.5px;margin:.6rem 0}
  img.fig{display:block;width:auto;max-width:100%;height:auto;max-height:460px;border:1px solid var(--rule);
   border-radius:8px;margin:.4rem auto;background:#fff;cursor:zoom-in}
  .maps{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:.4rem 0;align-items:start}
@@ -1118,14 +1819,23 @@ _HTML_TEMPLATE = """<!doctype html>
  .lightbox.open{display:flex}
  .lightbox img{max-width:96vw;max-height:90vh;width:auto;height:auto;background:#fff;border-radius:8px}
  .lightbox .cap{color:#dce5f2;font-size:12.5px;max-width:92vw;text-align:center;line-height:1.4}
- @media (max-width:640px){.maps{grid-template-columns:1fr}}
+ @media (max-width:640px){.maps{grid-template-columns:1fr}
+  .endpoint-grid.multi{grid-template-columns:1fr}.support-kpis{grid-template-columns:1fr}
+  .sensitivity-row{grid-template-columns:1fr;gap:1px}.function-card{padding:15px}
+  .tab-row{gap:2px 14px}}
+ /* ON PAPER THERE ARE NO TABS. Every panel and its heading come back and the button row goes, so
+    printing the page gives the whole document rather than whichever tab happened to be open. */
  @media print{body{padding:0} h2{page-break-after:avoid} table,img,figure{page-break-inside:avoid}
-  details.sec{border:0;background:none} .lightbox{display:none !important}}
-</style></head><body>
+  details.sec{border:0;background:none} .lightbox{display:none !important}
+  .js .tabpanel{display:block !important} .js .paneltitle{display:block !important}
+  .tab-row{display:none !important} .detail-toggle{display:none !important}}
+</style>
+<script>document.documentElement.className+=" js";</script>
+</head><body>
 <div class="wrap">
 <div class="head">
 <div class="eyebrow">Hyporheic Exchange Assessment</div>
-<h1>{{ title_name }}: Site Summary Report</h1>
+<h1>{{ title_name }}: {{ report_title }}</h1>
 <div class="facts">
  {% if site.site_name and site.site_name != title_name %}<span class="fact"><b>Site:</b> {{ site.site_name }}</span>{% endif %}
  {% if location %}<span class="fact"><b>Location:</b> {{ location }}</span>{% endif %}
@@ -1175,7 +1885,7 @@ _HTML_TEMPLATE = """<!doctype html>
   <div class="sup">
    {% for lab, val, unit in c.supporting %}<div class="row"><span class="k">{{ lab }}</span><span class="v">{{ val }} {{ unit }}</span></div>{% endfor %}
   </div>
-  <details><summary>What this means</summary><p>{{ c.definition }}</p><p class="muted">{{ c.relevance }}</p><p class="muted">{{ c.caution }}</p></details>
+  <details><summary>What this means</summary><p>{{ c.definition }}</p><p class="muted">{{ c.relevance }}</p></details>
  </div>
 {% endfor %}
 </div>
@@ -1212,33 +1922,50 @@ _HTML_TEMPLATE = """<!doctype html>
 </table>
 {% endif %}
 
+{% if calib_wells %}
+<h2>Groundwater Model Calibration</h2>
+<p class="muted">Computed heads are sampled from the Basecase groundwater solution at each well screen elevation. Residual is computed minus observed.</p>
+<table>
+ <tr><th>Well</th><th class="num">Screen elevation (m)</th><th class="num">Model layer</th><th class="num">Observed head (m)</th><th class="num">Computed head (m)</th><th class="num">Residual (m)</th><th>Note</th></tr>
+ {% for w in calib_wells %}
+ <tr><td>{{ w.name }}</td><td class="num">{{ w.screen }}</td><td class="num">{{ w.layer }}</td><td class="num">{{ w.observed }}</td><td class="num">{{ w.computed }}</td><td class="num">{{ w.residual }}</td><td>{{ w.note }}</td></tr>
+ {% endfor %}
+</table>
+{% if calib_pairs %}
+<table>
+ <tr><th>Tracked pair</th><th class="num">Distance (m)</th><th class="num">Computed gradient (m/m)</th><th class="num">Observed gradient (m/m)</th><th>Note</th></tr>
+ {% for p in calib_pairs %}
+ <tr><td>{{ p.pair }}</td><td class="num">{{ p.distance }}</td><td class="num">{{ p.computed_gradient }}</td><td class="num">{{ p.observed_gradient }}</td><td>{{ p.note }}</td></tr>
+ {% endfor %}
+</table>
+{% endif %}
+{% if calib_stats %}<p class="muted">{{ calib_stats }}</p>{% endif %}
+{% endif %}
+
 {% if results.warnings %}
 <ul>{% for w in results.warnings %}<li class="warn">{{ w.message }}</li>{% endfor %}</ul>
 {% endif %}
-
-<details class="sec"><summary>Detailed hydraulic metrics</summary>
-{% for section, items in grouped %}
-<h3>{{ section }}</h3>
-<table><tr><th>Metric</th><th class="num">Value</th><th>Unit</th>{% if alt_scenarios %}<th class="num">Scenario range</th>{% endif %}</tr>
-{% for r in items %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td><td>{{ r.unit }}</td>{% if alt_scenarios %}<td class="num">{{ alt_ranges.get((section, r.name), "") }}</td>{% endif %}</tr>{% endfor %}
-</table>
-{% endfor %}
-</details>
+{# The detailed metric tables moved to the appendix stack at the foot of the document, where the
+   screening report can reach them too. A reader of that document previously got three summary
+   cards and no way to see the numbers behind them without opening the other one. #}
 </section>
 {% endif %}
 
 {% if functions %}
 <section class="part">
+{# THE PART HEADER IS FOR THE COMBINED DOCUMENT ONLY. Its job is the structural break between what
+   the model computed and what was inferred from it (§9.3), and in the standalone screening report
+   there is nothing above it to break from: the document's own h1 already names it, so an eyebrow
+   reading "Part B" and a second h1 underneath were two headings for one thing. #}
+{# THE SUB-LINE IS FOR THE COMBINED DOCUMENT ONLY. There it draws the modelled-versus-inferred
+   line, which is the one job that sentence does. Standing alone it introduced a document the
+   reader had already chosen to open, and the appendix says what the estimates rest on. #}
+{% if hydraulics %}
 <p class="parteyebrow">Part B</p>
 <h1 class="parthead">Functional Screening Estimates</h1>
-{% if hydraulics %}
-<p class="partsub">Everything above is direct model output. Everything below is inferred from it.
-Published reaction rates applied to the modeled flow paths, under assumptions you set. Good for
-comparing sites and alternatives. Not a prediction of what this reach will do.</p>
-{% else %}
-<p class="partsub">Published reaction rates applied to the modeled flow paths, under assumptions
-you set. Good for comparing sites and alternatives. Not a prediction of what this reach will do.
-The hydraulics behind them are in the Hydraulics Report.</p>
+<p class="partsub">Everything above is direct model output. Everything below is inferred from it:
+published reaction rates applied to the modeled flow paths, under assumptions you set. For
+comparing sites and alternatives, not a prediction of this reach.</p>
 {% endif %}
 
 {# NO CONCEPTUAL FIGURE HERE. The framing diagram is its own report product now (Site Reports ->
@@ -1249,8 +1976,10 @@ The hydraulics behind them are in the Hydraulics Report.</p>
 {# Standalone screening report only: the three headline hydraulic values the estimates below are
    computed from. Without them this document would assert transformation rates with no visible
    basis, which is exactly the §9.3 distinction the panes make on screen. #}
+{# The SAME name Part A gives these same three cards. Two names for one block was an
+   inconsistency a reader moving between the documents would have to resolve themselves. #}
 {% if not hydraulics and cards %}
-<h2>The Signature These Estimates Rest On</h2>
+<h2>Key Hyporheic Hydraulic Metrics</h2>
 <div class="cards">
 {% for c in cards %}
  <div class="card">
@@ -1261,76 +1990,184 @@ The hydraulics behind them are in the Hydraulics Report.</p>
  </div>
 {% endfor %}
 </div>
-<p class="muted">{{ signature_sentence }} Full derivation, figures and diagnostics are in the
-hydraulics report.</p>
 {% endif %}
 
-{% for s in functions %}
-{# A function that spans several mechanisms heads them once, then each renders one level down. #}
-{% if s.group_title %}<h3>{{ s.group_title }}</h3>{% endif %}
-{% if s.parent %}<h4>{{ s.mechanism or s.title }}</h4>{% else %}<h3>{{ s.title }}</h3>{% endif %}
-<p class="muted">{{ s.lede }}</p>
-{% if s.conditions %}
-<p class="muted"><b>Applies only where all of these hold.</b></p>
-<ul class="muted">{% for c in s.conditions %}<li>{{ c }}</li>{% endfor %}</ul>
-{% endif %}
-{% for n in s.guard_notes or [] %}<p class="muted">{{ n }}</p>{% endfor %}
-{% if s.rows %}
-<table>
- <tr><th>Metric</th><th class="num">Value</th></tr>
- {% for r in s.rows %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td></tr>{% endfor %}
-</table>
-{% endif %}
-{% if s.chain %}
-<h4>{{ s.chain_title or "From intensity to total load" }}</h4>
-<table>
- <tr><th>{{ s.chain_header or "Step" }}</th><th class="num">Value</th></tr>
- {% for r in s.chain %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td></tr>{% endfor %}
-</table>
-{% if s.key == "nutrient" %}
-<p class="muted">Total mass removed = areal removal rate &times; streambed area. Areal removal rate =
-exchange flux &times; inlet concentration &times; removal efficiency.</p>
-{% endif %}
-{% endif %}
-{% if s.range %}
-<p><strong>Reported range: {{ s.range }}.</strong> {{ s.range_note }}</p>
-{% endif %}
-{% if s.key == "nutrient" and function_b64 %}<figure><img id="figfunc" class="fig" src="data:image/png;base64,{{ function_b64 }}" alt="Removal opportunity against assumed reaction timescale"><figcaption>Flux-weighted removal opportunity as a function of the assumed reaction timescale. This needs no rate constant.</figcaption></figure>{% endif %}
-{% if s.decisions %}
-<h4>Which number to use</h4>
-<table>
- <tr><th>Decision</th><th>Use</th><th class="num">Value</th><th>Why</th></tr>
- {% for d in s.decisions %}
- <tr><td>{{ d.context }}</td><td>{{ d.metric }}</td><td class="num">{{ d.value }}</td><td class="muted">{{ d.reasoning }}</td></tr>
- {% endfor %}
-</table>
-{% endif %}
-{% if s.validity_note %}<div class="card warn">{{ s.validity_note }}</div>{% endif %}
-{% if s.unavailable_reason %}<p class="muted">{{ s.unavailable_reason }}</p>{% endif %}
-<p class="muted"><b>Transferability.</b> {{ s.transferability_note }}</p>
-{% if s.references %}<details class="sec"><summary>Sources</summary>
-{% for r in s.references %}<p class="muted ref">{{ r }}</p>{% endfor %}</details>{% endif %}
-{% endfor %}
-
+{# THE SCOPE SENTENCE AND THE HELD-VALUES TABLE ARE GONE. Every value that table listed now prints
+   in the function's own Inputs tab -- nitrate, the rate, the oxygen settings, each endpoint's
+   concentration, the thermal response time -- so it had become a second copy standing between the
+   reader and the results. The cautions it carried survive in the appendix, twice: "Shared
+   screening assumptions" states that a range is a sensitivity bound and that the alternatives
+   range is hydraulic-only, and "Hydraulic Alternatives" repeats both beside the runs themselves.
+   A WITHHELD range still speaks up here, because that is news rather than framing. #}
+{% if env_warnings %}
 <div class="card warn">
-<strong>Assumptions behind every section above</strong>
-<ul>
- <li>Rate constants are scenario inputs. Nothing here has been calibrated against field data.</li>
- <li>Carbon is assumed non-limiting for denitrification, which overstates removal where it is scarce.</li>
- <li>Reported ranges are sensitivity bounds, not confidence intervals.</li>
- <li>Only returning flow paths are counted. Water leaving the domain without returning is excluded.</li>
- <li>Temperature regulation reports buffering opportunity, never degrees of cooling.</li>
- <li>Habitat extent is connected subsurface space, never habitat quality or occupancy.</li>
-</ul>
+{% for w in env_warnings %}<p class="warn">{{ w }}</p>{% endfor %}
+</div>
+{% endif %}
+
+<h2>Key Functional Results</h2>
+
+{# ONE FUNCTION, ONE CARD. The card carries a title and its results and nothing else: every word of
+   explanation, every input and every caveat is behind the four disclosures at its foot. A reader
+   scrolling this document meets answers only, and the four groupings are the same ones the
+   Screening pane uses on screen. #}
+<div class="function-list">
+{% for g in function_groups %}
+<article class="function-card">
+ <h3 class="function-title">{{ g.title }}</h3>
+ <div class="endpoint-grid{% if g.multi %} multi{% endif %}">
+ {% for s in g["items"] %}
+  {% set e = envelopes.get(s.key) %}
+  <section class="endpoint">
+   {% if g.multi %}<h4>{{ s.mechanism or s.title }}</h4>{% endif %}
+   {% if s.headline %}
+   <div class="result-label">{{ s.headline.name }} &middot; Basecase</div>
+   <div class="result-value">{{ s.headline.value }}<small>{{ unit_suffix(s.headline.unit) }}</small></div>
+   {% endif %}
+   {% if s.supporting %}
+   <div class="support-kpis">
+   {% for k in s.supporting %}<div class="support-kpi"><div class="label">{{ k.label }}</div><div class="value">{{ k.value }}{{ unit_suffix(k.unit) }}</div></div>{% endfor %}
+   </div>
+   {% endif %}
+   {% if s.range or s.alt_range %}
+   <div class="sensitivity-list">
+    {% if s.range %}<div class="sensitivity-row"><span class="label">{{ sensitivity_label }}</span><span class="value">{{ s.range }}</span></div>{% endif %}
+    {% if s.alt_range %}<div class="sensitivity-row"><span class="label">{{ envelope_label }}</span><span class="value">{{ s.alt_range }}</span></div>{% endif %}
+   </div>
+   {% endif %}
+   {% if e and e.withheld_reason %}<p class="withheld">{{ e.withheld_reason }}</p>{% endif %}
+  </section>
+ {% endfor %}
+ </div>
+ {# FOUR LABELLED PANELS, which a script turns into a tablist on load. The template emits no tab
+    markup at all: one source of truth per label, and with no script (or on paper) the reader gets
+    four plainly headed sections rather than four things they cannot open. #}
+ <div class="function-tabs">
+  {% if g.has_inputs %}
+  <section class="tabpanel"><p class="paneltitle">Inputs</p>
+  {% for s in g["items"] %}
+   {% if s.inputs %}
+   {% if g.multi %}<p class="subhead">{{ s.mechanism or s.title }}</p>{% endif %}
+   <table><tr><th>Input</th><th class="num">Value</th><th>Unit</th></tr>
+   {% for r in s.inputs %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td><td>{{ r.unit }}</td></tr>{% endfor %}
+   </table>
+   {% endif %}
+  {% endfor %}
+  {% if g.note %}<p class="muted">{{ g.note }}</p>{% endif %}
+  </section>
+  {% endif %}
+  {% if g.has_metrics %}
+  <section class="tabpanel"><p class="paneltitle">Output Metrics</p>
+  {% for s in g["items"] %}
+   {% if g.multi %}<p class="subhead">{{ s.mechanism or s.title }}</p>{% endif %}
+   {% if s.rows %}
+   <table><tr><th>Metric</th><th class="num">Value</th></tr>
+   {% for r in s.rows %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td></tr>{% endfor %}
+   </table>
+   {% if s.metrics_note %}<p class="muted">{{ s.metrics_note }}</p>{% endif %}
+   {% endif %}
+   {% if s.chain %}
+   <p class="subhead">{{ s.chain_title or "From intensity to total load" }}</p>
+   <table><tr><th>{{ s.chain_header or "Step" }}</th><th class="num">Value</th></tr>
+   {% for r in s.chain %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td></tr>{% endfor %}
+   </table>
+   {% if s.key == "nutrient" %}
+   <p class="muted">Total mass removed = areal removal rate &times; streambed area. Areal removal
+   rate = exchange flux &times; inlet concentration &times; removal efficiency.</p>
+   {% endif %}
+   {% endif %}
+   {% if s.key == "nutrient" and function_b64 %}<figure><img id="figfunc" class="fig" src="data:image/png;base64,{{ function_b64 }}" alt="Removal opportunity against assumed reaction timescale"><figcaption>Flux-weighted removal opportunity as a function of the assumed reaction timescale. This needs no rate constant.</figcaption></figure>{% endif %}
+   {# THE SAME METRICS, FOLDED ACROSS THE SWEEP. With the section's own readings, because that is
+      what they bracket. They used to be one flat table at the foot of the document with a leading
+      Section column that repeated "Dissolved Pollutants" once per row. #}
+   {% if s.alt_rows %}
+   <p class="subhead">Across hydraulic alternatives</p>
+   <table><tr><th>Metric</th><th class="num">Basecase</th><th class="num">Range</th><th>Lowest run</th><th>Highest run</th><th class="num">Runs</th></tr>
+   {% for r in s.alt_rows %}<tr><td>{{ r.name }}</td><td class="num">{{ r.base }}</td><td class="num">{{ r.range }}</td><td>{{ r.lo_case }}</td><td>{{ r.hi_case }}</td><td class="num">{{ r.runs }}</td></tr>{% endfor %}
+   </table>
+   {% endif %}
+  {% endfor %}
+  </section>
+  {% endif %}
+  {% if g.has_limits %}
+  <section class="tabpanel"><p class="paneltitle">Limitations</p>
+  {# The registry's own "what this cannot tell you" list, which until now was rendered on the
+     Screening pane and in NO report, PDF, CSV or JSON. #}
+  {% if g.limits %}<ul class="muted">{% for l in g.limits %}<li>{{ l }}</li>{% endfor %}</ul>{% endif %}
+  {% if g.shared %}
+  {% if g.shared.lede %}<p class="muted">{{ g.shared.lede }}</p>{% endif %}
+  {% if g.shared.conditions %}
+  <p class="muted"><b>Applies only where all of these hold.</b></p>
+  <ul class="muted">{% for c in g.shared.conditions %}<li>{{ c }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% for n in g.shared.notes or [] %}<p class="muted">{{ n }}</p>{% endfor %}
+  {% if g.shared.range_note %}<p class="muted">{{ g.shared.range_note }}</p>{% endif %}
+  {% if g.shared.transferability_note %}<p class="muted"><b>Transferability.</b> {{ g.shared.transferability_note }}</p>{% endif %}
+  {% endif %}
+  {% for s in g["items"] %}
+   {% if s.lede or s.conditions or s.validity_note or s.detail_notes %}
+   {% if g.multi %}<p class="subhead">{{ s.mechanism or s.title }}</p>{% endif %}
+   {% if s.lede %}<p class="muted">{{ s.lede }}</p>{% endif %}
+   {% if s.conditions %}
+   <p class="muted"><b>Applies only where all of these hold.</b></p>
+   <ul class="muted">{% for c in s.conditions %}<li>{{ c }}</li>{% endfor %}</ul>
+   {% endif %}
+   {% if s.validity_note %}<p class="muted"><b>Validity.</b> {{ s.validity_note }}</p>{% endif %}
+   {% for n in s.detail_notes %}<p class="muted">{{ n }}</p>{% endfor %}
+   {% endif %}
+  {% endfor %}
+  </section>
+  {% endif %}
+  {% if g.references %}
+  <section class="tabpanel"><p class="paneltitle">References</p>
+  {% for r in g.references %}<p class="muted ref">{{ r }}</p>{% endfor %}
+  </section>
+  {% endif %}
+ </div>
+</article>
+{% endfor %}
 </div>
 </section>
 {% endif %}
 
-{% if input_rows %}
+{# THE APPENDIX STACK, shared by both documents and always collapsed, under a heading of its own
+   so a reader can see where the answers stop and the working begins. #}
+<section class="part supporting">
+<h2>Supporting Information</h2>
+{% if grouped %}
+<details class="sec"><summary>Detailed hydraulic metrics</summary>
+{% for section, items in grouped %}
+<h3>{{ section }}</h3>
+<table><tr><th>Metric</th><th class="num">Value</th><th>Unit</th>{% if alt_scenarios %}<th class="num">Range across alternatives</th>{% endif %}</tr>
+{% for r in items %}<tr><td>{{ r.name }}</td><td class="num">{{ r.value }}</td><td>{{ r.unit }}</td>{% if alt_scenarios %}<td class="num">{{ alt_ranges.get((section, r.name), "") }}</td>{% endif %}</tr>{% endfor %}
+</table>
+{% endfor %}
+</details>
+{% endif %}
+
+{# Gated on EITHER, because the shared assumptions below are a claim about the report and must
+   not disappear because a run happens to carry no input snapshot. #}
+{% if input_rows or functions %}
 <details class="sec"><summary>Model inputs and assumptions</summary>
+{% if input_rows %}
 <table><tr><th>Group</th><th>Input</th><th class="num">Value</th><th>Unit</th></tr>
 {% for r in input_rows %}<tr><td>{{ r.section }}</td><td>{{ r.name }}</td><td class="num">{{ r.value }}</td><td>{{ r.unit }}</td></tr>{% endfor %}
 </table>
+{% endif %}
+{# THE THREE STATEMENTS NO FUNCTION OWNS. The rest of the old report-level assumptions block was
+   deleted, because `FunctionSpec.limits` already says each of those better and now reaches the
+   document. These three are about the report as a whole, so they live with the inputs. #}
+{% if functions %}
+<h3>Shared screening assumptions</h3>
+<ul class="muted">
+ <li>Functional estimates count returning flow paths only. Water leaving the domain without
+  returning is excluded.</li>
+ <li>Every range shown is a sensitivity bound, not a confidence interval.</li>
+ {% if env_scope %}<li>{{ env_limitation }}</li>
+ {# Said once here rather than under each of six tables. #}
+ <li>A range across alternatives lists only the metrics the sweep moved.</li>{% endif %}
+</ul>
+{% endif %}
 </details>
 {% endif %}
 
@@ -1338,6 +2175,9 @@ exchange flux &times; inlet concentration &times; removal efficiency.</p>
    an input-provenance section, but a "Data sources and provenance" block was removed from this
    report at a user's explicit request (see tests/test_report.py, which asserts its absence).
    The user's request wins over the framework document; flagged rather than silently reinstated. #}
+{# ONE appendix for everything the sweep produced: the runs themselves, then the supporting ranges
+   they fold to. They were two blocks under two names, which is what made the functional range read
+   as a second concept rather than as a second reading of these same runs. #}
 {% if alt_scenarios %}
 <details class="sec"><summary>Hydraulic Alternatives</summary>
 <p class="muted">Order of magnitude variations of hydraulic conductivity and head gradient, each run
@@ -1347,14 +2187,21 @@ exchange flux &times; inlet concentration &times; removal efficiency.</p>
 {% for s in alt_scenarios %}<tr><td>{{ s.label }}</td><td>{{ s.factors }}</td><td>{{ s.status }}</td><td class="num">{{ s.freq }}</td><td class="num">{{ s.dur }}</td><td class="num">{{ s.ext }}</td></tr>{% endfor %}
 </table>
 {% if alt_note %}<p class="muted">{{ alt_note }}</p>{% endif %}
+{# THE SCREENING RANGES ARE NOT HERE ANY MORE. They were one flat table of every section's rows
+   with a leading Section column, and they now sit in each function's own Output Metrics, beside
+   the readings they bracket. What stays is the runs themselves, which are hydraulic. #}
 </details>
 {% endif %}
 
+{# RENAMED when every function gained its own References disclosure. Two sections called
+   "References" in one document, one of them holding a different kind of thing, is the ambiguity
+   this avoids. #}
 {% if references %}
-<details class="sec"><summary>References</summary>
+<details class="sec"><summary>{{ references_title }}</summary>
 {% for r in references %}<p class="muted ref">{{ r.authors }}{% if r.year %} ({{ r.year }}){% endif %}. {{ r.title }}.{% if r.url %} {{ r.url }}{% endif %}</p>{% endfor %}
 </details>
 {% endif %}
+</section>
 
 <p class="foot">Generated {{ generated_at }} by HYPE {{ app_version }} using {{ model_version }}.
 Report method {{ method_version }}.</p>
@@ -1377,6 +2224,71 @@ Report method {{ method_version }}.</p>
   lb.classList.add("open");
  });
  document.addEventListener("keydown",function(ev){if(ev.key==="Escape")shut();});
+})();
+(function(){
+ /* Build a tablist per function card from the panel headings already in the markup, so each label
+    has exactly one source. Everything starts closed: the card is a result, and its working is on
+    request. */
+ var groups=document.querySelectorAll(".function-tabs"),gi=0;
+ Array.prototype.forEach.call(groups,function(box){
+  var panels=[];
+  Array.prototype.forEach.call(box.children,function(c){
+   if(c.className&&c.className.indexOf("tabpanel")>=0)panels.push(c);
+  });
+  if(!panels.length)return;
+  gi++;
+  var row=document.createElement("div");
+  row.className="tab-row";row.setAttribute("role","tablist");
+  var tabs=[];
+  panels.forEach(function(panel,i){
+   var title=panel.querySelector(".paneltitle");
+   var pid="fp"+gi+"-"+i,tid="ft"+gi+"-"+i;
+   panel.id=pid;panel.setAttribute("role","tabpanel");panel.setAttribute("aria-labelledby",tid);
+   var b=document.createElement("button");
+   b.type="button";b.className="tab";b.id=tid;
+   b.textContent=title?title.textContent:("Section "+(i+1));
+   b.setAttribute("role","tab");b.setAttribute("aria-controls",pid);
+   b.setAttribute("aria-selected","false");
+   b.addEventListener("click",function(){select(i);});
+   row.appendChild(b);tabs.push(b);
+  });
+  /* No close-on-reselect: the button below owns whether the card shows anything at all, and one
+     job wants one control. */
+  function select(n){
+   panels.forEach(function(p,i){
+    p.classList.toggle("on",i===n);
+    tabs[i].setAttribute("aria-selected",i===n?"true":"false");
+   });
+  }
+  row.addEventListener("keydown",function(ev){
+   var at=tabs.indexOf(document.activeElement);
+   if(at<0)return;
+   var k=ev.key,to=null;
+   if(k==="ArrowRight")to=at+1;else if(k==="ArrowLeft")to=at-1;
+   else if(k==="Home")to=0;else if(k==="End")to=tabs.length-1;
+   if(to===null)return;
+   ev.preventDefault();
+   tabs[(to+tabs.length)%tabs.length].focus();
+  });
+  box.insertBefore(row,panels[0]);
+  /* THE DETAILS SWITCH, ahead of the tab row so it never moves when the card opens. Opening lands
+     on the first tab rather than on an empty row of labels: one click should reach content. */
+  var tog=document.createElement("button");
+  tog.type="button";tog.className="detail-toggle";
+  tog.setAttribute("aria-expanded","false");
+  tog.setAttribute("aria-controls",row.id||(row.id="ftr"+gi));
+  tog.textContent="Show details";
+  tog.addEventListener("click",function(){
+   var open=box.className.indexOf("open")<0;
+   box.classList.toggle("open",open);
+   tog.setAttribute("aria-expanded",open?"true":"false");
+   tog.textContent=open?"Hide details":"Show details";
+   if(open){select(0);}
+   else{panels.forEach(function(p,i){
+    p.classList.remove("on");tabs[i].setAttribute("aria-selected","false");});}
+  });
+  box.insertBefore(tog,row);
+ });
 })();
 </script>
 </body></html>"""
@@ -1434,19 +2346,43 @@ def render_html(results: AssessmentResultsV2, *, app_version=None, model_version
     return template.render(
         results=results, site=site, cards=headline_cards(results), grouped=grouped,
         title_name=title_name, project_name=project_name,
+        unit_suffix=unit_suffix,
+        report_title=document_title(include_functions=include_functions,
+                                   include_hydraulics=include_hydraulics),
         location=_site_location(site), head_layer=head_layer,
         thresholds=threshold_rows(results), fmt=fmt,
+        # Groundwater Model Calibration (observation wells). Reads only the results model,
+        # so the app's no-figures fallback render shows the section too.
+        calib_wells=calibration_well_rows(results),
+        calib_pairs=calibration_pair_rows(results),
+        calib_stats=calibration_stats_line(results),
         # EITHER PART DROPS WHOLE, taking its header with it, which is what makes two documents
         # out of one template. Part B off gives the hydraulics report (§9.4: a complete hydraulic
         # signature must never depend on chemistry). Part A off gives the screening report, which
         # then opens with a three-card recap of what it rests on rather than asserting rates
         # against nothing.
         functions=(function_sections(results) if include_functions else []),
+        # The card model. `function_sections` stays in the context because the PDF and several
+        # tests read it directly; the template draws from the grouped view.
+        function_groups=(function_report_groups(results) if include_functions else []),
+        # A per-function References disclosure now exists, so the document-level one says which
+        # references it holds rather than clashing with four sections of the same name.
+        references_title=("Shared hydraulic and service references" if include_functions
+                          else "References"),
         hydraulics=include_hydraulics,
         input_rows=input_rows(results), data_sources=data_source_rows(results),
         alt_scenarios=alternative_scenario_rows(results),
         alt_ranges=scenario_range_map(results),
         alt_note=alternatives_note(results), references=report_references(results),
+        # The scenario envelope. All five keys resolve falsy without one, so a document built
+        # with the option off is byte-identical to before apart from the range label.
+        envelopes=(envelope_map(results) if include_functions else {}),
+        env_scope=(envelope_scope_note(results) if include_functions else None),
+        env_warnings=(envelope_warnings(results) if include_functions else []),
+        # No `env_line` callable: the sentence arrives precomputed on each section as `alt_range`,
+        # so the template and the PDF print one string rather than each calling the formatter.
+        sensitivity_label=SENSITIVITY_LABEL, envelope_label=ENVELOPE_LABEL,
+        env_limitation=ENVELOPE_LIMITATION,
         rtd_png_b64=_b64("rtd"), threshold_b64=_b64("threshold"), function_b64=_b64("function"),
         planview_b64=_b64("planview"), section_b64=_b64("section"),
         map_topo_b64=_b64("map_topo"), map_imagery_b64=_b64("map_imagery"),
@@ -1467,7 +2403,7 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib.units import inch
     from reportlab.platypus import (
-        Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
+        Image, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
 
     figures = figures or {}
     styles = getSampleStyleSheet()
@@ -1490,7 +2426,9 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
     site = snap.site if snap else None
     title_name = ((getattr(site, "site_name", None) if site else None)
                   or project_name or "HYPE")
-    story = [Paragraph(f"{title_name}: Site Summary Report", styles["Title"]),
+    doc_title = document_title(include_functions=include_functions,
+                               include_hydraulics=include_hydraulics)
+    story = [Paragraph(f"{title_name}: {doc_title}", styles["Title"]),
              Paragraph("Hyporheic Exchange Assessment", small)]
 
     # Section 1: site identity (was PDF-missing)
@@ -1558,28 +2496,6 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
                             [1.2 * inch, 1.5 * inch, 1.7 * inch, 1.9 * inch]))
         story.append(Spacer(1, 0.16 * inch))
 
-        story.append(Paragraph("Detailed metrics", styles["Heading2"]))
-        _rmap = scenario_range_map(results)
-        if _rmap:
-            story.append(_table(["Section", "Metric", "Value", "Unit", "Scenario range"],
-                                [[r["section"], r["name"], r["value"], r["unit"],
-                                  _rmap.get((r["section"], r["name"]), "")]
-                                 for r in metric_rows(results)],
-                                [1.2 * inch, 1.9 * inch, 1.2 * inch, 0.7 * inch, 1.3 * inch]))
-        else:
-            story.append(_table(["Section", "Metric", "Value", "Unit"],
-                                [[r["section"], r["name"], r["value"], r["unit"]]
-                                 for r in metric_rows(results)],
-                                [1.4 * inch, 2.4 * inch, 1.6 * inch, 0.9 * inch]))
-
-        irows = input_rows(results)
-        if irows:
-            story.append(Spacer(1, 0.16 * inch))
-            story.append(Paragraph("Model inputs", styles["Heading2"]))
-            story.append(_table(["Group", "Input", "Value", "Unit"],
-                                [[r["section"], r["name"], r["value"], r["unit"]] for r in irows],
-                                [1.2 * inch, 2.4 * inch, 1.8 * inch, 0.9 * inch]))
-
         # Figures: RTD full-width, then the four map-like figures paired 2-up (mirrors the
         # HTML's .maps rows and reuses the site-map grid Table pattern above).
         fig_pairs = [(("planview", "Plan-view hyporheic extent"),
@@ -1622,20 +2538,54 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
                   f"{r['functional_l_s']} L/s", r["functional_per_km"]] for r in trows],
                 [1.7 * inch, 0.8 * inch, 1.2 * inch, 1.3 * inch, 1.2 * inch]))
 
+        # Groundwater Model Calibration. Mirrors the HTML section above via the same shared
+        # builders (the classic drift hazard: change the builders, never one renderer).
+        cwells = calibration_well_rows(results)
+        if cwells:
+            story.append(Spacer(1, 0.16 * inch))
+            story.append(Paragraph("Groundwater Model Calibration", styles["Heading2"]))
+            story.append(Paragraph(
+                "Computed heads are sampled from the Basecase groundwater solution at each "
+                "well screen elevation. Residual is computed minus observed.", small))
+            story.append(_table(
+                ["Well", "Screen elev (m)", "Layer", "Observed (m)", "Computed (m)",
+                 "Residual (m)", "Note"],
+                [[w["name"], w["screen"], w["layer"], w["observed"], w["computed"],
+                  w["residual"], w["note"]] for w in cwells],
+                [0.9 * inch, 1.0 * inch, 0.55 * inch, 0.95 * inch, 0.95 * inch,
+                 0.9 * inch, 0.95 * inch]))
+            cpairs = calibration_pair_rows(results)
+            if cpairs:
+                story.append(Spacer(1, 0.08 * inch))
+                story.append(_table(
+                    ["Tracked pair", "Distance (m)", "Computed (m/m)", "Observed (m/m)",
+                     "Note"],
+                    [[p["pair"], p["distance"], p["computed_gradient"],
+                      p["observed_gradient"], p["note"]] for p in cpairs],
+                    [1.7 * inch, 1.0 * inch, 1.2 * inch, 1.2 * inch, 1.1 * inch]))
+            cstats = calibration_stats_line(results)
+            if cstats:
+                story.append(Paragraph(cstats, small))
+
     # Function screening. Mirrors the HTML block above; sections live in both renderers, so a
     # change to one without the other is the classic way this report drifts between formats.
     fsecs = function_sections(results) if include_functions else []
+    # Hoisted above the guard: the appendix's shared-assumptions bullet reads `_scope`, and it
+    # renders on `include_functions` rather than on there being any section to show.
+    _envs = envelope_map(results) if include_functions else {}
+    _scope = envelope_scope_note(results) if include_functions else None
     if fsecs:
         story.append(Spacer(1, 0.22 * inch))
-        story.append(Paragraph("Part B. Functional Screening Estimates", styles["Heading1"]))
-        story.append(Paragraph(
-            ("Everything above is direct model output. Everything below is inferred from it. "
-             if include_hydraulics else "") +
-            "Published reaction rates applied to the modeled flow paths, under assumptions you "
-            "set. Good for comparing sites and alternatives. Not a prediction of what this reach "
-            "will do." +
-            ("" if include_hydraulics
-             else " The hydraulics behind them are in the Hydraulics Report."), small))
+        # The part header AND the sub-line are for the combined document only, as in the HTML:
+        # standing alone the document's own title names it, and there is nothing above to draw the
+        # modelled-versus-inferred line against.
+        if include_hydraulics:
+            story.append(Paragraph("Part B. Functional Screening Estimates", styles["Heading1"]))
+            story.append(Paragraph(
+                "Everything above is direct model output. Everything below is inferred from it: "
+                "published reaction rates applied to the modeled flow paths, under assumptions "
+                "you set. For comparing sites and alternatives, not a prediction of this reach.",
+                small))
         # NO CONCEPTUAL FIGURE HERE: it is its own report product now (`concept_pdf_bytes`).
         # Standalone screening document only: the three headline values these estimates are
         # computed from, so the document never asserts a rate with no visible basis (§9.3).
@@ -1643,84 +2593,181 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
             cards = headline_cards(results)
             if cards:
                 story.append(Spacer(1, 0.16 * inch))
-                story.append(Paragraph("The Signature These Estimates Rest On",
-                                       styles["Heading2"]))
+                story.append(Paragraph("Key Hyporheic Hydraulic Metrics", styles["Heading2"]))
                 story.append(_table(
                     ["Dimension", "Metric", "Value", "Unit"],
                     [[c["dimension"], c["primary_name"], c["primary_value"], c["primary_unit"]]
                      for c in cards],
                     [1.5 * inch, 2.6 * inch, 1.2 * inch, 1.0 * inch]))
-                story.append(Paragraph(
-                    dims.SIGNATURE_SENTENCE + " Full derivation, figures and diagnostics are in "
-                    "the hydraulics report.", small))
-        for s in fsecs:
-            story.append(Spacer(1, 0.12 * inch))
-            # A mechanism renders one level down, beneath the function that hosts it, so the
-            # dissolved endpoints and microplastic retention read as parts of Pollutant
-            # Attenuation rather than as peer functions. The function's own name is printed once,
-            # by whichever of its mechanisms comes first.
-            if s.get("group_title"):
-                story.append(Paragraph(s["group_title"], styles["Heading3"]))
-            story.append(Paragraph(
-                s.get("mechanism") or s["title"] if s.get("parent") else s["title"],
-                styles["Heading4" if s.get("parent") else "Heading3"]))
-            story.append(Paragraph(s["lede"], small))
-            # The conditions and guards travel with the PDF too. A printed result that omits the
-            # eligibility gate is the one most likely to be quoted out of context.
-            if s.get("conditions"):
-                story.append(Paragraph("<b>Applies only where all of these hold.</b>", small))
-                for c in s["conditions"]:
-                    story.append(Paragraph(f"• {c}", small))
-            for n in s.get("guard_notes") or []:
-                story.append(Paragraph(n, small))
-            if s["rows"]:
-                story.append(_table(["Metric", "Value"],
-                                    [[r["name"], r["value"]] for r in s["rows"]],
-                                    [4.2 * inch, 2.0 * inch]))
-            if s["chain"]:
-                story.append(Spacer(1, 0.08 * inch))
-                story.append(_table([s.get("chain_title") or "Step", "Value"],
-                                    [[r["name"], r["value"]] for r in s["chain"]],
-                                    [4.2 * inch, 2.0 * inch]))
-            if s.get("range"):
-                story.append(Paragraph(
-                    f"<b>Reported range: {s['range']}.</b> {s.get('range_note', '')}", small))
-            if s.get("validity_note"):
-                story.append(Paragraph(f"<b>Caution.</b> {s['validity_note']}", small))
-            if s["decisions"]:
-                story.append(Spacer(1, 0.08 * inch))
-                story.append(_table(
-                    ["Decision", "Use", "Value"],
-                    [[d["context"], d["metric"], d["value"]] for d in s["decisions"]],
-                    [2.6 * inch, 1.8 * inch, 1.8 * inch]))
-            if s.get("unavailable_reason"):
-                story.append(Paragraph(s["unavailable_reason"], small))
-            story.append(Paragraph(f"<b>Transferability.</b> {s['transferability_note']}", small))
-            if s.get("references"):
-                # One reference per paragraph, as the HTML does. A single concatenated Source
-                # line is exactly the wall this split exists to remove.
-                story.append(Paragraph("<b>Sources.</b>", small))
-                for ref in s["references"]:
+        # The scope sentence and the held-values table are gone here too, for the reason the HTML
+        # gives: every value is in the function's own Inputs block, and the cautions are in the
+        # appendix. A WITHHELD range still speaks up, because that is news rather than framing.
+        for _w in envelope_warnings(results):
+            story.append(Spacer(1, 0.08 * inch))
+            story.append(Paragraph(f"<b>{html.escape(_w)}</b>", small))
+        story.append(Spacer(1, 0.16 * inch))
+        story.append(Paragraph("Key Functional Results", styles["Heading2"]))
+        # ONE FUNCTION, ONE BLOCK, and the same four groupings the HTML puts behind disclosures.
+        # The PDF has no collapsed widget, so they become headings in the same order rather than a
+        # different arrangement of the same material.
+        for g in function_report_groups(results):
+            story.append(Spacer(1, 0.14 * inch))
+            story.append(Paragraph(g["title"], styles["Heading3"]))
+            for s in g["items"]:
+                block = []
+                if g["multi"]:
+                    block.append(Paragraph(f"<b>{s.get('mechanism') or s['title']}</b>", small))
+                _e = _envs.get(s["key"])
+                if s.get("headline"):
+                    _h = s["headline"]
+                    block.append(Paragraph(f"{_h['name']} &middot; Basecase", small))
+                    block.append(Paragraph(
+                        f"<b>{_h['value']}</b>{unit_suffix(_h['unit'])}", small))
+                for k in s.get("supporting") or []:
+                    block.append(Paragraph(
+                        f"{k['label']}: {k['value']}{unit_suffix(k['unit'])}", small))
+                if s.get("range"):
+                    block.append(Paragraph(f"{SENSITIVITY_LABEL}: {s['range']}", small))
+                # The same precomputed field the template prints, so the two documents cannot word
+                # one sentence differently.
+                if s.get("alt_range"):
+                    block.append(Paragraph(f"{ENVELOPE_LABEL}: {s['alt_range']}", small))
+                if _e is not None and _e.withheld_reason:
+                    block.append(Paragraph(_e.withheld_reason, small))
+                # An endpoint's headline and its ranges never split across a page: the number and
+                # the case it belongs to have to be readable together.
+                story.append(KeepTogether(block))
+            if g["has_inputs"]:
+                story.append(Paragraph("Inputs", styles["Heading4"]))
+                for s in g["items"]:
+                    if not s["inputs"]:
+                        continue
+                    if g["multi"]:
+                        story.append(Paragraph(
+                            f"<b>{s.get('mechanism') or s['title']}</b>", small))
+                    story.append(_table(["Input", "Value", "Unit"],
+                                        [[r["name"], r["value"], r["unit"]] for r in s["inputs"]],
+                                        [3.0 * inch, 1.9 * inch, 1.3 * inch]))
+                if g["note"]:
+                    story.append(Paragraph(g["note"], small))
+            if g["has_metrics"]:
+                story.append(Paragraph("Output Metrics", styles["Heading4"]))
+                for s in g["items"]:
+                    if g["multi"]:
+                        story.append(Paragraph(
+                            f"<b>{s.get('mechanism') or s['title']}</b>", small))
+                    if s["rows"]:
+                        story.append(_table(["Metric", "Value"],
+                                            [[r["name"], r["value"]] for r in s["rows"]],
+                                            [4.2 * inch, 2.0 * inch]))
+                        if s.get("metrics_note"):
+                            story.append(Paragraph(s["metrics_note"], small))
+                    if s["chain"]:
+                        story.append(Spacer(1, 0.08 * inch))
+                        story.append(_table([s.get("chain_title") or "Step", "Value"],
+                                            [[r["name"], r["value"]] for r in s["chain"]],
+                                            [4.2 * inch, 2.0 * inch]))
+                    # The same metrics folded across the sweep, with the readings they bracket.
+                    if s["alt_rows"]:
+                        story.append(Spacer(1, 0.08 * inch))
+                        story.append(Paragraph("<b>Across hydraulic alternatives</b>", small))
+                        story.append(_table(
+                            ["Metric", "Basecase", "Range", "Lowest run", "Highest run", "Runs"],
+                            [[r["name"], r["base"], r["range"], r["lo_case"], r["hi_case"],
+                              r["runs"]] for r in s["alt_rows"]],
+                            [1.55 * inch, 0.8 * inch, 1.35 * inch, 0.95 * inch, 0.95 * inch,
+                             0.6 * inch]))
+            if g["has_limits"]:
+                story.append(Paragraph("Limitations", styles["Heading4"]))
+                # The registry's own "what this cannot tell you" list, which reached no report
+                # before this block existed.
+                for line in g["limits"]:
+                    story.append(Paragraph("• " + line, small))
+                _sh = g["shared"]
+                if _sh.get("lede"):
+                    story.append(Paragraph(_sh["lede"], small))
+                if _sh.get("conditions"):
+                    story.append(Paragraph("<b>Applies only where all of these hold.</b>", small))
+                    for c in _sh["conditions"]:
+                        story.append(Paragraph(f"• {c}", small))
+                for n in _sh.get("notes") or []:
+                    story.append(Paragraph(n, small))
+                if _sh.get("range_note"):
+                    story.append(Paragraph(_sh["range_note"], small))
+                if _sh.get("transferability_note"):
+                    story.append(Paragraph(
+                        f"<b>Transferability.</b> {_sh['transferability_note']}", small))
+                for s in g["items"]:
+                    if g["multi"] and (s.get("lede") or s.get("conditions")
+                                       or s.get("validity_note") or s.get("detail_notes")):
+                        story.append(Paragraph(
+                            f"<b>{s.get('mechanism') or s['title']}</b>", small))
+                    if s.get("lede"):
+                        story.append(Paragraph(s["lede"], small))
+                    # The conditions travel with the PDF too. A printed result that omits the
+                    # eligibility gate is the one most likely to be quoted out of context.
+                    if s.get("conditions"):
+                        story.append(Paragraph(
+                            "<b>Applies only where all of these hold.</b>", small))
+                        for c in s["conditions"]:
+                            story.append(Paragraph(f"• {c}", small))
+                    if s.get("validity_note"):
+                        story.append(Paragraph(f"<b>Validity.</b> {s['validity_note']}", small))
+                    for n in s.get("detail_notes") or []:
+                        story.append(Paragraph(n, small))
+            if g["references"]:
+                story.append(Paragraph("References", styles["Heading4"]))
+                for ref in g["references"]:
                     story.append(Paragraph(html.escape(ref), small))
-        story.append(Spacer(1, 0.1 * inch))
-        story.append(Paragraph("<b>Assumptions behind every section above</b>", small))
-        for line in [
-                "Rate constants are scenario inputs. Nothing here has been calibrated against "
-                "field data.",
-                "Carbon is assumed non-limiting for denitrification, which overstates removal "
-                "where it is scarce.",
-                "Reported ranges are sensitivity bounds, not confidence intervals.",
-                "Only returning flow paths are counted. Water leaving the domain without "
-                "returning is excluded.",
-                "Temperature regulation reports buffering opportunity, never degrees of cooling.",
-                "Habitat extent is connected subsurface space, never habitat quality or "
-                "occupancy."]:
-            story.append(Paragraph("• " + line, small))
 
+    # ---- THE APPENDIX STACK, in the HTML's order and under the HTML's names. It sits outside
+    # both gates, so the screening PDF carries it too: it previously ended after the last
+    # function, with no metric tables, no model inputs and no references, while the screening
+    # HTML had two of the three. Collapsed in the browser, plain headings here.
+    # Supporting material starts on a new page, so the opening pages stay an executive summary
+    # rather than running straight into the first rows of a long appendix.
+    story.append(PageBreak())
+    story.append(Paragraph("Supporting Information", styles["Heading2"]))
+    story.append(Paragraph("Detailed hydraulic metrics", styles["Heading3"]))
+    _rmap = scenario_range_map(results)
+    if _rmap:
+        story.append(_table(["Section", "Metric", "Value", "Unit", "Range across alternatives"],
+                            [[r["section"], r["name"], r["value"], r["unit"],
+                              _rmap.get((r["section"], r["name"]), "")]
+                             for r in metric_rows(results)],
+                            [1.2 * inch, 1.9 * inch, 1.2 * inch, 0.7 * inch, 1.3 * inch]))
+    else:
+        story.append(_table(["Section", "Metric", "Value", "Unit"],
+                            [[r["section"], r["name"], r["value"], r["unit"]]
+                             for r in metric_rows(results)],
+                            [1.4 * inch, 2.4 * inch, 1.6 * inch, 0.9 * inch]))
+
+    irows = input_rows(results)
+    if irows or include_functions:
+        story.append(Spacer(1, 0.16 * inch))
+        story.append(Paragraph("Model inputs and assumptions", styles["Heading3"]))
+        if irows:
+            story.append(_table(["Group", "Input", "Value", "Unit"],
+                                [[r["section"], r["name"], r["value"], r["unit"]] for r in irows],
+                                [1.2 * inch, 2.4 * inch, 1.8 * inch, 0.9 * inch]))
+        # The three statements no single function owns. The rest of the old report-level
+        # assumptions block is gone: `FunctionSpec.limits` says each of those better and now
+        # reaches the document under the function it belongs to.
+        if include_functions:
+            story.append(Paragraph("<b>Shared screening assumptions</b>", small))
+            for line in ["Functional estimates count returning flow paths only. Water leaving "
+                         "the domain without returning is excluded.",
+                         "Every range shown is a sensitivity bound, not a confidence interval."
+                         ] + ([ENVELOPE_LIMITATION] if _scope else []):
+                story.append(Paragraph("• " + line, small))
+
+    # ONE section for everything the sweep produced: the runs, then the screening results folded
+    # across them. Two headings under two names is what made the functional range read as a
+    # second concept rather than as a second reading of these same runs.
     arows = alternative_scenario_rows(results)
     if arows:
         story.append(Spacer(1, 0.16 * inch))
-        story.append(Paragraph("Hydraulic Alternatives", styles["Heading2"]))
+        story.append(Paragraph("Hydraulic Alternatives", styles["Heading3"]))
         story.append(Paragraph("Order of magnitude variations of hydraulic conductivity and "
                                "head gradient, each run through the full groundwater and "
                                "hyporheic analysis. Ranges show sensitivity to these two "
@@ -1734,9 +2781,23 @@ def render_pdf(results: AssessmentResultsV2, path, *, app_version=None,
         note = alternatives_note(results)
         if note:
             story.append(Paragraph(note, small))
+        # The screening ranges moved to each function's own Output Metrics, beside the readings
+        # they bracket. What stays here is the runs themselves, which are hydraulic.
+
+    refs = report_references(results)
+    if refs:
+        story.append(Spacer(1, 0.16 * inch))
+        story.append(Paragraph(
+            "Shared hydraulic and service references" if include_functions else "References",
+            styles["Heading3"]))
+        for r in refs:
+            _yr = f" ({r['year']})" if r.get("year") else ""
+            _url = f" {r['url']}" if r.get("url") else ""
+            story.append(Paragraph(
+                html.escape(f"{r['authors']}{_yr}. {r['title']}.{_url}"), small))
 
     story.append(Spacer(1, 0.16 * inch))
-    story.append(Paragraph("Warnings &amp; limitations", styles["Heading2"]))
+    story.append(Paragraph("Warnings and limitations", styles["Heading2"]))
     if results.warnings:
         for w in results.warnings:
             story.append(Paragraph("• " + w.message, small))
@@ -1768,8 +2829,9 @@ def generate_report(results: AssessmentResultsV2, out_dir, *, transit_rows=None,
      "paths_gdf": <returning paths GeoDataFrame>, "reach_line": <shapely LineString, metric CRS>}
     plus optional site-map inputs (report §10): "crs_wkt" (model CRS), "wse_tif" and
     "head_tif" (GeoTIFF paths), "head_layer" (1-based layer of head_tif), "gwf_ws" (run
-    workspace with *.dis.grb), "dem_path" for the static 3-D view, and "sides_lonlat"
-    ({up|left|right|down: [[lon,lat],...]}) for the colored boundary-condition lines.
+    workspace with *.dis.grb), "dem_path" for the static 3-D view, "sides_lonlat"
+    ({up|left|right|down: [[lon,lat],...]}) for the colored boundary-condition lines, and
+    "wells_lonlat" ([(lon, lat, name), ...]) for observation-well markers on the head map.
     Missing keys just drop the corresponding figures. `project_name` feeds the title."""
     from . import figures as fig_mod
 
@@ -2009,4 +3071,6 @@ __all__ = [
     "RTD_DISTRIBUTION_SCHEMA_VERSION",
     "concept_html", "concept_pdf_bytes", "CONCEPT_SVG", "CONCEPT_PNG", "CONCEPT_TITLE",
     "CONCEPT_CAPTION",
+    "document_title", "function_sections", "function_section_key", "function_headline",
+    "unit_suffix",
 ]

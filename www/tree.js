@@ -364,6 +364,40 @@
           if (w) w.style.display = cells[uid].warn ? "" : "none";
         });
       });
+      // Observation-wells pane: computed head / residual cells, pair rows, and well-name
+      // ripples patched in place — same discipline as hype_gpt_cells above (typing a screen
+      // elevation must never remount the input being typed in). Missing rows are skipped.
+      Shiny.addCustomMessageHandler("hype_wells_cells", function (msg) {
+        var wells = (msg && msg.wells) || {};
+        Object.keys(wells).forEach(function (uid) {
+          var tr = document.querySelector('.hype-wells-table tr[data-uid="' + uid + '"]');
+          if (!tr) return;
+          [["comp", "gwl-comp"], ["resid", "gwl-resid"]].forEach(function (pair) {
+            var td = tr.querySelector("." + pair[1]);
+            if (!td) return;
+            td.textContent = String(wells[uid][pair[0]]);
+            if (pair[0] === "comp") td.title = String(wells[uid].title || "");
+          });
+        });
+        var names = (msg && msg.names) || {};
+        Object.keys(names).forEach(function (uid) {
+          document.querySelectorAll('[data-wname="' + uid + '"]').forEach(function (el) {
+            el.textContent = String(names[uid]);
+          });
+          document.querySelectorAll('#wlp_a option[value="' + uid + '"],' +
+                                    ' #wlp_b option[value="' + uid + '"]')
+            .forEach(function (o) { o.textContent = String(names[uid]); });
+        });
+        var pairs = (msg && msg.pairs) || {};
+        Object.keys(pairs).forEach(function (pid) {
+          var tr = document.querySelector('.hype-wells-pairs tr[data-pid="' + pid + '"]');
+          if (!tr) return;
+          [["dist", "gwp-dist"], ["cg", "gwp-cg"], ["og", "gwp-og"]].forEach(function (pair) {
+            var td = tr.querySelector("." + pair[1]);
+            if (td) td.textContent = String(pairs[pid][pair[0]]);
+          });
+        });
+      });
       // Hydraulic Alternatives runs table: live status words patched in place during a
       // sweep. Re-rendering the table per tick would reset its horizontal scroll (and the
       // pane's vertical scroll), so the server pushes {sid: word} instead — same discipline

@@ -39,6 +39,9 @@ h5py>=3.11
 # --- Figures (the engine imports these at module level even when make_figures=False) ---
 matplotlib>=3.8
 seaborn>=0.12
+# Bundled ffmpeg for the flow-path animation MP4 export (hype_app/video.py). Without it
+# the export still works but falls back to animated WebP.
+imageio-ffmpeg>=0.5
 
 # --- HTTP client for USGS StreamStats/NSS + NRCS Soil Data Access (revision) ---
 # Separate connect/read timeouts, retries, and a MockTransport for offline contract tests.

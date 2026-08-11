@@ -1,15 +1,16 @@
-"""Project identity metadata (name, units, created stamp) — pure helpers, NO Shiny.
+"""Project identity metadata (name, units, created stamp, UUIDs) — pure helpers, NO Shiny.
 
-The three keys ("project_name", "project_units", "project_created") ride config/state.json
-as first-class peers of sel_node/current_step — additive, so pre-metadata bundles simply
-lack them and every reader here tolerates that. Units are recorded but LOCKED to metric
-for now: the token exists so a future unit system can key off saved projects (mirroring
-Stream Corridor's locked us_ft placeholder), not because anything converts today.
+The metadata keys ride config/state.json as first-class peers of sel_node/current_step —
+additive, so pre-metadata bundles simply lack them and every reader here tolerates that.
+Units are recorded but LOCKED to metric for now: the token exists so a future unit system
+can key off saved projects (mirroring Stream Corridor's locked us_ft placeholder), not
+because anything converts today.
 """
 from __future__ import annotations
 
 import re
 from datetime import datetime
+from uuid import uuid4
 
 UNITS_METRIC = "metric"
 # Display labels per unit-system token. A future system (e.g. US customary) adds a token
@@ -35,7 +36,21 @@ def meta_from_state(state: dict | None, *, fallback_name: str | None = None) -> 
     if units not in UNIT_LABELS:
         units = UNITS_METRIC
     created = st.get("project_created")
-    return {"name": name, "units": units, "created": str(created) if created else None}
+    out = {"name": name, "units": units, "created": str(created) if created else None}
+    project_id = str(st.get("project_id") or "").strip() or None
+    site_id = str(st.get("site_id") or "").strip() or None
+    # Keep the legacy helper shape for legacy state, while surfacing immutable IDs once
+    # present. Callers use .get(), so an old project is upgraded without sentinel values.
+    if project_id:
+        out["project_id"] = project_id
+    if site_id:
+        out["site_id"] = site_id
+    return out
+
+
+def new_identity() -> str:
+    """Return a new immutable project/site identity token."""
+    return str(uuid4())
 
 
 def filename_stem(name: str | None, fallback: str = "") -> str:

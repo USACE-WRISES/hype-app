@@ -16,8 +16,9 @@ from pydantic import Field
 from ..provenance import HypeModel, HypeWarning
 from .inputs import AssessmentInputSnapshot
 from .alternatives import HydraulicAlternativesManifest
+from .function_envelope import FunctionEnvelope
 
-RESULTS_SCHEMA_VERSION = "assessment-results/2.3"
+RESULTS_SCHEMA_VERSION = "assessment-results/2.5"
 
 
 class ConnectivityMetrics(HypeModel):
@@ -343,6 +344,13 @@ class HabitatScreening(_ScreeningBase):
     # identity would keep holding. `screen.screen_extent` divides by the connected area.
     pore_equivalent_depth_m: float | None = None            # pore volume / A_bed
     pore_depth_active_m: float | None = None                # pore volume / A_connected
+    # THE SECOND IDENTITY, and the one a reader of the report actually trips over: these two share
+    # a denominator and differ only by the porosity, because the pore volume IS the bulk volume
+    # times n (`metrics.pore_volume`).
+    #   pore_equivalent_depth_m == equivalent_active_depth_m * porosity
+    # The Extent card headlines the bulk one and Habitat Creation headlines the pore one, so at
+    # n = 0.3 the same zone is reported as 7.671 m and 2.30 m a few inches apart. Both labels now
+    # name their basis, and the habitat metrics table says the relationship outright.
     equivalent_active_depth_m: float | None = None          # D_HZ, BULK basis (framework §8)
     active_streambed_area_m2: float | None = None
     return_streambed_area_m2: float | None = None
@@ -424,6 +432,54 @@ class FunctionScreening(HypeModel):
         return [self.pollutant] if self.pollutant is not None else []
 
 
+class CalibrationWell(HypeModel):
+    """One observation well as sampled against the Basecase groundwater solution.
+
+    Observation data only: wells never feed the model and never enter the input snapshot,
+    so this rides the RESULTS side. All sampled fields are None (with `note` saying why)
+    when the well could not be sampled — the report prints the row verbatim either way."""
+
+    well_id: str
+    name: str
+    lat: float
+    lon: float
+    screen_elevation_m: float | None = None
+    observed_head_m: float | None = None
+    model_layer: int | None = None                      # 1-based, 1 = top
+    computed_head_m: float | None = None
+    residual_m: float | None = None                     # computed minus observed
+    note: str | None = None
+
+
+class CalibrationPair(HypeModel):
+    """A tracked head-gradient pair. Gradient sign is (A - B) / distance."""
+
+    pair_id: str
+    well_a: str                                         # display names, not ids: the report
+    well_b: str                                         # is a rendering, not a database
+    distance_m: float | None = None
+    computed_gradient: float | None = None
+    observed_gradient: float | None = None
+    note: str | None = None
+
+
+class CalibrationStats(HypeModel):
+    """Residual summary over wells with BOTH computed and observed heads."""
+
+    n_observed: int
+    mean_error_m: float
+    mean_absolute_error_m: float
+    rmse_m: float
+
+
+class GroundwaterCalibration(HypeModel):
+    """Observed-vs-computed head comparison for the report's calibration table."""
+
+    wells: list[CalibrationWell] = Field(default_factory=list)
+    pairs: list[CalibrationPair] = Field(default_factory=list)
+    stats: CalibrationStats | None = None
+
+
 class AssessmentResultsV2(HypeModel):
     """The single source of truth read by the report modal and all exports (§11.2)."""
 
@@ -438,8 +494,16 @@ class AssessmentResultsV2(HypeModel):
     zone: ZoneMetrics = Field(default_factory=ZoneMetrics)
     thresholds: list[ThresholdResult] = Field(default_factory=list)
     functions: FunctionScreening | None = None
+    #: Observed-vs-computed heads at user-placed observation wells. Observation data, never a
+    #: model input: it re-attaches at report-build time from the live well list, so it needs
+    #: no place in the input snapshot and never moves input_hash.
+    calibration: GroundwaterCalibration | None = None
 
     alternatives: HydraulicAlternativesManifest | None = None
+    #: Functional screening re-run across the completed alternatives. Built at REPORT time, not
+    #: at sweep time, because the functional inputs move independently of the sweep and a frozen
+    #: envelope would disagree with the Basecase headline it sits under.
+    function_envelope: FunctionEnvelope | None = None
 
     warnings: list[HypeWarning] = Field(default_factory=list)
     untested_uncertainty: list[str] = Field(default_factory=list)   # §10.6
@@ -453,5 +517,6 @@ __all__ = [
     "ConnectivityMetrics", "ResidenceTimeMetrics", "ZoneMetrics", "ThresholdResult",
     "OpportunityPoint", "ReactiveScreening", "NutrientScreening", "ContaminantScreening",
     "HabitatScreening", "ThermalOpportunity", "FunctionScreening",
+    "CalibrationWell", "CalibrationPair", "CalibrationStats", "GroundwaterCalibration",
     "AssessmentResultsV2", "RESULTS_SCHEMA_VERSION",
 ]

@@ -318,6 +318,118 @@ internal sealed class MainForm : Form
                 break;
             }
 
+            case "pickProjectsMultiple":
+            {
+                using var dialog = new OpenFileDialog
+                {
+                    Title = "Select HYPE projects to compare",
+                    Filter = "HYPE project (*.hype)|*.hype",
+                    CheckFileExists = true,
+                    Multiselect = true,
+                };
+                var ok = dialog.ShowDialog(this) == DialogResult.OK;
+                Post(new
+                {
+                    type = "projectPathsPicked",
+                    purpose = command.Purpose,
+                    paths = ok ? dialog.FileNames : Array.Empty<string>(),
+                    cancelled = !ok,
+                });
+                break;
+            }
+
+            case "pickComparisonOpen":
+            {
+                using var dialog = new OpenFileDialog
+                {
+                    Title = "Open HYPE comparison",
+                    Filter = "HYPE comparison (*.hypecompare)|*.hypecompare",
+                    CheckFileExists = true,
+                };
+                var ok = dialog.ShowDialog(this) == DialogResult.OK;
+                Post(new
+                {
+                    type = "comparisonPathPicked",
+                    purpose = command.Purpose,
+                    path = ok ? dialog.FileName : null,
+                    cancelled = !ok,
+                });
+                break;
+            }
+
+            case "pickComparisonSave":
+            {
+                using var dialog = new SaveFileDialog
+                {
+                    Title = "Save HYPE comparison",
+                    Filter = "HYPE comparison (*.hypecompare)|*.hypecompare",
+                    DefaultExt = "hypecompare",
+                    AddExtension = true,
+                    OverwritePrompt = true,
+                    FileName = string.IsNullOrWhiteSpace(command.FileName)
+                        ? "Hydraulic comparison.hypecompare"
+                        : command.FileName,
+                };
+                var ok = dialog.ShowDialog(this) == DialogResult.OK;
+                Post(new
+                {
+                    type = "comparisonPathPicked",
+                    purpose = command.Purpose,
+                    path = ok ? dialog.FileName : null,
+                    cancelled = !ok,
+                });
+                break;
+            }
+
+            case "pickComparisonExport":
+            {
+                using var dialog = new FolderBrowserDialog
+                {
+                    Description = "Choose a folder for the comparison export",
+                    UseDescriptionForTitle = true,
+                    ShowNewFolderButton = true,
+                };
+                var ok = dialog.ShowDialog(this) == DialogResult.OK;
+                Post(new
+                {
+                    type = "comparisonPathPicked",
+                    purpose = command.Purpose,
+                    path = ok ? dialog.SelectedPath : null,
+                    cancelled = !ok,
+                });
+                break;
+            }
+
+            case "captureView":
+            {
+                // Header capture control: snapshot the shell's own rendered page (panes
+                // and the current animation frame included), auto-copy it to the
+                // clipboard like the snipping tool, and hand the app a temp-file path.
+                // The app shows its own preview modal with Copy and Save from there.
+                if (_webView.CoreWebView2 is not { } captureCore)
+                {
+                    Post(new { type = "captureDone", ok = false, reason = "no webview" });
+                    break;
+                }
+                try
+                {
+                    using var ms = new MemoryStream();
+                    await captureCore.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, ms);
+                    var tempPath = Path.Combine(Path.GetTempPath(), "hype_capture.png");
+                    await File.WriteAllBytesAsync(tempPath, ms.ToArray());
+                    ms.Position = 0;
+                    using var img = Image.FromStream(ms);
+                    Clipboard.SetImage(img);    // SetImage copies, so disposing img after is fine
+                    Post(new { type = "captureDone", ok = true, path = tempPath });
+                }
+                catch (Exception ex)
+                {
+                    _services.ShellLog.WriteLine($"[shell] captureView failed: {ex.Message}");
+                    Post(new { type = "captureDone", ok = false, err = ex.Message });
+                }
+                break;
+            }
+
             case "setTitle":
                 Text = string.IsNullOrWhiteSpace(command.Title)
                     ? "HYPE Desktop"

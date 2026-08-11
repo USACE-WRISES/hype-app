@@ -15,8 +15,8 @@
   var S = {
     on: false, speed: 3, msPerDay: 0, color: "#ff2bd6", style: "comet",
     map: null, canvas: null, ctx: null,
-    raf: 0, hidden: false, scanTimer: 0, waitTimer: 0,
-    paths: [], w: 0, h: 0, dpr: 1
+    raf: 0, hidden: false, hiddenAt: 0, scanTimer: 0, waitTimer: 0, pulse: 0,
+    lastTick: 0, paths: [], w: 0, h: 0, dpr: 1
   };
 
   // ---- path cache ------------------------------------------------------------------------
@@ -30,11 +30,19 @@
       // every non-path group bail on their first child.
       if (!(g instanceof window.L.GeoJSON) || !g.getLayers) return;
       var kids = g.getLayers();
+      // Group eligibility comes from the first TAGGED kid anywhere (map_bounds.js
+      // tagOf doctrine): one untagged clone mid-park must never discard the whole
+      // class group, and non-path groups still bail cheaply.
+      var gtag = null;
+      for (var i0 = 0; i0 < kids.length; i0++) {
+        var f0 = kids[i0] && kids[i0].feature;
+        var t0 = f0 && f0.properties && f0.properties.hz_lyr;
+        if (t0) { gtag = t0; break; }
+      }
+      if (!gtag || gtag.indexOf("hz_paths_") !== 0 || gtag === "hz_paths_sel") return;
       for (var i = 0; i < kids.length; i++) {
         var f = kids[i] && kids[i].feature;
         var pr = f && f.properties;
-        var tag = pr && pr.hz_lyr;
-        if (!tag || tag.indexOf("hz_paths_") !== 0 || tag === "hz_paths_sel") break;
         var td = pr && +pr.total_time_d;
         if (!(td > 0) || !kids[i].getLatLngs) continue;
         var lls = kids[i].getLatLngs();
@@ -86,8 +94,10 @@
   function onZoomStart() {
     // Container-point math is unreliable while a zoom is in flight (CSS-scaled panes,
     // flyTo re-projection), and guardVectors may be hiding the path lines anyway — hide
-    // the particles for the duration and pop them back at settle.
+    // the particles for the duration and pop them back at settle. The timestamp lets
+    // the watchdog un-latch an interrupted zoom that never fires a settle event.
     S.hidden = true;
+    S.hiddenAt = performance.now();
     if (S.canvas) S.canvas.style.visibility = "hidden";
   }
 
@@ -98,23 +108,31 @@
 
   function bind(m) {
     if (S.map === m) return;
+    // Resolve the container FIRST: if it throws (mid-teardown map), nothing has been
+    // torn down yet, S.map still points at the old binding, and the next frame's
+    // rebind check simply retries.
+    var cont = m.getContainer();
+    if (!cont) return;
     if (S.map) {
       try { S.map.off("layeradd layerremove", schedScan); } catch (e) { /* gone */ }
       try { S.map.off("zoomstart zoomanim", onZoomStart); } catch (e) { /* gone */ }
       try { S.map.off("zoomend moveend viewreset", onSettle); } catch (e) { /* gone */ }
     }
     if (S.canvas && S.canvas.parentNode) S.canvas.parentNode.removeChild(S.canvas);
-    S.map = m;
     if (!S.canvas) {
       S.canvas = document.createElement("canvas");
       S.canvas.className = "hype-fp-anim";
       S.ctx = S.canvas.getContext("2d");
     }
-    m.getContainer().appendChild(S.canvas);
+    cont.appendChild(S.canvas);
     S.w = S.h = 0;                          // force a resize on the next frame
     m.on("layeradd layerremove", schedScan);
     m.on("zoomstart zoomanim", onZoomStart);
     m.on("zoomend moveend viewreset", onSettle);
+    S.map = m;                              // LAST: only a fully wired map is current
+    S.hidden = false;                       // a fresh map never inherits the zoom latch
+    S.hiddenAt = 0;
+    if (S.canvas) S.canvas.style.visibility = "";
     scan();
   }
 
@@ -141,6 +159,7 @@
   function frame(now) {
     S.raf = S.on ? requestAnimationFrame(frame) : 0;
     if (!S.on) return;
+    S.lastTick = performance.now();   // heartbeat: proves the loop is actually running
     var live = window.__hypeMap;
     if (live && live !== S.map) bind(live);  // map widget was rebuilt under us
     if (!S.map || !S.ctx) return;
@@ -253,11 +272,41 @@
   }
 
   // ---- settings message ------------------------------------------------------------------
+  function pulse() {
+    // Self-healing watchdog while the animation is on: whatever latched or starved
+    // the loop (an interrupted zoom with no settle event, an empty rescan that hit
+    // mid-layer-swap, a broken rAF chain), it recovers within ~2 s instead of
+    // showing static lines until the user fiddles. Self-clears when off (the
+    // waitTimer idiom).
+    if (S.pulse) return;
+    S.pulse = setInterval(function () {
+      if (!S.on) { clearInterval(S.pulse); S.pulse = 0; return; }
+      if (S.hidden && performance.now() - S.hiddenAt > 2000) {
+        var az = false;
+        try { az = !!(S.map && S.map._animatingZoom); } catch (e) { /* fine */ }
+        if (!az) onSettle();                 // zoom never settled: un-latch
+      }
+      if (!S.paths.length) scan();           // empty rescan mid-swap: retry
+      // Liveness is TIME-based: a stranded rAF id looks armed forever, but "no
+      // frame for 3 s" cannot lie. Clear any stale handle and arm fresh.
+      var silent = S.lastTick > 0 && performance.now() - S.lastTick > 3000;
+      if (!S.raf || silent) {
+        if (S.raf) { try { cancelAnimationFrame(S.raf); } catch (e) { /**/ } }
+        S.raf = requestAnimationFrame(frame);
+        S.lastTick = performance.now();      // one forced restart per silent window
+      }
+    }, 2000);
+  }
+
   function kick() {
+    pulse();
     var m = window.__hypeMap;
     if (m) {
       if (m !== S.map) bind(m); else scan();
-      if (!S.raf) S.raf = requestAnimationFrame(frame);
+      if (!S.raf) {
+        S.raf = requestAnimationFrame(frame);
+        S.lastTick = performance.now();      // fresh arm gets a full grace window
+      }
       return;
     }
     if (S.waitTimer) return;
@@ -269,6 +318,12 @@
 
   function apply(msg) {
     if (!msg) return;
+    // Shiny keeps ONE handler per custom message type, so the 3-D animator in
+    // mesh3d.js cannot register its own hype_fp_anim handler: forward each
+    // message through its hook instead (absent until the 3-D viewer loads).
+    if (window.__hypeFpAnim3dApply) {
+      try { window.__hypeFpAnim3dApply(msg); } catch (e) { /* viewer not ready */ }
+    }
     S.on = !!msg.on;
     if (typeof msg.speed === "number" && msg.speed > 0) S.speed = msg.speed;
     if (typeof msg.color === "string" && msg.color) S.color = msg.color;

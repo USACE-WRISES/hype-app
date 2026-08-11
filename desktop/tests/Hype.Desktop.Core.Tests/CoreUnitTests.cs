@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using Hype.Desktop.Core;
 using Hype.Desktop.Core.Logging;
 using Hype.Desktop.Core.Manifest;
@@ -285,6 +286,26 @@ public sealed class LauncherProtocolCommandTests
         Assert.NotNull(cmd);
         Assert.Equal("setTitle", cmd!.Type);
         Assert.Equal("SiteA", cmd.Title);
+    }
+
+    [Theory]
+    [InlineData("pickProjectsMultiple", "comparison_add", null)]
+    [InlineData("pickComparisonOpen", "comparison_open", null)]
+    [InlineData("pickComparisonSave", "comparison_save_as", "Sites.hypecompare")]
+    [InlineData("pickComparisonExport", "comparison_export", null)]
+    public void ParsesComparisonPickerCommands(string type, string purpose, string? fileName)
+    {
+        var json = JsonSerializer.Serialize(new
+        {
+            type,
+            purpose,
+            fileName,
+        });
+        var cmd = LauncherProtocol.ParseCommand(json);
+        Assert.NotNull(cmd);
+        Assert.Equal(type, cmd!.Type);
+        Assert.Equal(purpose, cmd.Purpose);
+        Assert.Equal(fileName, cmd.FileName);
     }
 
     [Fact]

@@ -168,6 +168,8 @@ def _readme(run_config: dict | None, seen: set, include_computed: bool = True) -
         "  6_Site_Report/       Generated site summary report (HTML/PDF/CSV/JSON), when produced.",
         "  GMS/                 Aquaveo GMS 10.7 project, when a groundwater run exists.",
         "                       Extract the archive and open GMS/<name>.gpr in GMS.",
+        "  aerials/             Site aerial imagery (GeoTIFF), shown via the Map layers list.",
+        "                       Lives in the project folder only - not packed into archives.",
         "  data_sources/        Recorded USGS StreamStats/NSS and NRCS SDA responses, when fetched.",
         "  alternatives/        Hydraulic Alternatives sweep outputs (index.json + one",
         "                       results folder per scenario), when run.",
@@ -340,8 +342,9 @@ PROJECT_DIRS: tuple[str, ...] = ("inputs", "model", "ras", "summary", "alternati
 
 # One-way exports: live in the project folder, travel with Save As and the clash checks,
 # but NEVER restore from bundles (restore drops their arcs by design — see extra_trees
-# in zip_workspace). The app regenerates them from run artifacts instead.
-EXPORT_DIRS: tuple[str, ...] = ("GMS",)
+# in zip_workspace). The app regenerates GMS from run artifacts; aerials holds user or
+# site-factory reference imagery referenced by the map layers list as path pointers.
+EXPORT_DIRS: tuple[str, ...] = ("GMS", "aerials")
 
 # Dirs OLD versions of the app owned. They keep folder_clash quiet on legacy projects (a
 # stray sensitivity/ tree is ours, not foreign content) but never zip, restore, or travel

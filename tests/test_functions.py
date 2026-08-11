@@ -788,6 +788,45 @@ class TestOtherSections:
         assert out["equivalent_active_depth_m"] == pytest.approx(8200.0 / a_bed)
         assert out["volume_basis"] == "pore water"
 
+    def test_the_bulk_and_pore_depths_reconcile_through_porosity(self):
+        """THE ONE A READER OF THE REPORT TRIPS OVER. The Extent card headlines the bulk-basis
+        depth and Habitat Creation headlines the pore-water one, so at n = 0.3 the same zone is
+        reported as 7.671 m and 2.30 m a few inches apart and reads as a contradiction.
+
+        The sibling identity above (pore depth vs coverage) was pinned; this one was only implied
+        in a docstring. It has to come out of a pipeline that DERIVES the pore volume: handing
+        `mobile_pore_storage_m3` and `bulk_saturated_volume_m3` in independently decouples them and
+        the identity silently stops holding."""
+        import numpy as np
+
+        from hype_app import assess
+        from hype_app.contracts import ConnectivityMetrics, ZoneMetrics
+        from hype_app.metrics import ExchangeAccounting, pore_volume
+
+        rng = np.random.default_rng(0)
+        t = np.exp(rng.normal(np.log(2.0), 0.8, 200))
+        a_bed, bulk = 5000.0, 1e4
+        for n in (0.3, 0.45):
+            zone = ZoneMetrics(
+                bulk_saturated_volume_m3=bulk,
+                mobile_pore_storage_m3=pore_volume(bulk, n),   # derived, as signature.py does
+                equivalent_active_depth_m=bulk / a_bed)
+            fns = assess._build_functions(
+                {"pollutant_endpoints": [], "contaminant_conc_by_key": {}, "nitrate_mg_l": 1.0},
+                conn=ConnectivityMetrics(streambed_area_m2=a_bed, active_streambed_area_m2=3000.0,
+                                         connected_streambed_area_m2=2500.0,
+                                         connected_streambed_fraction=0.5, turnovers_per_km=0.3),
+                zone=zone,
+                exchange=ExchangeAccounting(total_downwelling=0.1, returning_hyporheic=0.05,
+                                            losing_to_sides=0.01, unresolved=0.0),
+                transit_times_days=t, transit_weights=np.ones_like(t), streamflow_cms=2.8,
+                porosity=n, have_rtd=True, reach_length_m=253.0)
+            h = fns.habitat
+            assert h.pore_equivalent_depth_m == pytest.approx(
+                h.equivalent_active_depth_m * n), n
+            # ...and the report's Extent card reads the SAME field habitat calls the bulk basis
+            assert h.equivalent_active_depth_m == pytest.approx(zone.equivalent_active_depth_m)
+
     def test_the_two_pore_depths_reconcile_through_coverage(self):
         """Coverage is a CONNECTED-bed quantity and the depth beside it normalizes over the WHOLE
         bed, so a reader who divides one by the other must land on a number the pane actually
@@ -1002,9 +1041,16 @@ class TestReactiveSectionsMatch:
 
     #: The pollutant headlines read DISPLAY twins of the canonical keys, because their units scale
     #: with the endpoint. The metric each one reports is still the nutrient one.
-    _SAME_METRIC = {"total_mass_display": "total_removed_kg_day",
-                    "removal_efficiency": "removal_efficiency",
-                    "per_km_display": "removal_per_km_kg_day"}
+    #:
+    #: Resolved through the PUBLIC map rather than a second copy of it: this map used to be
+    #: hand-written here, and `screen.CANONICAL_FOR_DISPLAY` now exists because the scenario
+    #: envelope needs the same twin-to-canonical step. Two copies is how they drift. The identity
+    #: fallback covers `removal_efficiency`, which is canonical on both sides.
+    @property
+    def _SAME_METRIC(self):
+        from hype_app.functions.screen import CANONICAL_FOR_DISPLAY
+        return {k: CANONICAL_FOR_DISPLAY.get(k, k)
+                for k in ("total_mass_display", "removal_efficiency", "per_km_display")}
 
     def test_both_sections_headline_the_same_three_metrics_in_the_same_order(self):
         """PARITY RESTORED, and by the same reasoning on both sides rather than by copying.
@@ -2487,7 +2533,7 @@ class TestReportSections:
         # match our own vocabulary would falsify it. Anywhere else is a miss -- and checking it
         # this way keeps working if this fixture ever gains a cited endpoint, where a blanket
         # "not in html" would start passing for the wrong reason.
-        assert "<h3>Pollutant Attenuation</h3>" in html
+        assert "<h3 class=\"function-title\">Pollutant Attenuation</h3>" in html
         stray = [m.start() for m in re.finditer("Pollutant Removal", html)
                  if "Screening-Level Hyporheic Pollutant Removal Reference"
                  not in html[max(0, m.start() - 40):m.start() + 60]]
@@ -2505,8 +2551,10 @@ class TestReportSections:
         html = render_html(self._results())
         assert html.count('<p class="muted ref">') >= 3
         assert "Ecological Engineering 97:452-464" in html
-        # and they sit behind a disclosure, as the secondary blocks elsewhere in the report do
-        assert '<details class="sec"><summary>Sources</summary>' in html
+        # and they sit under the function's own References tab, one of the four the card ends in,
+        # rather than mixed into a single catch-all
+        assert '<p class="paneltitle">References</p>' in html
+        assert "<summary>Sources</summary>" not in html
 
     def test_a_section_with_nothing_to_cite_still_says_something(self):
         """Pollutant Attenuation ships no rate and names no sources; that is a real state, and it
@@ -2534,9 +2582,9 @@ class TestReportSections:
                 citation="User supplied.", transferability_note="Match the setting.")))
 
     def test_the_pollutant_section_carries_the_same_derivation_as_nutrient(self):
-        """It was a flat nine-row table where nutrient split inputs from the four-metric chain and
-        hung the decision framework off it. The pane now headlines the same three metrics for both
-        sections, so the report cannot keep presenting one as a different kind of result."""
+        """It was a flat nine-row table where nutrient split inputs from the four-metric chain.
+        The pane now headlines the same three metrics for both sections, so the report cannot keep
+        presenting one as a different kind of result."""
         from hype_app.report import function_sections
         pol = next(s for s in function_sections(self._configured_pollutant())
                    if s["key"] == "pollutant")
@@ -2547,9 +2595,10 @@ class TestReportSections:
         assert any("Per streambed area" in n for n in names)
         assert any("Per stream km" in n for n in names)
         assert any(n.startswith("Total (kg") for n in names)
-        assert len(pol["decisions"]) == 4
-        # inputs and rate-free hydraulics stay in `rows`, out of the derivation
-        assert {"Endpoint", "Attenuation rate (1/day)"} <= {r["name"] for r in pol["rows"]}
+        # What the section was GIVEN is its own table now, and out of both the rate-free
+        # hydraulics in `rows` and the derivation in `chain`.
+        assert {"Endpoint", "Attenuation rate"} <= {r["name"] for r in pol["inputs"]}
+        assert "Reactive exposure (m³)" in {r["name"] for r in pol["rows"]}
 
     def test_the_pollutant_section_reports_no_range(self):
         """The corners are in the payload. They are factor-of-two around a rate the user supplied,
@@ -2563,12 +2612,12 @@ class TestReportSections:
         # standing caveat list, which says reported ranges in general are sensitivity bounds
         assert "Reported range:" not in render_html(results)
 
-    def test_a_blocked_pollutant_section_has_no_chain_to_hang_decisions_on(self):
+    def test_a_blocked_pollutant_section_has_no_derivation_to_show(self):
         """`fmt` renders None as "n/a", so building the chain with it would have produced seven
-        n/a rows and a decision framework recommending them."""
+        n/a rows presented as a derivation."""
         from hype_app.report import function_sections
         pol = next(s for s in function_sections(self._results()) if s["key"] == "pollutant")
-        assert pol["chain"] == [] and pol["decisions"] == []
+        assert pol["chain"] == []
         assert all("n/a" != r["value"] for r in pol["rows"])
 
     def test_absent_when_screening_did_not_run(self):
@@ -2636,10 +2685,14 @@ class TestReportSections:
         assert "group_title" not in secs["microplastic"]
         html = render_html(res)
         assert "<h4>Microplastics</h4>" in html
-        # Exactly four function-level headings in the screening part: the extra calculators are
-        # nested, not peers.
-        part_b = html[html.index(">Part B<"):]
-        assert part_b.count("<h3>") == 4, part_b.count("<h3>")
+        # Exactly four function-level headings in the screening part, in registry order, and the
+        # extra calculators nested one level under the function that hosts them rather than
+        # standing as peers of it. A function is a card, a calculator is an endpoint inside one.
+        part_b = html[html.index(">Part B<"):html.index("Supporting Information")]
+        assert re.findall(r'<h3 class="function-title">([^<]+)</h3>', part_b) == [
+            "Nutrient Cycling", "Pollutant Attenuation", "Habitat Creation",
+            "Temperature Regulation"]
+        assert re.findall(r"<h4>([^<]+)</h4>", part_b) == ["Atrazine", "Microplastics"]
 
     def test_pdf_carries_the_same_sections(self, tmp_path):
         from hype_app.report import render_pdf
@@ -2875,13 +2928,17 @@ class TestTheOxygenGateIsAChoice:
                  if k in NutrientScreening.model_fields})
             res = AssessmentResultsV2(assessment_id="t", input_hash="h",
                                       functions=FunctionScreening(nutrient=n))
-            return {r["name"]: r["value"] for r in function_sections(res)[0]["rows"]}
+            sec = function_sections(res)[0]
+            # Both tables. The gate flag and the dissolved oxygen are what the run was GIVEN and
+            # moved to Inputs in the 2026-08-02 layout; the onset and the two shares are what it
+            # produced and stayed in the output rows. The rule under test spans both.
+            return {r["name"]: r["value"] for r in sec["rows"] + sec["inputs"]}
 
         on, off = _rows(), _rows(oxygen_gate=False)
-        assert on["Oxygen limitation applied"] == "yes"
-        assert on["Time to anoxia (h)"] and on["Stream dissolved oxygen (mg/L)"]
-        assert off["Oxygen limitation applied"] == "no"
-        for gone in ("Time to anoxia (h)", "Stream dissolved oxygen (mg/L)",
+        assert on["Oxygen limitation"] == "on"
+        assert on["Time to anoxia (h)"] and on["Stream dissolved oxygen"]
+        assert off["Oxygen limitation"] == "off"
+        for gone in ("Time to anoxia (h)", "Stream dissolved oxygen",
                      "Exchange reaching anoxia (%)", "Exchange staying oxic (%)"):
             assert gone not in off, f"{gone} still prints with the gate off"
         # ...and the lede describes the run that actually happened

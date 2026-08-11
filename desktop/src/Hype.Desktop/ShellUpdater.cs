@@ -11,7 +11,7 @@ namespace Hype.Desktop;
 /// </summary>
 internal sealed class ShellUpdater(ILineLog log)
 {
-    private const string RepoUrl = "https://github.com/gtmenichino/hype-app";
+    private const string RepoUrl = "https://github.com/USACE-WRISES/hype-app";
 
     private readonly UpdateManager _manager = new(new GithubSource(RepoUrl, accessToken: null, prerelease: false));
     private UpdateInfo? _pending;

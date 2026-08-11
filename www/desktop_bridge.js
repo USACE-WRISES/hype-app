@@ -53,6 +53,23 @@
         { purpose: d.purpose || "", path: d.path || null, cancelled: !!d.cancelled,
           nonce: Date.now() },
         { priority: "event" });
+    } else if (d.type === "projectPathsPicked" && window.Shiny && Shiny.setInputValue) {
+      Shiny.setInputValue("desktop_pick",
+        { purpose: d.purpose || "", paths: Array.isArray(d.paths) ? d.paths : [],
+          cancelled: !!d.cancelled, nonce: Date.now() },
+        { priority: "event" });
+    } else if (d.type === "comparisonPathPicked" && window.Shiny && Shiny.setInputValue) {
+      Shiny.setInputValue("desktop_pick",
+        { purpose: d.purpose || "", path: d.path || null, cancelled: !!d.cancelled,
+          nonce: Date.now() },
+        { priority: "event" });
+    } else if (d.type === "captureDone" && window.Shiny && Shiny.setInputValue) {
+      // Outcome of a captureView request (header Export menu); export_menu.js
+      // clears its no-response timer off the same message.
+      Shiny.setInputValue("desktop_capture",
+        { ok: !!d.ok, mode: d.mode || "", path: d.path || null,
+          reason: d.reason || "", err: d.err || "", nonce: Date.now() },
+        { priority: "event" });
     }
   });
 

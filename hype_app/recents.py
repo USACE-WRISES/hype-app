@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _FILE = "recent_projects.json"
+#: Sibling store for saved .hypecompare collections; same shape, same pruning rules.
+_COMPARISONS_FILE = "recent_comparisons.json"
 MAX_RECENTS = 15
 
 
@@ -31,19 +33,19 @@ def data_root() -> Path:
     return Path.home() / ".hype"
 
 
-def _path() -> Path:
-    return data_root() / _FILE
+def _path(file: str = _FILE) -> Path:
+    return data_root() / file
 
 
-def load() -> list[dict]:
-    """Recents newest-first, pruned of entries whose .hype file no longer exists.
+def load(file: str = _FILE) -> list[dict]:
+    """Recents newest-first, pruned of entries whose file no longer exists.
 
     Each entry: {"path": str, "name": str, "last_opened": iso-utc str}. Pruning is
     in-memory only (the file is rewritten on the next touch), so a temporarily
     unavailable drive doesn't permanently evict its projects.
     """
     try:
-        raw = json.loads(_path().read_text(encoding="utf-8"))
+        raw = json.loads(_path(file).read_text(encoding="utf-8"))
         items = raw.get("projects", [])
     except (OSError, ValueError):
         return []
@@ -62,7 +64,7 @@ def load() -> list[dict]:
     return out[:MAX_RECENTS]
 
 
-def _write(items: list[dict]) -> None:
+def _write(items: list[dict], file: str = _FILE) -> None:
     """Atomic same-dir tmp + os.replace so a crash mid-write can't corrupt the list."""
     root = data_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -70,7 +72,7 @@ def _write(items: list[dict]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump({"projects": items}, fh, indent=2)
-        os.replace(tmp, _path())
+        os.replace(tmp, _path(file))
     except BaseException:
         try:
             os.unlink(tmp)
@@ -79,8 +81,8 @@ def _write(items: list[dict]) -> None:
         raise
 
 
-def touch(path: str | os.PathLike[str]) -> None:
-    """Record a project open/create: dedupe by normalized path, insert front, cap, write.
+def touch(path: str | os.PathLike[str], file: str = _FILE) -> None:
+    """Record an open/create: dedupe by normalized path, insert front, cap, write.
 
     Silently a no-op on any IO failure.
     """
@@ -89,23 +91,37 @@ def touch(path: str | os.PathLike[str]) -> None:
         key = os.path.normcase(str(p))
         entry = {"path": str(p), "name": p.stem,
                  "last_opened": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        kept = [it for it in load() if os.path.normcase(it["path"]) != key]
-        _write([entry, *kept][:MAX_RECENTS])
+        kept = [it for it in load(file) if os.path.normcase(it["path"]) != key]
+        _write([entry, *kept][:MAX_RECENTS], file)
     except Exception:
         pass
 
 
-def forget(path: str | os.PathLike[str]) -> None:
+def forget(path: str | os.PathLike[str], file: str = _FILE) -> None:
     """Drop *path* from the list (same normalized-path match as touch's dedupe).
 
-    Only edits recent_projects.json; never touches the project itself. Silently a
+    Only edits the store file; never touches the project itself. Silently a
     no-op on any IO failure.
     """
     try:
         key = os.path.normcase(str(Path(path).resolve()))
-        _write([it for it in load() if os.path.normcase(it["path"]) != key])
+        _write([it for it in load(file) if os.path.normcase(it["path"]) != key], file)
     except Exception:
         pass
 
 
-__all__ = ["MAX_RECENTS", "data_root", "load", "touch", "forget"]
+def load_comparisons() -> list[dict]:
+    """Recent saved .hypecompare collections, newest-first (pruned like projects)."""
+    return load(_COMPARISONS_FILE)
+
+
+def touch_comparison(path: str | os.PathLike[str]) -> None:
+    touch(path, _COMPARISONS_FILE)
+
+
+def forget_comparison(path: str | os.PathLike[str]) -> None:
+    forget(path, _COMPARISONS_FILE)
+
+
+__all__ = ["MAX_RECENTS", "data_root", "load", "touch", "forget",
+           "load_comparisons", "touch_comparison", "forget_comparison"]

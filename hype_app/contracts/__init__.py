@@ -39,12 +39,24 @@ from .inputs import (
     StreamflowInput,
     TerrainSource,
 )
+from .function_envelope import (
+    BASECASE_ID,
+    BASECASE_LABEL,
+    FUNCTION_ENVELOPE_SCHEMA_VERSION,
+    EnvelopeRow,
+    FunctionEnvelope,
+    SectionEnvelope,
+)
 from .results import (
     RESULTS_SCHEMA_VERSION,
     AssessmentResultsV2,
+    CalibrationPair,
+    CalibrationStats,
+    CalibrationWell,
     ConnectivityMetrics,
     ContaminantScreening,
     FunctionScreening,
+    GroundwaterCalibration,
     HabitatScreening,
     MicroplasticRetention,
     NutrientScreening,
@@ -61,6 +73,23 @@ from .alternatives import (
     AltScenario,
     AltStatus,
     HydraulicAlternativesManifest,
+)
+from .comparison import (
+    COMPARISON_COLLECTION_SCHEMA_VERSION,
+    COMPARISON_FINDING_SCHEMA_VERSION,
+    COMPARISON_MEMBER_SCHEMA_VERSION,
+    COMPARISON_OBSERVATION_SCHEMA_VERSION,
+    COMPARISON_SCENARIO_SCHEMA_VERSION,
+    COMPARISON_SNAPSHOT_SCHEMA_VERSION,
+    COMPARISON_VIEW_SCHEMA_VERSION,
+    ComparisonCollectionV1,
+    ComparisonFindingV1,
+    ComparisonMemberV1,
+    ComparisonMetricObservationV1,
+    ComparisonScenarioV1,
+    ComparisonSnapshotV1,
+    ComparisonSourceStatus,
+    ComparisonViewSettingsV1,
 )
 from .soils import (
     SOIL_SNAPSHOT_SCHEMA_VERSION,
@@ -85,7 +114,15 @@ SCHEMA_VERSIONS: dict[str, str] = {
     "soil-data-snapshot": SOIL_SNAPSHOT_SCHEMA_VERSION,
     "gradient-boundary-config": GRADIENT_SCHEMA_VERSION,
     "hydraulic-alternatives": ALTERNATIVES_MANIFEST_SCHEMA_VERSION,
+    "function-envelope": FUNCTION_ENVELOPE_SCHEMA_VERSION,
     "assessment-results": RESULTS_SCHEMA_VERSION,
+    "comparison-collection": COMPARISON_COLLECTION_SCHEMA_VERSION,
+    "comparison-member": COMPARISON_MEMBER_SCHEMA_VERSION,
+    "comparison-snapshot": COMPARISON_SNAPSHOT_SCHEMA_VERSION,
+    "comparison-metric-observation": COMPARISON_OBSERVATION_SCHEMA_VERSION,
+    "comparison-scenario": COMPARISON_SCENARIO_SCHEMA_VERSION,
+    "comparison-finding": COMPARISON_FINDING_SCHEMA_VERSION,
+    "comparison-view-settings": COMPARISON_VIEW_SCHEMA_VERSION,
 }
 
 # kind -> ordered list of (from_version, upgrade_fn). Registered by later phases as schemas evolve.
@@ -152,9 +189,41 @@ def _swap_sensitivity_2_2(data: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _add_function_envelope_2_3(data: dict[str, Any]) -> dict[str, Any]:
+    """assessment-results 2.3 -> 2.4: the hydraulic scenario envelope for the screening modules
+    was added.
+
+    Nothing to move: `function_envelope` is optional and defaults to None, so a 2.3 payload is
+    already valid under the 2.4 model. The step exists so the bump is explicit and so the
+    version-chain tests keep reaching the current version from 2.0.
+
+    Stamps the LITERAL 2.4, not `RESULTS_SCHEMA_VERSION`, per the chain rule documented on
+    `_add_functions_2_1`."""
+    out = dict(data)
+    out["schema_version"] = "assessment-results/2.4"
+    return out
+
+
+def _add_calibration_2_4(data: dict[str, Any]) -> dict[str, Any]:
+    """assessment-results 2.4 -> 2.5: the groundwater observation-well calibration table was
+    added.
+
+    Nothing to move: `calibration` is optional and defaults to None, so a 2.4 payload is
+    already valid under the 2.5 model. The step exists so the bump is explicit and so the
+    version-chain tests keep reaching the current version from 2.0.
+
+    Stamps the LITERAL 2.5, not `RESULTS_SCHEMA_VERSION`, per the chain rule documented on
+    `_add_functions_2_1`."""
+    out = dict(data)
+    out["schema_version"] = "assessment-results/2.5"
+    return out
+
+
 register_migration("assessment-results", "2.0", _drop_hfci_2_0)
 register_migration("assessment-results", "2.1", _add_functions_2_1)
 register_migration("assessment-results", "2.2", _swap_sensitivity_2_2)
+register_migration("assessment-results", "2.3", _add_function_envelope_2_3)
+register_migration("assessment-results", "2.4", _add_calibration_2_4)
 
 
 __all__ = [
@@ -177,10 +246,22 @@ __all__ = [
     "OpportunityPoint", "ReactiveScreening", "NutrientScreening", "ContaminantScreening",
     "HabitatScreening", "MicroplasticRetention", "ThermalOpportunity",
     "FunctionScreening",
+    "CalibrationWell", "CalibrationPair", "CalibrationStats", "GroundwaterCalibration",
     "AssessmentResultsV2", "RESULTS_SCHEMA_VERSION",
+    # hydraulic scenario envelope
+    "EnvelopeRow", "SectionEnvelope", "FunctionEnvelope",
+    "FUNCTION_ENVELOPE_SCHEMA_VERSION", "BASECASE_LABEL", "BASECASE_ID",
     # alternatives
     "AltStatus", "ALT_STATUS_LABEL", "AltScenario", "HydraulicAlternativesManifest",
     "ALTERNATIVES_MANIFEST_SCHEMA_VERSION",
+    # cross-project hydraulic comparisons
+    "ComparisonSourceStatus", "ComparisonFindingV1", "ComparisonScenarioV1",
+    "ComparisonMetricObservationV1", "ComparisonSnapshotV1", "ComparisonMemberV1",
+    "ComparisonViewSettingsV1", "ComparisonCollectionV1",
+    "COMPARISON_COLLECTION_SCHEMA_VERSION", "COMPARISON_MEMBER_SCHEMA_VERSION",
+    "COMPARISON_SNAPSHOT_SCHEMA_VERSION", "COMPARISON_OBSERVATION_SCHEMA_VERSION",
+    "COMPARISON_SCENARIO_SCHEMA_VERSION", "COMPARISON_FINDING_SCHEMA_VERSION",
+    "COMPARISON_VIEW_SCHEMA_VERSION",
     # registry
     "SCHEMA_VERSIONS", "register_migration", "migrate",
 ]

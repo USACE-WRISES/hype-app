@@ -230,13 +230,13 @@ public sealed class PayloadManagerTests : IDisposable
                 env = new
                 {
                     version = "env-cp312-off77777",
-                    url = $"https://github.com/gtmenichino/hype-app/releases/download/x/{env.FileName}",
+                    url = $"https://github.com/USACE-WRISES/hype-app/releases/download/x/{env.FileName}",
                     sha256 = env.Sha256, sizeBytes = env.Size, installedSizeBytes = env.Size * 3, python = "3.12",
                 },
                 apps = new
                 {
                     version = "apps-2026.07.12-off8888",
-                    url = $"https://github.com/gtmenichino/hype-app/releases/download/x/{apps.FileName}",
+                    url = $"https://github.com/USACE-WRISES/hype-app/releases/download/x/{apps.FileName}",
                     sha256 = apps.Sha256, sizeBytes = apps.Size, installedSizeBytes = apps.Size * 3,
                     requiresEnv = "env-cp312-off77777",
                 },

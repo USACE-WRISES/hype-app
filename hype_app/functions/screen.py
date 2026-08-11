@@ -828,6 +828,94 @@ _MASS_DISPLAY = (
 )
 
 
+#: Display twin -> the canonical key it was scaled from. The inverse of `_MASS_DISPLAY`, published
+#: because the registry's headline and two of its rows name TWINS, not contract fields:
+#: `_F_POLLUTANT.headline_kpi` is `total_mass_display`, which `_build_functions` filters away when
+#: it validates into `ContaminantScreening`. Anything resolving a registry row key against a
+#: contract model has to come through here first or it reads None and drops the endpoint silently.
+CANONICAL_FOR_DISPLAY = {dst: src for src, dst, _ in _MASS_DISPLAY}
+
+#: Canonical key -> its canonical unit string. Deliberately NOT read from `total_mass_unit` and
+#: friends: those carry the DISPLAY scale (every organic preset is `mass_scale="g"`, factor 1000),
+#: so pairing a canonical value with them understates by 1000x. A caller that resolves a key
+#: through `CANONICAL_FOR_DISPLAY` must take its unit from here and ignore the row's `unit_key`.
+CANONICAL_MASS_UNIT = {
+    "total_removed_kg_day": MASS_SCALES["kg"].total,
+    "areal_removal_rate_g_m2_day": MASS_SCALES["kg"].areal,
+    "areal_removal_rate_low_g_m2_day": MASS_SCALES["kg"].areal,
+    "areal_removal_rate_high_g_m2_day": MASS_SCALES["kg"].areal,
+    "removal_per_km_kg_day": MASS_SCALES["kg"].per_km,
+    "removal_per_km_low_kg_day": MASS_SCALES["kg"].per_km,
+    "removal_per_km_high_kg_day": MASS_SCALES["kg"].per_km,
+}
+
+
+def row_specs(process_key) -> tuple[object | None, tuple]:
+    """(primary spec, supporting specs) for one process, in the registry's own order.
+
+    The registry is the vocabulary: `FunctionSpec.headline_kpi` already declares which result is
+    THE primary, and the pane rows already declare every supporting one with its label, unit and
+    formatting. Restating any of that here would be a second naming authority.
+
+    SHARED, so the report's headline card and the alternatives fold cannot pick different primaries
+    for the same section. It lives here rather than in either caller because both of them resolve
+    through `CANONICAL_FOR_DISPLAY` below, and a second copy is how the display-twin trap comes
+    back."""
+    from .registry import function_for_process, get_process
+    spec = get_process(process_key)
+    fspec = function_for_process(process_key)
+    primary = None
+    if fspec is not None:
+        want = fspec.headline(fspec.mechanism_for_process(process_key))
+        primary = next((k for k in spec.kpis if k.key == want), None)
+    if primary is None and spec.kpis:
+        primary = spec.kpis[0]          # the fallback `validate_functions` already enforces
+    rows: list = [k for k in spec.kpis if primary is None or k.key != primary.key]
+    for g in spec.pane_groups:
+        # `list_key` groups read a LIST of dicts out of the result (the thermal response bands),
+        # not a number, so they have no range to fold.
+        if not g.list_key:
+            rows.extend(g.rows)
+    rows.extend(spec.detail_rows)
+    # NEVER `run_settings`: those are the settings the run was configured with, not results. The
+    # sweep varies none of them, so every one would fold to a zero-width range.
+    return primary, tuple(rows)
+
+
+def is_numeric(v) -> bool:
+    """Stricter than `alternatives.metric_ranges`, which is a bare isinstance check.
+
+    A single NaN poisons min/max for the whole row and prints "nan to nan". `bool` is an `int` in
+    Python and `NutrientScreening.oxygen_gate` is a bool, which would otherwise fold as 0/1."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def resolve_row(spec, model) -> tuple[str, str, str] | None:
+    """(canonical key, name, unit) for one registry row against one result model.
+
+    THE KEY IS RESOLVED THROUGH THE DISPLAY TWINS FIRST. The registry headlines the pollutant
+    section with `total_mass_display`, which is not a field on `ContaminantScreening`: it is a
+    rescaled copy minted for the pane and filtered away when `_build_functions` validates the
+    model. Reading the row key straight off the model returns None for every endpoint and every
+    scenario, and the section vanishes without a word.
+
+    `unit_key` IS IGNORED FOR AN ALIASED KEY. The `*_unit` fields carry the DISPLAY scale (every
+    organic preset is mass_scale="g", factor 1000), so pairing them with a canonical value
+    understates it by 1000x. `label_key` still applies: it names the metric, and metal
+    "attenuation" versus organic "transformation" is a real distinction."""
+    key = CANONICAL_FOR_DISPLAY.get(spec.key, spec.key)
+    if not hasattr(model, key):
+        return None
+    lk = getattr(spec, "label_key", "")
+    name = (getattr(model, lk, None) or spec.label) if lk else spec.label
+    if key != spec.key:
+        unit = CANONICAL_MASS_UNIT.get(key, "")
+    else:
+        uk = getattr(spec, "unit_key", "")
+        unit = (getattr(model, uk, None) or spec.unit) if uk else spec.unit
+    return key, str(name), str(unit or "")
+
+
 def _mass_display(out: dict, preset) -> None:
     """Rescaled copies of the mass chain, for endpoints whose masses are tiny in kilograms.
 
@@ -1203,4 +1291,7 @@ __all__ = [
     # the other is a six-orders-of-magnitude error.
     "ALPHA_MP_PER_KM", "LAMBDA_F_PER_CM", "STRAINING_ONSET_RATIO", "SIZE_EXCLUSION_RATIO",
     "CAPTURE_CAP", "GATE_ATTACHMENT", "GATE_STRAINING", "GATE_EXCLUDED", "GATE_NOTES",
+    # Twin -> canonical resolution, for anything reading a registry row key off a contract model.
+    "CANONICAL_FOR_DISPLAY", "CANONICAL_MASS_UNIT",
+    "row_specs", "resolve_row", "is_numeric",
 ]

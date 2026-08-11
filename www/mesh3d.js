@@ -31,6 +31,9 @@
             drapeTexReady: {},                                // raster-drape key -> texture loaded (gate vis)
             // ---- viewer tools (wireframe / view presets / measure) ----
             wireframe: false, meshSurfActors: [],             // grid body+top actors (repr toggle)
+            terrainOpacity: 1,                                // DEM pane opacity slider (3-D mirror)
+            gridStyle: { opacity: 1, color: null },           // Model grid pane 3D display controls
+            renP: null,                                       // layer-1 overlay renderer (particles)
             projMode: "persp", viewPreset: null,              // "parallel" in top/side presets
             cube: null, cubeBox: null,                        // HTML view cube (camera-synced)
             measure: { armed: false, pts: [], actor: null, mapper: null,
@@ -112,6 +115,7 @@
     }
     delete S.layers[key];
     recomputeSceneBounds();
+    animRebuild();     // drop this layer's particle cloud with it
   }
 
   function applyLayerVis(key) {
@@ -244,6 +248,14 @@
     var tx = S.drapeTex || {};
     if (S.vis.basemap !== false && tx.imagery && tx.imagery.ready) pick = tx.imagery;
     else if (S.vis.basemap_topo !== false && tx.topo && tx.topo.ready) pick = tx.topo;
+    // Fallback: the SELECTED texture can be missing (its USGS export failed at mesh
+    // build, quietly) or still mid-load at swap time — never blank the drape while a
+    // basemap is wanted and the other texture is sitting ready. The selection still
+    // wins the moment it becomes ready, because every texture onload re-runs this.
+    if (!pick && (S.vis.basemap !== false || S.vis.basemap_topo !== false)) {
+      if (tx.imagery && tx.imagery.ready) pick = tx.imagery;
+      else if (tx.topo && tx.topo.ready) pick = tx.topo;
+    }
     if (pick && pick.tex !== S.drapeCurTex) {
       try {
         if (S.drapeActor.removeAllTextures) S.drapeActor.removeAllTextures();
@@ -273,10 +285,76 @@
     });
     var terr = S.layers.terrain;
     if (terr) terr.actors.forEach(function (a) {
-      a.getProperty().setOpacity(S.wireframe ? 0.25 : 1.0);
+      // wireframe dims the terrain so interior volumes stay readable, but never
+      // ABOVE the DEM pane's own opacity slider: the lower of the two wins.
+      a.getProperty().setOpacity(S.wireframe ? Math.min(0.25, S.terrainOpacity)
+                                             : S.terrainOpacity);
     });
     applyDrapeOpacity();
+    applyGridStyle();   // single owner of line opacity/color across representations
+  }
+
+  function applyGridStyle() {
+    // Grid style semantics: the opacity slider fades the GRID LINES only — the
+    // surface-mode cell edges via edgeOpacity (the actor stays opaque), and the
+    // wireframe lines via a COLOR BLEND toward the renderer background. NEVER
+    // fade the wireframe with actor opacity: any value below 1 drops the whole
+    // line field into vtk's translucent pass, which both blends the lines into
+    // one indistinct level and disrupts the other translucent actors (the
+    // wse/depth drapes vanished — the reported "turns off the surface water
+    // model"). The color override paints the lines; in wireframe a fade or an
+    // override needs a solid color, so the elevation scalars stay only for the
+    // stock full-opacity look.
+    var gs = S.gridStyle || { opacity: 1, color: null };
+    var k = Math.max(0.05, Math.min(gs.opacity || 1, 1));
+    var rgb = null;
+    if (gs.color && /^#[0-9a-fA-F]{6}$/.test(gs.color)) {
+      rgb = [parseInt(gs.color.slice(1, 3), 16) / 255,
+             parseInt(gs.color.slice(3, 5), 16) / 255,
+             parseInt(gs.color.slice(5, 7), 16) / 255];
+    }
+    var bg = (S.ren && S.ren.getBackground) ? S.ren.getBackground()
+                                            : [0.05, 0.07, 0.09];
+    var base = rgb || [0.56, 0.58, 0.61];
+    var faded = [base[0] * k + bg[0] * (1 - k),
+                 base[1] * k + bg[1] * (1 - k),
+                 base[2] * k + bg[2] * (1 - k)];
+    (S.meshSurfActors || []).forEach(function (a, i) {
+      var p = a.getProperty();
+      p.setOpacity(1);
+      if (S.wireframe) {
+        p.setColor(faded[0], faded[1], faded[2]);
+      } else {
+        if (p.setEdgeOpacity) p.setEdgeOpacity(k);
+        if (p.setEdgeColor) {
+          if (rgb) p.setEdgeColor(rgb[0], rgb[1], rgb[2]);
+          else p.setEdgeColor(0.16, 0.18, 0.22);
+        }
+        if (i === 0) p.setColor(0.56, 0.58, 0.61);   // body's stock neutral gray
+      }
+    });
+    if (S.topMapper && S.topMapper.setScalarVisibility) {
+      S.topMapper.setScalarVisibility(S.wireframe ? (!rgb && k >= 0.999) : true);
+    }
     render();
+  }
+
+  function overlayRenderer() {
+    // Layer-1 renderer for the particle animation: composited AFTER layer 0's
+    // opaque and translucent passes, so particles and streaks keep their true
+    // color instead of being alpha-diluted behind the translucent grid or drape.
+    // Shares the MAIN camera object, so the views can never drift apart.
+    if (S.renP) return S.renP;
+    var vtk = V();
+    S.renP = vtk.Rendering.Core.vtkRenderer.newInstance();
+    S.renP.setLayer(1);
+    S.renP.setInteractive(false);
+    S.renP.setActiveCamera(S.ren.getActiveCamera());
+    if (S.rw.getNumberOfLayers && S.rw.getNumberOfLayers() < 2 && S.rw.setNumberOfLayers) {
+      S.rw.setNumberOfLayers(2);
+    }
+    S.rw.addRenderer(S.renP);
+    return S.renP;
   }
 
   // ---- view presets + HTML view cube -----------------------------------------------------
@@ -772,6 +850,9 @@
           render();
         } catch (e) { console.error("[mesh3d] drape texture failed", e); }
       };
+      img.onerror = function () {   // dead data URI: diagnosable, not silent
+        console.error("[mesh3d] basemap texture failed to load");
+      };
       img.src = src.url;
       return entry;
     }
@@ -1038,6 +1119,7 @@
                     msg.bounds, msg.origin || null);
     applyVexag();
     applyWireframe();                          // toggle state survives mesh re-sends
+    applyGridStyle();                          // ...and so do the opacity/color controls
     try { S.grw.resize(); } catch (e) { /**/ }
     // Frame the mesh ONCE (so the first preview is visible); a REGENERATE must not re-zoom the
     // camera — it keeps whatever view the user set. Per the app-wide rule: only an explicit
@@ -1138,6 +1220,7 @@
                                  parseInt(c.slice(3, 5), 16) / 255,
                                  parseInt(c.slice(5, 7), 16) / 255);
     actor.getProperty().setLineWidth(msg.width || 2);
+    if (typeof msg.opacity === "number") actor.getProperty().setOpacity(msg.opacity);
     if (actor.getProperty().setLighting) actor.getProperty().setLighting(false);
     S.ren.addActor(actor);
     S.actors.push(actor); S.mappers.push(mapper);
@@ -1147,7 +1230,359 @@
       bx[2] = Math.min(bx[2], pts[p + 1]); bx[3] = Math.max(bx[3], pts[p + 1]);
       bx[4] = Math.min(bx[4], pts[p + 2]); bx[5] = Math.max(bx[5], pts[p + 2]);
     }
+    // Subtle depth shading: per-point z scalars through a two-point ramp from a
+    // darkened class color (deepest) to the full color (near-surface), so distance
+    // into the grid reads directly off the line brightness. The mapper then ignores
+    // actor color — hype3d_style re-ramps the CTF on line-color restyles.
+    var ctf = null;
+    if (bx[5] > bx[4] && vtk.Rendering.Core.vtkColorTransferFunction
+        && vtk.Common.Core.vtkDataArray) {
+      var nPts = pts.length / 3;
+      var zs = new Float32Array(nPts);
+      for (var zi = 0; zi < nPts; zi++) zs[zi] = pts[zi * 3 + 2];
+      pd.getPointData().setScalars(vtk.Common.Core.vtkDataArray.newInstance({
+        name: "z", values: zs, numberOfComponents: 1 }));
+      ctf = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
+      var lr = parseInt(c.slice(1, 3), 16) / 255;
+      var lg = parseInt(c.slice(3, 5), 16) / 255;
+      var lb = parseInt(c.slice(5, 7), 16) / 255;
+      ctf.addRGBPoint(bx[4], lr * 0.55, lg * 0.55, lb * 0.55);
+      ctf.addRGBPoint(bx[5], lr, lg, lb);
+      mapper.setLookupTable(ctf);
+      if (mapper.setUseLookupTableScalarRange) mapper.setUseLookupTableScalarRange(true);
+    }
     registerLayer3d(key, [actor], [mapper], bx, msg.origin || null);
+    if (ctf) {
+      S.layers[key].ctf = ctf;
+      S.layers[key].zr = [bx[4], bx[5]];
+    }
+    // Retain the raw polylines + per-path residence times so the particle animator
+    // can move dots along them (the polydata alone loses per-path identity). times
+    // and pids arrive ALIGNED with polylines from scene.flowpaths_payload.
+    if (msg.times && msg.times.length) {
+      var paths = [];
+      lines.forEach(function (flat, li) {
+        var n2 = flat.length / 3;
+        if (n2 < 2) return;
+        var cum = [0];
+        for (var q = 1; q < n2; q++) {
+          var dx = flat[q * 3] - flat[(q - 1) * 3];
+          var dy = flat[q * 3 + 1] - flat[(q - 1) * 3 + 1];
+          var dz = flat[q * 3 + 2] - flat[(q - 1) * 3 + 2];
+          cum.push(cum[q - 1] + Math.sqrt(dx * dx + dy * dy + dz * dz));
+        }
+        var pid = (msg.pids && +msg.pids[li]) || (li + 1);
+        paths.push({ flat: flat, cum: cum, total: cum[n2 - 1] || 1,
+                     td: +(msg.times[li]) || 0,
+                     ph: (pid * 0.6180339887) % 1 });
+      });
+      S.layers[key].paths = paths;
+    }
+    animRebuild();
+  }
+
+  // ---- flow-path particle animation (the 3-D twin of www/path_anim.js) -------------------
+  // Same controls and the same motion model: median residence time anchored to a
+  // 36/speed-second loop, every path scaled linearly by its own total_time_d with an
+  // 800 ms floor, phase = golden-ratio hash of the particleid. The 2-D module owns the
+  // hype_fp_anim message (Shiny keeps ONE handler per type) and forwards each one here
+  // through window.__hypeFpAnim3dApply. Particles render as one GL_POINTS cloud per
+  // class layer (plus three stacked tail line actors in comet style): the actors carry
+  // the layer's origin offset and ride S.actors (vexag rescale) and S.mappers
+  // (clip-plane slicing); positions stay in RAW z, the actor scale transform applies
+  // the exaggeration. Line opacity is deliberately ignored, matching 2-D: hidden
+  // lines keep animating, the class checkbox is what stops them.
+  var A3 = { on: false, speed: 3, color: "#ff2bd6", style: "comet", msPerDay: 1,
+             raf: 0, wait: 0, pulse: 0, errs: 0, lastTick: 0, parts: {} };
+
+  // Arc-length sampler shared by heads and tails: binary-search the cumulative
+  // distances, lerp inside the segment, write xyz into out. Returns the low index.
+  function arcPoint(p, s, out) {
+    var lo = 0, hi = p.cum.length - 1;
+    while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (p.cum[mid] <= s) lo = mid; else hi = mid; }
+    var t = (s - p.cum[lo]) / ((p.cum[lo + 1] - p.cum[lo]) || 1);
+    var f = p.flat;
+    out[0] = f[lo * 3] + (f[(lo + 1) * 3] - f[lo * 3]) * t;
+    out[1] = f[lo * 3 + 1] + (f[(lo + 1) * 3 + 1] - f[lo * 3 + 1]) * t;
+    out[2] = f[lo * 3 + 2] + (f[(lo + 1) * 3 + 2] - f[lo * 3 + 2]) * t;
+    return lo;
+  }
+
+  function animLayers() {
+    return Object.keys(S.layers).filter(function (k) {
+      return k.indexOf("hz3d_paths_") === 0 && S.layers[k].paths &&
+             S.vis[k] !== false;
+    });
+  }
+
+  function animRetime() {
+    var tds = [];
+    animLayers().forEach(function (k) {
+      S.layers[k].paths.forEach(function (p) { if (p.td > 0) tds.push(p.td); });
+    });
+    tds.sort(function (x, y) { return x - y; });
+    var med = tds.length ? tds[(tds.length - 1) >> 1] : 1;
+    A3.msPerDay = (36000 / Math.max(A3.speed, 0.1)) / (med || 1);
+  }
+
+  function animStop() {
+    if (A3.raf) { cancelAnimationFrame(A3.raf); A3.raf = 0; }
+    if (A3.wait) { clearTimeout(A3.wait); A3.wait = 0; }
+    if (A3.pulse) { clearInterval(A3.pulse); A3.pulse = 0; }
+  }
+
+  function animClear() {
+    Object.keys(A3.parts).forEach(function (k) {
+      var P = A3.parts[k];
+      var doomed = [{ actor: P.actor, mapper: P.mapper }].concat(P.tails || []);
+      doomed.forEach(function (D) {
+        try { (S.renP || S.ren).removeActor(D.actor); } catch (e) { /**/ }
+        var ia = S.actors.indexOf(D.actor);
+        if (ia >= 0) S.actors.splice(ia, 1);
+        if (S.clipping) { try { D.mapper.removeClippingPlane(S.plane); } catch (e) { /**/ } }
+        var im = S.mappers.indexOf(D.mapper);
+        if (im >= 0) S.mappers.splice(im, 1);
+      });
+    });
+    A3.parts = {};
+  }
+
+  function animRebuild() {
+    if (!S.ren) return;
+    animClear();
+    if (!A3.on) { animStop(); render(); return; }
+    var vtk = V();
+    animRetime();
+    var c = A3.color || "#ff2bd6";
+    var cr = parseInt(c.slice(1, 3), 16) / 255;
+    var cg = parseInt(c.slice(3, 5), 16) / 255;
+    var cb = parseInt(c.slice(5, 7), 16) / 255;
+    animLayers().forEach(function (k) {
+      var L = S.layers[k];
+      var n = L.paths.length;
+      if (!n) return;
+      var pd = vtk.Common.DataModel.vtkPolyData.newInstance();
+      var arr = new Float32Array(n * 3);
+      pd.getPoints().setData(arr, 3);
+      var verts = new Uint32Array(n * 2);
+      for (var i = 0; i < n; i++) { verts[i * 2] = 1; verts[i * 2 + 1] = i; }
+      pd.getVerts().setData(verts);
+      var mapper = vtk.Rendering.Core.vtkMapper.newInstance();
+      mapper.setInputData(pd);
+      var actor = vtk.Rendering.Core.vtkActor.newInstance();
+      actor.setMapper(mapper);
+      actor.getProperty().setColor(cr, cg, cb);
+      if (actor.getProperty().setPointSize) actor.getProperty().setPointSize(7);
+      if (actor.getProperty().setLighting) actor.getProperty().setLighting(false);
+      // Same deeper-equals-darker ramp as the static lines (L.zr recorded at line
+      // build): a parcel diving deep visibly dims while staying on the undiluted
+      // overlay. Recreated on every rebuild, so color swaps re-ramp for free; a
+      // flat-z layer (no zr) keeps the solid color.
+      var ctfP = null, zbuf = null, za = null;
+      if (L.zr && vtk.Rendering.Core.vtkColorTransferFunction
+          && vtk.Common.Core.vtkDataArray) {
+        ctfP = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
+        ctfP.addRGBPoint(L.zr[0], cr * 0.55, cg * 0.55, cb * 0.55);
+        ctfP.addRGBPoint(L.zr[1], cr, cg, cb);
+        zbuf = new Float32Array(n);
+        za = vtk.Common.Core.vtkDataArray.newInstance({
+          name: "z", values: zbuf, numberOfComponents: 1 });
+        pd.getPointData().setScalars(za);
+        mapper.setLookupTable(ctfP);
+        if (mapper.setUseLookupTableScalarRange) mapper.setUseLookupTableScalarRange(true);
+      }
+      var off = layerOffset(L.origin);
+      actor.setPosition(off[0], off[1], 0);
+      actor.setScale(1, 1, S.vexag);
+      overlayRenderer().addActor(actor);   // layer 1: never diluted by translucency
+      S.actors.push(actor);
+      S.mappers.push(mapper);
+      if (S.clipping) { try { mapper.addClippingPlane(S.plane); } catch (e) { /**/ } }
+      // Comet streaks: three stacked tail line actors per class (the 2-D recipe:
+      // rising alpha, widths 1/1.4/1.9 best-effort — WebGL may clamp line width).
+      // Geometry is rebuilt per frame in animFrame; dots style skips them.
+      var tails = null;
+      if (A3.style === "comet") {
+        tails = [];
+        var TS = [[0.12, 1.0], [0.2, 1.4], [0.3, 1.9]];
+        for (var k3 = 0; k3 < 3; k3++) {
+          var tpd = vtk.Common.DataModel.vtkPolyData.newInstance();
+          var tmap = vtk.Rendering.Core.vtkMapper.newInstance();
+          tmap.setInputData(tpd);
+          var tact = vtk.Rendering.Core.vtkActor.newInstance();
+          tact.setMapper(tmap);
+          tact.getProperty().setColor(cr, cg, cb);
+          tact.getProperty().setOpacity(TS[k3][0]);
+          tact.getProperty().setLineWidth(TS[k3][1]);
+          if (tact.getProperty().setLighting) tact.getProperty().setLighting(false);
+          tact.setPosition(off[0], off[1], 0);
+          tact.setScale(1, 1, S.vexag);
+          overlayRenderer().addActor(tact);
+          S.actors.push(tact);
+          S.mappers.push(tmap);
+          if (S.clipping) { try { tmap.addClippingPlane(S.plane); } catch (e) { /**/ } }
+          var tza = null;
+          if (ctfP) {   // tails share the class depth ramp
+            tza = vtk.Common.Core.vtkDataArray.newInstance({
+              name: "z", values: new Float32Array(0), numberOfComponents: 1 });
+            tpd.getPointData().setScalars(tza);
+            tmap.setLookupTable(ctfP);
+            if (tmap.setUseLookupTableScalarRange) tmap.setUseLookupTableScalarRange(true);
+          }
+          tails.push({ pd: tpd, mapper: tmap, actor: tact, za: tza });
+        }
+      }
+      A3.parts[k] = { actor: actor, mapper: mapper, pd: pd, arr: arr,
+                      zbuf: zbuf, za: za, tails: tails };
+    });
+    animKick();
+  }
+
+  function animFrame(now) {
+    A3.raf = 0;
+    if (!A3.on) return;
+    if (!containerVisible()) {           // 2-D view up: idle-poll instead of rendering blind
+      A3.wait = setTimeout(animKick, 500);
+      return;
+    }
+    // Re-arm BEFORE the body (the 2-D loop's doctrine): a throw anywhere below —
+    // GL context hiccups surface out of render() — must never break the chain and
+    // freeze the particles while the checkbox still reads on.
+    A3.raf = requestAnimationFrame(animFrame);
+    A3.lastTick = performance.now();   // heartbeat: proves the loop is actually drawing
+    try {
+      animDraw(now);
+    } catch (e) {
+      if ((A3.errs += 1) <= 3) console.error("[mesh3d] particle frame failed", e);
+    }
+  }
+
+  function animDraw(now) {
+    var head = [0, 0, 0], tail0 = [0, 0, 0];
+    Object.keys(A3.parts).forEach(function (k) {
+      var P = A3.parts[k];
+      var paths = (S.layers[k] || {}).paths || [];
+      var arr = P.arr;
+      for (var i = 0; i < paths.length; i++) {
+        var p = paths[i];
+        var dur = Math.max(p.td * A3.msPerDay, 800);
+        var fr = ((now / dur) + p.ph) % 1;
+        arcPoint(p, fr * p.total, head);
+        arr[i * 3] = head[0]; arr[i * 3 + 1] = head[1]; arr[i * 3 + 2] = head[2];
+        if (P.zbuf) P.zbuf[i] = head[2];   // depth ramp scalar
+      }
+      P.pd.getPoints().setData(arr, 3);
+      if (P.za) P.za.setData(P.zbuf);
+      P.pd.modified();
+      if (P.tails) {   // comet-tail geometry, rebuilt per frame
+        // Tail arc = distance covered in the last second of wall clock, capped at a
+        // quarter of the path, CLAMPED at the start (never wrap — a wrap draws a
+        // chord across the whole path once per loop; the 2-D lesson). Stroke k
+        // starts at k/3 of the span for the taper.
+        for (var k2 = 0; k2 < 3; k2++) {
+          var pts2 = [], conn2 = [], zs2 = [];
+          for (var j = 0; j < paths.length; j++) {
+            var p2 = paths[j];
+            var dur2 = Math.max(p2.td * A3.msPerDay, 800);
+            var s2 = (((now / dur2) + p2.ph) % 1) * p2.total;
+            var tailLen = Math.min(p2.total / dur2 * 1000, p2.total * 0.25);
+            var ta = Math.max(s2 - tailLen, 0);
+            var span = s2 - ta;
+            if (span < 1e-6) continue;
+            var loT = arcPoint(p2, ta + span * k2 / 3, tail0);
+            var loH = arcPoint(p2, s2, head);
+            var base = pts2.length / 3, n3 = 0;
+            pts2.push(tail0[0], tail0[1], tail0[2]); zs2.push(tail0[2]); n3++;
+            for (var vi = loT + 1; vi <= loH; vi++) {
+              pts2.push(p2.flat[vi * 3], p2.flat[vi * 3 + 1], p2.flat[vi * 3 + 2]);
+              zs2.push(p2.flat[vi * 3 + 2]);
+              n3++;
+            }
+            pts2.push(head[0], head[1], head[2]); zs2.push(head[2]); n3++;
+            conn2.push(n3);
+            for (var c2 = 0; c2 < n3; c2++) conn2.push(base + c2);
+          }
+          var T = P.tails[k2];
+          T.pd.getPoints().setData(Float32Array.from(pts2), 3);
+          T.pd.getLines().setData(Uint32Array.from(conn2));
+          if (T.za) T.za.setData(Float32Array.from(zs2));
+          T.pd.modified();
+        }
+      }
+    });
+    render();
+  }
+
+  function animNudge() {
+    // Force restart from ANY state, including a stale-truthy rAF handle whose
+    // callback will never fire (webview/tab suspension can strand one — the
+    // frozen-after-2D-to-3D report). This is what the off/on toggle achieved by
+    // accident via animStop: clear every handle, then arm fresh.
+    if (!A3.on) return;
+    if (A3.raf) { try { cancelAnimationFrame(A3.raf); } catch (e) { /**/ } A3.raf = 0; }
+    if (A3.wait) { clearTimeout(A3.wait); A3.wait = 0; }
+    animKick();
+  }
+
+  function animPulse() {
+    // Self-healing watchdog while the animation is on. Liveness is TIME-based:
+    // handle state cannot prove the loop is alive (a stranded rAF id looks armed
+    // forever), but "no frame drawn for 3 s while visible" cannot lie. Dead
+    // handles restart immediately; a silent-but-armed loop gets nudged. Self-
+    // clears when off.
+    if (A3.pulse) return;
+    A3.pulse = setInterval(function () {
+      if (!A3.on) { clearInterval(A3.pulse); A3.pulse = 0; return; }
+      if (S.recording) return;   // capture owns the clock; healing would fight it
+      if (!containerVisible()) return;
+      var dead = !A3.raf && !A3.wait;
+      var silent = A3.lastTick > 0 && performance.now() - A3.lastTick > 3000;
+      if (dead || silent) {
+        // Particles exist: restart the loop. None: a rebuild either creates
+        // them (layers arrived after the on-message) or no-ops quietly.
+        if (Object.keys(A3.parts).length) animNudge(); else animRebuild();
+        A3.lastTick = performance.now();   // one forced restart per silent window
+      }
+    }, 2000);
+  }
+
+  function animKick() {
+    if (A3.wait) { clearTimeout(A3.wait); A3.wait = 0; }
+    if (!A3.on) return;
+    animPulse();
+    if (A3.raf) return;
+    A3.raf = requestAnimationFrame(animFrame);
+    A3.lastTick = performance.now();       // fresh arm gets a full grace window
+  }
+
+  window.__hypeFpAnim3dApply = function (msg) {
+    if (!msg) return;
+    A3.on = !!msg.on;
+    if (typeof msg.speed === "number" && msg.speed > 0) A3.speed = msg.speed;
+    if (typeof msg.color === "string" && msg.color) A3.color = msg.color;
+    if (msg.style === "comet" || msg.style === "dots") A3.style = msg.style;
+    // animPulse arms even when animRebuild bails early (no renderer yet): the
+    // watchdog then owns recovery once the scene exists.
+    if (A3.on) { animPulse(); animRebuild(); } else { animClear(); animStop(); render(); }
+  };
+  window.__hypeFpAnim3d = A3;   // debug/E2E handle (the __hypeMesh3d convention)
+  // Instant resume on the 2D-to-3D switch: clear any stale handle right away
+  // instead of waiting out the heartbeat (one dropped frame when healthy,
+  // immediate revival when frozen). The pane reveals after a server round
+  // trip, so a still-hidden nudge just hands off to the healthy wait cycle.
+  document.addEventListener("click", function (ev) {
+    var t = ev.target;
+    if (t && t.closest && t.closest('.hype-view-btn[data-view="3d"]') && A3.on) {
+      setTimeout(animNudge, 350);
+    }
+  });
+  // Ordering seed: the 2-D module may have applied the message before this file's
+  // layers existed. Pull its current state once so a later layer build animates.
+  if (window.__hypeFpAnim) {
+    A3.on = !!window.__hypeFpAnim.on;
+    if (window.__hypeFpAnim.speed > 0) A3.speed = window.__hypeFpAnim.speed;
+    if (window.__hypeFpAnim.color) A3.color = window.__hypeFpAnim.color;
+    if (window.__hypeFpAnim.style) A3.style = window.__hypeFpAnim.style;
   }
 
   // Translucent closed volume (hyporheic-zone shells): data = {points:[x,y,z,...],
@@ -1338,6 +1773,10 @@
     // Tear a half-initialized render window down so the next attempt rebuilds cleanly.
     try { if (S.grw && S.grw.delete) S.grw.delete(); } catch (e) { /**/ }
     S.grw = null; S.ren = null; S.rw = null;
+    S.renP = null;                       // overlay renderer died with the window
+    A3.parts = {};                       // its particle actors are gone too
+    animStop();                          // no loop over wiped state; the watchdog or the
+    if (A3.on) animPulse();              // server resends restart it once layers return
     S.actors = []; S.mappers = []; S.layers = {}; S.origin = null; S.meshFramed = false;
     var el = container();
     if (el) { var cs = el.querySelectorAll("canvas"); for (var i = 0; i < cs.length; i++) cs[i].remove(); }
@@ -1380,6 +1819,7 @@
     S.vis[msg.key] = msg.on !== false;
     if (msg.key in (S.pendingDrapes || {})) return;   // applies when it builds
     applyLayerVis(msg.key);
+    if (msg.key.indexOf("hz3d_paths_") === 0) animRebuild();   // particles follow the checkbox
   }
 
   function onClearMessage() {                          // New run → empty the whole scene
@@ -1458,6 +1898,229 @@
     wire: function (on) { S.wireframe = !!on; applyWireframe(); return S.wireframe; },
   };
 
+  // ---- 3-D flyover recording -----------------------------------------------------
+  // Orbits the active camera one full turn over msg.seconds while MediaRecorder captures
+  // the WebGL canvas (not tainted: the drape is a data URI). The webm lands server-side
+  // through the hidden Shiny file input msg.input_id — Shiny's own chunked uploader, the
+  // sanctioned big-payload path (dynamic routes are GET-only in this build, and multi-MB
+  // blobs must never ride the websocket). If the input is missing or the browser cannot
+  // record, the blob downloads directly as .webm.
+  function pickMime() {
+    var cands = ["video/webm;codecs=h264", "video/webm;codecs=vp9",
+                 "video/webm;codecs=vp8", "video/webm"];
+    for (var i = 0; i < cands.length; i++) {
+      try { if (MediaRecorder.isTypeSupported(cands[i])) return cands[i]; } catch (e) { /**/ }
+    }
+    return "";
+  }
+
+  function deliverRecording(blob, inputId, filename) {
+    var name = filename || "view3d.webm";
+    var el = inputId ? document.getElementById(inputId) : null;
+    if (el && window.DataTransfer) {
+      try {
+        var dt = new DataTransfer();
+        dt.items.add(new File([blob], name, { type: blob.type || "video/webm" }));
+        el.files = dt.files;
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return "upload";
+      } catch (e) { /* fall through to download */ }
+    }
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+    return "download";
+  }
+
+  function record3d(msg) {
+    // STATIC camera: the view records exactly as the user sees it (particle
+    // animation and all). The interval below is the frame clock — captureStream
+    // only emits on repaints, and demand-rendered vtk repaints nothing on its own.
+    if (S.recording) return;
+    var el = container();
+    var canvas = el && el.querySelector("canvas");
+    if (!canvas || !S.ren || !window.MediaRecorder || !canvas.captureStream) {
+      Shiny.setInputValue("hype3d_record_done",
+                          { ok: false, err: "recording unavailable in this browser",
+                            n: Date.now() }, { priority: "event" });
+      return;
+    }
+    var seconds = Math.max(2, Math.min(Number(msg.seconds) || 8, 30));
+    var fps = Number(msg.fps) === 15 ? 15 : 30;
+    var frames = Math.round(seconds * fps);
+    // Optional crop rect (canvas pixels, from the capture control's rubber band):
+    // record an offscreen canvas fed by drawImage each tick. Dims forced even so
+    // the h264 transcode never rejects the stream.
+    var crop = null;
+    if (msg.crop && Number(msg.crop.w) > 8 && Number(msg.crop.h) > 8) {
+      var cx = Math.max(0, Math.round(Number(msg.crop.x) || 0));
+      var cy = Math.max(0, Math.round(Number(msg.crop.y) || 0));
+      var cw = Math.min(Math.round(Number(msg.crop.w)), canvas.width - cx);
+      var ch = Math.min(Math.round(Number(msg.crop.h)), canvas.height - cy);
+      cw -= cw % 2; ch -= ch % 2;
+      if (cw >= 16 && ch >= 16) crop = { x: cx, y: cy, w: cw, h: ch };
+    }
+    var srcCanvas = canvas, octx = null;
+    if (crop) {
+      var off = document.createElement("canvas");
+      off.width = crop.w; off.height = crop.h;
+      octx = off.getContext("2d");
+      srcCanvas = off;
+    }
+    var mime = pickMime();
+    var stream = srcCanvas.captureStream(fps);
+    var rec;
+    try {
+      rec = mime ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8e6 })
+                 : new MediaRecorder(stream);
+    } catch (e) {
+      Shiny.setInputValue("hype3d_record_done",
+                          { ok: false, err: String(e), n: Date.now() },
+                          { priority: "event" });
+      return;
+    }
+    var chunks = [];
+    rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.onstop = function () {
+      S.recording = false;
+      var blob = new Blob(chunks, { type: mime || "video/webm" });
+      var mode = blob.size > 1000 ? deliverRecording(blob, msg.input_id) : "empty";
+      Shiny.setInputValue("hype3d_record_done",
+                          { ok: mode !== "empty", mode: mode, bytes: blob.size,
+                            n: Date.now() }, { priority: "event" });
+    };
+    S.recording = true;
+    var i = 0;
+    rec.start(250);
+    var timer = setInterval(function () {
+      try {
+        render();
+        // drawImage right after the synchronous render, same task: with
+        // preserveDrawingBuffer off the GL buffer is only valid until we yield.
+        if (octx) octx.drawImage(canvas, crop.x, crop.y, crop.w, crop.h,
+                                 0, 0, crop.w, crop.h);
+      } catch (e) { /* keep recording; a bad frame beats an abort */ }
+      i += 1;
+      if (i >= frames) {
+        clearInterval(timer);
+        try { rec.stop(); } catch (e) { S.recording = false; }
+      }
+    }, 1000.0 / fps);
+  }
+
+  function recordFrames(msg) {
+    // Deterministic capture: step the particle clock frame by frame (animDraw is
+    // a pure function of the time it is handed) and JPEG each frame into one
+    // MJPEG blob the server assembles into a constant-rate MP4 — the 2D builder's
+    // smoothness, in 3D. Real-time recording can never promise that: its frames
+    // land at whatever wall-clock moments the busy main thread manages.
+    if (S.recording) return;
+    var el = container();
+    var canvas = el && el.querySelector("canvas");
+    if (!canvas || !S.ren) {
+      Shiny.setInputValue("hype3d_record_done",
+                          { ok: false, err: "the 3D view is not ready to record",
+                            n: Date.now() }, { priority: "event" });
+      return;
+    }
+    var seconds = Math.max(2, Math.min(Number(msg.seconds) || 8, 30));
+    var fps = Number(msg.fps) === 15 ? 15 : 30;
+    var frames = Math.round(seconds * fps);
+    var crop = null;
+    if (msg.crop && Number(msg.crop.w) > 8 && Number(msg.crop.h) > 8) {
+      var cx = Math.max(0, Math.round(Number(msg.crop.x) || 0));
+      var cy = Math.max(0, Math.round(Number(msg.crop.y) || 0));
+      var cw = Math.min(Math.round(Number(msg.crop.w)), canvas.width - cx);
+      var ch = Math.min(Math.round(Number(msg.crop.h)), canvas.height - cy);
+      cw -= cw % 2; ch -= ch % 2;
+      if (cw >= 16 && ch >= 16) crop = { x: cx, y: cy, w: cw, h: ch };
+    }
+    // Always copy through an offscreen 2d canvas with EVEN dims (yuv420p —
+    // the full canvas can be odd-sized; the crop path already forces even).
+    var sx = crop ? crop.x : 0, sy = crop ? crop.y : 0;
+    var sw = crop ? crop.w : canvas.width - (canvas.width % 2);
+    var sh = crop ? crop.h : canvas.height - (canvas.height % 2);
+    if (sw < 16 || sh < 16) {
+      Shiny.setInputValue("hype3d_record_done",
+                          { ok: false, err: "the view is too small to record",
+                            n: Date.now() }, { priority: "event" });
+      return;
+    }
+    var off = document.createElement("canvas");
+    off.width = sw; off.height = sh;
+    var octx = off.getContext("2d");
+
+    var chip = document.createElement("div");
+    chip.className = "hype-video-notifier hype-rec3d-chip";
+    var label = document.createElement("div");
+    label.className = "hype-rec3d-label";
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-sm btn-outline-secondary";
+    btn.textContent = "Cancel";
+    var cancelled = false;
+    btn.addEventListener("click", function () { cancelled = true; });
+    chip.appendChild(label);
+    chip.appendChild(btn);
+    document.body.appendChild(chip);
+
+    // Suspend the free-running animator: the loop below is the ONLY clock while
+    // capturing. A3.on stays true so state survives; animPulse's S.recording
+    // guard keeps the watchdog from force-restarting the "dead" handles.
+    if (A3.raf) { try { cancelAnimationFrame(A3.raf); } catch (e) { /**/ } A3.raf = 0; }
+    if (A3.wait) { clearTimeout(A3.wait); A3.wait = 0; }
+    S.recording = true;
+    var t0 = performance.now();
+    var parts = [];
+    var i = 0;
+
+    function done(ok, extra) {
+      S.recording = false;
+      chip.remove();
+      if (A3.on) animNudge();              // hand the clock back to the live loop
+      var payload = { ok: ok, n: Date.now() };
+      if (extra) Object.keys(extra).forEach(function (k) { payload[k] = extra[k]; });
+      Shiny.setInputValue("hype3d_record_done", payload, { priority: "event" });
+    }
+
+    function step() {
+      if (cancelled) { done(false, { err: "cancelled" }); return; }
+      if (!containerVisible()) {
+        done(false, { err: "the 3D view was hidden during capture" });
+        return;
+      }
+      if (i >= frames) {
+        var blob = new Blob(parts, { type: "video/x-motion-jpeg" });
+        var mode = blob.size > 1000
+          ? deliverRecording(blob, msg.input_id, "view3d.mjpeg") : "empty";
+        done(mode !== "empty",
+             { mode: mode, bytes: blob.size, frames: frames, fps: fps });
+        return;
+      }
+      label.textContent = "Building 3D video, frame " + (i + 1) + " of " + frames;
+      try {
+        var t = t0 + i * (1000.0 / fps);
+        if (A3.on && Object.keys(A3.parts).length) animDraw(t); else render();
+        A3.lastTick = performance.now();
+        // drawImage in the SAME task as the synchronous render: with
+        // preserveDrawingBuffer off the GL buffer is only valid until we yield.
+        octx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+      } catch (e) {
+        done(false, { err: String(e) });
+        return;
+      }
+      i += 1;
+      off.toBlob(function (b) {
+        if (b) parts.push(b);
+        step();
+      }, "image/jpeg", 0.9);
+    }
+    step();
+  }
+
   function register() {
     if (!(window.Shiny && Shiny.addCustomMessageHandler)) return false;
     // shiny:connected fires again on every reconnect, and Shiny's addCustomMessageHandler
@@ -1472,6 +2135,65 @@
     add("hype3d_layer", onLayerMessage);
     add("hype3d_vis", onVisMessage);
     add("hype3d_clear", onClearMessage);
+    // Live restyle of an existing named layer's actors (flow-path line styling) — a light
+    // message so style changes never re-send geometry. Unknown keys are a silent no-op.
+    add("hype3d_style", function (msg) {
+      var L = msg && msg.key ? S.layers[msg.key] : null;
+      if (msg && msg.key === "terrain" && typeof msg.opacity === "number") {
+        // The DEM pane's opacity slider owns the terrain surface. Remembered so the
+        // wireframe toggle (which dims terrain) respects the lower of the two, and
+        // applied through the same path so the rules never fight.
+        S.terrainOpacity = Math.max(0, Math.min(msg.opacity, 1));
+        applyWireframe();
+        return;
+      }
+      if (!L) return;
+      (L.actors || []).forEach(function (a) {
+        var p = a.getProperty();
+        if (msg.color && /^#[0-9a-fA-F]{6}$/.test(msg.color)) {
+          p.setColor(parseInt(msg.color.slice(1, 3), 16) / 255,
+                     parseInt(msg.color.slice(3, 5), 16) / 255,
+                     parseInt(msg.color.slice(5, 7), 16) / 255);
+        }
+        if (typeof msg.width === "number" && msg.width > 0) p.setLineWidth(msg.width);
+        if (typeof msg.opacity === "number") p.setOpacity(Math.max(0, Math.min(msg.opacity, 1)));
+        if (typeof msg.visible === "boolean") a.setVisibility(msg.visible);
+      });
+      if (L.ctf && L.zr && msg.color && /^#[0-9a-fA-F]{6}$/.test(msg.color)) {
+        // Depth-shaded line layers color through their CTF (actor color is
+        // ignored): re-ramp it so line restyles keep working.
+        var cr = parseInt(msg.color.slice(1, 3), 16) / 255;
+        var cg = parseInt(msg.color.slice(3, 5), 16) / 255;
+        var cb = parseInt(msg.color.slice(5, 7), 16) / 255;
+        L.ctf.removeAllPoints();
+        L.ctf.addRGBPoint(L.zr[0], cr * 0.55, cg * 0.55, cb * 0.55);
+        L.ctf.addRGBPoint(L.zr[1], cr, cg, cb);
+      }
+      render();
+    });
+    // Model grid pane's 3D display controls (opacity + wire/edge color).
+    add("hype3d_grid_style", function (msg) {
+      S.gridStyle = {
+        opacity: (msg && typeof msg.opacity === "number"
+                  ? Math.max(0.05, Math.min(msg.opacity, 1)) : 1),
+        color: (msg && msg.color) || null,
+      };
+      applyGridStyle();
+    });
+    // 3-D view recording: static camera for msg.seconds. mode "frames" =
+    // deterministic frame-stepped MJPEG capture (server assembles a constant-rate
+    // MP4); default = live MediaRecorder webm (the no-ffmpeg fallback). Either
+    // way the result reaches the server through the hidden msg.input_id input.
+    add("hype3d_record", function (msg) {
+      try {
+        if (msg && msg.mode === "frames") recordFrames(msg);
+        else record3d(msg || {});
+      } catch (e) {
+        Shiny.setInputValue("hype3d_record_done",
+                            { ok: false, err: String(e), n: Date.now() },
+                            { priority: "event" });
+      }
+    });
     // Model-grid pane checkbox (app.py grid_wireframe) — the sole wireframe control
     add("hype3d_wire", function (msg) {
       S.wireframe = !!(msg && msg.on);

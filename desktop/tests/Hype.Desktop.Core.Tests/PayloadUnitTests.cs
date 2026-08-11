@@ -35,12 +35,12 @@ internal sealed class FakeSource : IPayloadSource
 
 public sealed class LatestManifestTests
 {
-    private static readonly string[] Official = ["https://github.com/gtmenichino/hype-app/releases/download/"];
+    private static readonly string[] Official = ["https://github.com/USACE-WRISES/hype-app/releases/download/"];
 
     private static string Json(
         string envVersion = "env-cp312-4f9a2c1b",
         string appsRequires = "env-cp312-4f9a2c1b",
-        string envUrl = "https://github.com/gtmenichino/hype-app/releases/download/x/env.zip",
+        string envUrl = "https://github.com/USACE-WRISES/hype-app/releases/download/x/env.zip",
         string sha = "AB12CD34AB12CD34AB12CD34AB12CD34AB12CD34AB12CD34AB12CD34AB12CD34",
         int schema = 1,
         string minShell = "1.0.0") => $$"""
@@ -51,7 +51,7 @@ public sealed class LatestManifestTests
             "env": { "version": "{{envVersion}}", "url": "{{envUrl}}",
                      "sha256": "{{sha}}", "sizeBytes": 1000, "installedSizeBytes": 3000, "python": "3.12.11" },
             "apps": { "version": "apps-2026.07.06-abc1234",
-                      "url": "https://github.com/gtmenichino/hype-app/releases/download/x/apps.zip",
+                      "url": "https://github.com/USACE-WRISES/hype-app/releases/download/x/apps.zip",
                       "sha256": "{{sha}}", "sizeBytes": 500, "installedSizeBytes": 800,
                       "requiresEnv": "{{appsRequires}}" }
           }

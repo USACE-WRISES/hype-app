@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional, Tuple
 
-_UA = "HYPE-hyporheic/1.0 (https://github.com/gtmenichino/hype-app)"
+_UA = "HYPE-hyporheic/1.0 (https://github.com/USACE-WRISES/hype-app)"
 _PHOTON = "https://photon.komoot.io/api/"
 _NOMINATIM = "https://nominatim.openstreetmap.org/search"
 _CONUS = (39.5, -98.35)     # bias results toward the lower-48

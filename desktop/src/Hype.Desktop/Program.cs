@@ -9,9 +9,9 @@ internal static class Program
 {
     /// <summary>The one URL every installed shell polls for payload updates (rolling prerelease asset).</summary>
     private const string OfficialManifestUrl =
-        "https://github.com/gtmenichino/hype-app/releases/download/desktop-current/latest-desktop.json";
+        "https://github.com/USACE-WRISES/hype-app/releases/download/desktop-current/latest-desktop.json";
 
-    private const string OfficialDownloadPrefix = "https://github.com/gtmenichino/hype-app/releases/download/";
+    private const string OfficialDownloadPrefix = "https://github.com/USACE-WRISES/hype-app/releases/download/";
 
     [STAThread]
     private static int Main(string[] args)

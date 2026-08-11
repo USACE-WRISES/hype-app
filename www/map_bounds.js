@@ -29,7 +29,8 @@
       if (window.Shiny && window.Shiny.setInputValue) {
         window.Shiny.setInputValue("map_bounds", {
           west: Math.min(a.lng, b.lng), south: Math.min(a.lat, b.lat),
-          east: Math.max(a.lng, b.lng), north: Math.max(a.lat, b.lat)
+          east: Math.max(a.lng, b.lng), north: Math.max(a.lat, b.lat),
+          w: Math.round(w), h: Math.round(h)   // px, so the video matches the viewport
         });
       }
     } catch (e) { /* map not ready — next moveend will report */ }
@@ -52,6 +53,11 @@
     map.on("moveend zoomend", function () { report(map); });
     report(map);
     guardVectors(map);
+    // On-demand refresh for consumers that read map_bounds server-side at a click
+    // (the Export menu): a pane/window resize with no pan since leaves the last
+    // report stale, and an export sized from it letterboxes. Same-batch ordering
+    // means a synchronous re-report lands before the click's own event input.
+    window.__hypeReportBounds = function () { report(map); };
   }
 
   // ---- big-zoom vector guard --------------------------------------------------------------

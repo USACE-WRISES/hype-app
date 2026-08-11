@@ -147,3 +147,67 @@ def test_open_never_appends_suffix(tmp_path):
     raw = str(tmp_path / "SiteA")
     assert interpret_typed_target(raw, purpose="open_project") == \
         (tmp_path / "SiteA", None)
+
+
+# ---------------------------------------------------------------- open purposes
+
+def test_open_purposes_hold_only_the_project_open():
+    # The comparison workspace routes its picks through its own comparison_* purposes
+    # (a separate dispatcher), so this set is back to the one true open flow.
+    assert pathpick.OPEN_PURPOSES == frozenset({"open_project"})
+
+
+# ---------------------------------------------------------------- reference map layers
+
+def test_reference_file_quote_strip_and_ok(tmp_path):
+    p = tmp_path / "parcels.shp"
+    p.write_bytes(b"\x00")
+    assert pathpick.interpret_reference_file(f'"{p}"') == (p, None)
+    assert pathpick.interpret_reference_file(str(p)) == (p, None)
+
+
+def test_reference_file_rules(tmp_path):
+    # empty / relative / directory / wrong suffix / nonexistent, each its own message
+    assert pathpick.interpret_reference_file("  ") == (None, pathpick.MSG_REF_EMPTY)
+    assert pathpick.interpret_reference_file("parcels.shp") == (None, pathpick.MSG_ABS)
+    assert pathpick.interpret_reference_file(str(tmp_path)) == (None, pathpick.MSG_REF_DIR)
+    doc = tmp_path / "notes.txt"
+    doc.write_text("x", encoding="utf-8")
+    assert pathpick.interpret_reference_file(str(doc)) == (None, pathpick.MSG_REF_KIND)
+    assert pathpick.interpret_reference_file(str(tmp_path / "gone.tif")) == \
+        (None, pathpick.MSG_REF_MISSING)
+
+
+def test_reference_suffixes_stay_in_sync_with_the_display_module():
+    from hype_app import map_layers
+    assert pathpick.REFERENCE_SUFFIXES == frozenset(
+        map_layers.RASTER_SUFFIXES | map_layers.VECTOR_SUFFIXES)
+
+
+# ---------------------------------------------------------------- local DEM raster
+
+def test_dem_file_quote_strip_and_ok(tmp_path):
+    p = tmp_path / "site_dem.tif"
+    p.write_bytes(b"\x00")
+    assert pathpick.interpret_dem_file(f'"{p}"') == (p, None)
+    assert pathpick.interpret_dem_file(str(p)) == (p, None)
+
+
+def test_dem_file_rules(tmp_path):
+    # empty / relative / directory / wrong suffix / nonexistent, each its own message
+    assert pathpick.interpret_dem_file("  ") == (None, pathpick.MSG_DEM_EMPTY)
+    assert pathpick.interpret_dem_file("site_dem.tif") == (None, pathpick.MSG_ABS)
+    assert pathpick.interpret_dem_file(str(tmp_path)) == (None, pathpick.MSG_REF_DIR)
+    vrt = tmp_path / "mosaic.vrt"                       # a map-layer suffix, NOT a DEM one
+    vrt.write_text("x", encoding="utf-8")
+    assert pathpick.interpret_dem_file(str(vrt)) == (None, pathpick.MSG_DEM_KIND)
+    assert pathpick.interpret_dem_file(str(tmp_path / "gone.tif")) == \
+        (None, pathpick.MSG_REF_MISSING)
+
+
+def test_dem_suffixes_stay_in_sync_with_the_import_module(tmp_path):
+    from hype_app import dem
+    for suffix in dem.DEM_SUFFIXES:                     # every importable suffix passes
+        p = tmp_path / f"a{suffix}"
+        p.write_bytes(b"\x00")
+        assert pathpick.interpret_dem_file(str(p)) == (p, None)

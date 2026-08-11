@@ -66,7 +66,7 @@ jobs:
             --packDir desktop/publish `
             --mainExe HypeDesktop.exe `
             --packTitle 'HYPE Desktop' `
-            --packAuthors 'gtmenichino' `
+            --packAuthors 'USACE-WRISES' `
             --icon desktop/resources/icon.ico
 
       - name: Upload release (installer, portable, deltas, RELEASES feed)

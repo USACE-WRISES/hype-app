@@ -22,6 +22,9 @@ INPUT_SNAPSHOT_SCHEMA_VERSION = "assessment-input-snapshot/2.0"
 
 
 class SiteMetadata(HypeModel):
+    # Stable across Save As; kept in the frozen input identity as well as project state so
+    # read-only consumers need not infer a site from names or paths.
+    site_id: str | None = None
     site_name: str | None = None
     analyst: str | None = None
     organization: str | None = None
@@ -127,7 +130,13 @@ class AssessmentInputSnapshot(HypeModel):
     @property
     def input_hash(self) -> str:
         """Canonical hash of the whole snapshot (excludes this computed field itself)."""
-        return stable_hash(self.model_dump(mode="json", exclude={"input_hash"}))
+        payload = self.model_dump(mode="json", exclude={"input_hash"})
+        # site_id is collection/project identity, not a model input. Excluding it also keeps
+        # hashes from pre-identity projects stable when their snapshots validate under this
+        # additive field.
+        if isinstance(payload.get("site"), dict):
+            payload["site"].pop("site_id", None)
+        return stable_hash(payload)
 
 
 __all__ = [

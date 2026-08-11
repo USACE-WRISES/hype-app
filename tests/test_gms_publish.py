@@ -132,4 +132,5 @@ def test_porosity_prefers_hz_stats_when_including_hz(tmp_path):
 
 
 def test_export_dirs_ties_to_publish_name():
-    assert bundle.EXPORT_DIRS == (publish.GMS_DIRNAME,)
+    assert publish.GMS_DIRNAME in bundle.EXPORT_DIRS
+    assert bundle.EXPORT_DIRS[0] == publish.GMS_DIRNAME

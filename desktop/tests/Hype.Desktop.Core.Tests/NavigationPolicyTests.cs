@@ -82,7 +82,7 @@ public sealed class NavigationPolicyTests
     }
 
     [Theory]
-    [InlineData("https://github.com/gtmenichino/hype-app")]
+    [InlineData("https://github.com/USACE-WRISES/hype-app")]
     [InlineData("https://basemap.nationalmap.gov/arcgis/rest/services")]
     [InlineData("http://example.com")]
     public void ExternalHttp_GoesToSystemBrowser(string url)

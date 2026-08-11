@@ -284,3 +284,25 @@ def test_legacy_state_without_meta_passes_through(tmp_path):
     assert "project_name" not in st
     assert "project_units" not in st
     assert "project_created" not in st
+
+
+def test_fp_line_style_state_keys_round_trip(tmp_path):
+    """The flow-path line display prefs ride project state (app.py _project_state ->
+    restore). This pins the five key names both ends must agree on."""
+    src = tmp_path / "session_fp"
+    src.mkdir()
+    _make_workspace(src)
+    state = {"format_version": 2,
+             "fp_line_show": False, "fp_line_weight": 4.5, "fp_line_opacity": 0.35,
+             "fp_line_mode": "single", "fp_line_color": "#ba2d8e"}
+    zip_path = bundle.zip_workspace(src, vectors={"reach": _FEATURE}, state=state,
+                                    include_computed=False)
+    dst = tmp_path / "restored"
+    dst.mkdir()
+    out = bundle.restore_workspace(zip_path, dst)
+    st = out["state"]
+    assert st["fp_line_show"] is False
+    assert st["fp_line_weight"] == 4.5
+    assert st["fp_line_opacity"] == 0.35
+    assert st["fp_line_mode"] == "single"
+    assert st["fp_line_color"] == "#ba2d8e"

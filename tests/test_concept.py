@@ -298,7 +298,7 @@ class TestTheReportNode:
 
         kids = [n["id"] for n in ui_tree.NODES if n.get("parent") == "report"]
         assert kids[0] == "report.concept", kids
-        assert kids == ["report.concept", "report.hyd", "report.fn"]
+        assert kids == ["report.concept", "report.hyd", "report.fn", "report.cmp"]
 
     def test_it_is_never_greyed_out(self):
         """`_push_tree_state` builds its disabled set from the non-None `NODE_STEP` entries, and
@@ -312,6 +312,8 @@ class TestTheReportNode:
         prereqs = src[src.index("    PREREQS = {"):src.index("for _fnid in (")]
         assert '"report":' not in prereqs, "the hub is walled off again"
         assert '"report.concept"' not in prereqs
+        # the comparison manager is the same shape: reachable before any run, gated by words
+        assert '"report.cmp"' not in prereqs
         assert 'for _rid in ("report.hyd", "report.fn")' in prereqs
 
     def test_opening_it_never_waits_on_a_report_build(self):

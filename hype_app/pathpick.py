@@ -10,11 +10,33 @@ from __future__ import annotations
 from pathlib import Path
 
 from hype_app.bundle import OS_CRUFT
+from hype_app.dem import DEM_SUFFIXES
+from hype_app.map_layers import RASTER_SUFFIXES, VECTOR_SUFFIXES
 
 MSG_EMPTY = "Enter a full path, for example D:\\Projects\\SiteA\\SiteA.hype."
 MSG_ABS = "Enter an absolute path (e.g. D:\\Projects\\SiteA\\SiteA.hype)."
 MSG_OPEN_DIR = "That is a folder. Enter the path of the .hype file inside it."
 MSG_UNREADABLE = "That path can't be read. Check it and try again."
+
+#: Reference map layers (Map layers tree group) — kept in one place with the module that
+#: displays them so the picker filter and the display path can never drift.
+REFERENCE_SUFFIXES: frozenset[str] = frozenset(RASTER_SUFFIXES | VECTOR_SUFFIXES)
+MSG_REF_EMPTY = "Enter a full path, for example D:\\GIS\\parcels.shp."
+MSG_REF_DIR = "That is a folder. Enter the path of the layer file inside it."
+MSG_REF_KIND = ("That file type isn't supported. Use .tif, .tiff, .vrt, .shp, "
+                ".geojson, or .json.")
+MSG_REF_MISSING = "That file doesn't exist. Check the path and try again."
+
+#: Local-DEM import (DEM pane, Terrain source = Local raster) — suffixes live with the
+#: import module so the picker filter and the importer can never drift.
+MSG_DEM_EMPTY = "Enter a full path, for example D:\\GIS\\site_dem.tif."
+MSG_DEM_KIND = "Use a GeoTIFF (.tif or .tiff)."
+
+#: Purposes that pick an EXISTING .hype for reading. Everything else is a save-side pick
+#: (create semantics: directories resolve to <dir>/<name>.hype, overwrite gates apply).
+#: Purposes that READ an existing main file (no create/overwrite semantics). The comparison
+#: workspace routes its picks through its own comparison_* purposes, never through here.
+OPEN_PURPOSES: frozenset[str] = frozenset({"open_project"})
 
 
 def _dir_full_msg(example: str) -> str:
@@ -61,7 +83,7 @@ def interpret_typed_target(raw: str, *, purpose: str,
         is_dir = p.is_dir()
     except (ValueError, OSError):
         return None, MSG_UNREADABLE
-    is_open = purpose == "open_project"
+    is_open = purpose in OPEN_PURPOSES
     try:
         if is_dir:
             if is_open:
@@ -80,4 +102,54 @@ def interpret_typed_target(raw: str, *, purpose: str,
             return p, None                 # nonexistent-file error stays downstream
         return ensure_hype_suffix(p), None
     except OSError:
+        return None, MSG_UNREADABLE
+
+
+def interpret_dem_file(raw: str) -> tuple[Path | None, str | None]:
+    """Typed-path interpretation for a local DEM raster: an EXISTING GeoTIFF — no create
+    semantics, no suffix appending. Returns (path, None) on success or
+    (None, user_error_message). Filesystem access is read-only probes."""
+    s = raw.strip()
+    for _ in range(2):                     # same symmetric quote-strip as the project picker
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1].strip()
+    if not s:
+        return None, MSG_DEM_EMPTY
+    try:
+        p = Path(s)
+        if not p.is_absolute():
+            return None, MSG_ABS
+        if p.is_dir():
+            return None, MSG_REF_DIR
+        if p.suffix.lower() not in DEM_SUFFIXES:
+            return None, MSG_DEM_KIND
+        if not p.is_file():
+            return None, MSG_REF_MISSING
+        return p, None
+    except (ValueError, OSError):
+        return None, MSG_UNREADABLE
+
+
+def interpret_reference_file(raw: str) -> tuple[Path | None, str | None]:
+    """Typed-path interpretation for a reference map layer: an EXISTING raster/vector
+    file — no create semantics, no suffix appending. Returns (path, None) on success or
+    (None, user_error_message). Filesystem access is read-only probes."""
+    s = raw.strip()
+    for _ in range(2):                     # same symmetric quote-strip as the project picker
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            s = s[1:-1].strip()
+    if not s:
+        return None, MSG_REF_EMPTY
+    try:
+        p = Path(s)
+        if not p.is_absolute():
+            return None, MSG_ABS
+        if p.is_dir():
+            return None, MSG_REF_DIR
+        if p.suffix.lower() not in REFERENCE_SUFFIXES:
+            return None, MSG_REF_KIND
+        if not p.is_file():
+            return None, MSG_REF_MISSING
+        return p, None
+    except (ValueError, OSError):
         return None, MSG_UNREADABLE

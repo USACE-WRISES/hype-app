@@ -19,19 +19,10 @@ cache/
 # 400+ MB of installed software; the app bundles only what it needs (hype_app/data/ras_template,
 # bin/ras2025)
 /reference/
-# local GMS 10.7 reference project (1.4 GB installed example; the app ships only the
-# distilled template in hype_app/data/gms_template)
-/notes/Example_GMS_10_7_Project/
-# local GMS example project with MT3DMS (1.6 GB) — same reference-only status as above
-/notes/Example_GMS_Project_with_MT3DMS/
-# engine/GMS run artifacts written while verifying the GMS export (h5/pth/nam scratch)
-/notes/GMS_export_check/
-/notes/GMS_template_check/
-# local working documents (manuscript drafts, IPR factsheet decks incl. a 60 MB pptx,
-# conceptual-figure authoring sources) — the shipped figure lives in hype_app/data/figure
-/notes/Journal_Publication_Drafting/
-/notes/workunit_factsheet_progress_for_IPR/
-/notes/functional_screening_conceptual_figure/
+# local working notes — spec drafts, reference GMS projects (multi-GB installed examples),
+# manuscript + IPR material, figure-authoring sources. Never published; every asset the app
+# ships lives under hype_app/data instead.
+/notes/
 # stray engine log from dev runs at the repo root
 /mpath7.log
 # per-developer Claude Code settings (permissions allowlist); launch.json stays shared

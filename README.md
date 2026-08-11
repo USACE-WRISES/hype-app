@@ -10,6 +10,15 @@ core + FloPy) on **Posit Connect Cloud** (Linux). Modeled on the EASI app.
 > **Still deploy `smoke_app.py` first** to confirm the Connect Cloud sandbox executes the
 > bundled Linux binary, then deploy `app.py`.
 
+## Install HYPE Desktop (Windows)
+
+Download `HypeDesktop-win-Setup.exe` from the
+[latest release](https://github.com/USACE-WRISES/hype-app/releases/latest) and run it.
+Per-user install, no admin rights; requires the Microsoft WebView2 Runtime (ships with
+Edge on Windows 10/11). First launch downloads the modeling runtime (~450 MB, resumable,
+sha256-verified). After that the app keeps itself current: app updates ship on every push
+to `main`, and shell updates arrive with each `v*` release (see `desktop/RELEASING.md`).
+
 ## What it does
 
 Six stages, shown as the numbered stage bar under the header:
@@ -79,7 +88,7 @@ binaries), so Git LFS is **not** needed for this path — see *Source control* b
 
 ## Source control (GitHub + Git LFS)
 
-The repo lives at **[gtmenichino/hype-app](https://github.com/gtmenichino/hype-app)**
+The repo lives at **[USACE-WRISES/hype-app](https://github.com/USACE-WRISES/hype-app)**
 (public). The ~49 MB Linux `bin/linux/{mf6,mp7}` binaries are tracked with **Git LFS**
 (`.gitattributes`), so clones stay lean:
 ```bash

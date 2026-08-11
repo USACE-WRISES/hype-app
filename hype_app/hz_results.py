@@ -103,6 +103,71 @@ def flux_arrays(hz_dir) -> dict | None:
         return None
 
 
+def flux_metrics(hz_stats: dict, hz_dir, *, transit_rows: bool = True) -> dict:
+    """Flux-weighted §8.3 interface-pass metrics as a dict bundle: exchange (m3/s),
+    transit_times, transit_weights, path_depths (returning subset; None when the depth pass did
+    not run), censored, transit_rows. The model budget is m3/day; the canonical results +
+    streamflow are m3/s, hence the /86400.
+
+    Lives here rather than in `app.py` because it captures nothing from the session: it is a
+    pure read of one run directory, and the scenario-envelope build calls it from the report
+    WORKER THREAD, where a `server()` closure has no business being.
+
+    `transit_rows=False` skips the per-particle row list. Only the Basecase needs it (the
+    transit CSV and the RTD figure); building it for each alternative in a sweep would allocate
+    a dict per particle per scenario for data nothing reads.
+
+    THE WEIGHTS STAY RAW m3/day. `functions.screen` requires that basis (its Sigma-w is Q_HEF);
+    only `ExchangeAccounting` and the per-row `flow_weight` below are converted."""
+    from .metrics import ExchangeAccounting
+    DAY = 86400.0
+    out = {"exchange": None, "transit_times": None, "transit_weights": None,
+           "path_depths": None, "path_lengths": None, "censored": None, "transit_rows": [],
+           "downwelling_cells": None, "iface_ppc": None}
+    acct = ((hz_stats or {}).get("flux") or {}).get("accounting") \
+        if isinstance((hz_stats or {}).get("flux"), dict) else None
+    if acct:
+        # Provenance of the returning-path count, straight off the saved accounting so an
+        # older project reports whatever density IT was run at.
+        out["downwelling_cells"] = acct.get("n_stream_cells_downwelling")
+        out["iface_ppc"] = acct.get("particles_per_cell")
+        out["exchange"] = ExchangeAccounting(
+            total_downwelling=acct["total_downwelling"] / DAY,
+            returning_hyporheic=acct["returning"] / DAY,
+            losing_to_sides=acct["losing"] / DAY,
+            unresolved=acct["unresolved"] / DAY)
+        if acct.get("total_downwelling"):
+            out["censored"] = acct["unresolved"] / acct["total_downwelling"]
+    fx = flux_arrays(hz_dir) if hz_dir else None
+    if fx is not None:
+        ret = fx["cls"] == 1
+        has_depth = "max_depth_m" in fx
+        # Path LENGTH, for the particulate module. Written by the same optional pathline pass
+        # as the depth and absent from artifacts saved before it existed, so the microplastic
+        # capture check degrades to "re-run the calculations" instead of breaking.
+        has_length = "path_length_m" in fx
+        if ret.any():
+            out["transit_times"] = fx["time_days"][ret]
+            out["transit_weights"] = fx["weight"][ret]
+            if has_depth:
+                out["path_depths"] = fx["max_depth_m"][ret]
+            if has_length:
+                out["path_lengths"] = fx["path_length_m"][ret]
+        cls_names = {0: "unresolved", 1: "returning", 2: "losing",
+                     3: "gaining", 4: "throughflow"}
+        if transit_rows:
+            out["transit_rows"] = [
+                {"particle_id": int(i), "source_cell": int(fx["source_node"][i]),
+                 "flow_weight": float(fx["weight"][i] / DAY),
+                 "endpoint_class": cls_names.get(int(fx["cls"][i]), "unresolved"),
+                 "transit_time_days": float(fx["time_days"][i]),
+                 "max_depth_m": (float(fx["max_depth_m"][i]) if has_depth
+                                 and fx["max_depth_m"][i] == fx["max_depth_m"][i] else None),
+                 "termination": int(fx["status"][i])}
+                for i in range(len(fx["cls"]))]
+    return out
+
+
 def volume_arrays(hz_dir, cls: str) -> tuple[np.ndarray, np.ndarray] | None:
     """(points (P,3) absolute model coords, quads (Q,4)) of the zone's exterior
     shell, for scene.volume_payload."""

@@ -212,3 +212,42 @@ class TestWatershedDisplayFeatures:
         assert watershed_display_features(
             {"featurecollection": [{"name": "globalwatershedpoint",
                                     "feature": {"features": []}}]}) == (None, None)
+
+
+def test_results_migration_reaches_2_5_and_calibration_round_trips():
+    """assessment-results 2.4 -> 2.5 added the observation-well calibration table. The chain
+    stamps forward, an old payload validates with `calibration` absent, and a payload carrying
+    one round-trips through the model unchanged."""
+    from hype_app.contracts import AssessmentResultsV2, GroundwaterCalibration
+    old = {"schema_version": "assessment-results/2.4", "assessment_id": "A1",
+           "input_hash": "a" * 64}
+    out = migrate("assessment-results", old)
+    assert out["schema_version"] == SCHEMA_VERSIONS["assessment-results"]
+    res = AssessmentResultsV2.model_validate(out)
+    assert res.calibration is None
+
+    payload = {"schema_version": SCHEMA_VERSIONS["assessment-results"],
+               "assessment_id": "A1", "input_hash": "a" * 64,
+               "calibration": {
+                   "wells": [{"well_id": "w1", "name": "OW-1", "lat": 43.7, "lon": -72.3,
+                              "screen_elevation_m": 191.5, "observed_head_m": 192.1,
+                              "model_layer": 8, "computed_head_m": 192.34,
+                              "residual_m": 0.24, "note": None}],
+                   "pairs": [{"pair_id": "p1", "well_a": "OW-1", "well_b": "OW-2",
+                              "distance_m": 141.2, "computed_gradient": 0.0021,
+                              "observed_gradient": None, "note": None}],
+                   "stats": {"n_observed": 1, "mean_error_m": 0.24,
+                             "mean_absolute_error_m": 0.24, "rmse_m": 0.24}}}
+    res = AssessmentResultsV2.model_validate(payload)
+    assert res.calibration.wells[0].name == "OW-1"
+    assert res.calibration.pairs[0].computed_gradient == 0.0021
+    assert res.calibration.stats.n_observed == 1
+    again = AssessmentResultsV2.model_validate(res.model_dump(mode="json"))
+    assert again.calibration == res.calibration
+
+    # extra="forbid" still rejects a typoed calibration field
+    import pytest as _pytest
+    bad = dict(payload)
+    bad["calibration"] = {"wells": [], "pairz": []}
+    with _pytest.raises(Exception):
+        AssessmentResultsV2.model_validate(bad)

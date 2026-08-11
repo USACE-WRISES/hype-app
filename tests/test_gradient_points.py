@@ -243,3 +243,31 @@ def test_downstream_wse_warnings_none_and_equal_values():
             _wrow("dl", "left", 1.0, None),
             _wrow("ur", "right", 0.0, 190.0), _wrow("dr", "right", 1.0, 190.0)]
     assert downstream_wse_warnings(rows) == set()
+
+
+# --- session-reset hygiene -----------------------------------------------------------------
+
+def test_gradient_points_reset_on_project_switch_and_reach_clear():
+    """New project / project switch goes through _reset_memory_state, NOT _clear_reach_all —
+    for years only the latter cleared the gradient reactives, so a fresh project inherited
+    the previous project's gradient points until a restore overwrote them. Both reset paths
+    must clear the trio (and the mirror's change-guard dict in the memory reset), the same
+    rule the observation wells shipped with."""
+    import re
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+
+    def body(name):
+        m = re.search(
+            rf"\n(    (?:async )?def {name}\b.*?)(?=\n    (?:async )?def |\n    @|\nclass )",
+            src, flags=re.S)
+        assert m, f"{name} not found in app.py"
+        return m.group(1)
+
+    for fn in ("_reset_memory_state", "_clear_reach_all"):
+        b = body(fn)
+        assert "grad_pts.set([])" in b, fn
+        assert "grad_adding.set(None)" in b, fn
+        assert "ref_slope_override.set(None)" in b, fn
+    assert "_gpt_seen.clear()" in body("_reset_memory_state")

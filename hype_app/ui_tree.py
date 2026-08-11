@@ -1,9 +1,12 @@
 """Pure model for the layer tree (left panel) — NO Shiny imports, no reactives.
 
 The tree is a FIXED hierarchy (hype-app has one reach, one DEM, four boundary sides, one
-surface-water model, one groundwater model — no dynamic feature lists), so the model is a
-flat ordered list with parent links. app.py gathers live state (statuses, checkbox values,
-reachability) and calls build_tree_payload(); www/tree.js renders/reconciles the DOM.
+surface-water model, one groundwater model), so the model is a flat ordered list with parent
+links. app.py gathers live state (statuses, checkbox values, reachability) and calls
+build_tree_payload(); www/tree.js renders/reconciles the DOM. The ONE dynamic exception is
+per-session feature rows (user Map layers) passed through build_tree_payload(extra_rows=...):
+NODES itself is module-global and shared across sessions, so per-user rows must never be
+appended here — they ride the payload only.
 
 Node ids are dotted paths ("bnd.left", "gw.res.paths"). NODE_STEP maps each node onto the
 wizard step whose machinery drives it — BEHAVIORAL, not hierarchical (e.g. "sw.wetted" maps
@@ -67,6 +70,10 @@ NODES: list[dict] = [
      "check": False, "layers": ()},                       # hidden until a run first starts
     {"id": "gw.alt", "label": "Hydraulic Alternatives", "parent": "gw", "group": False,
      "check": False, "layers": ()},   # order-of-magnitude K / gradient sweep vs the Basecase
+    # Observation wells: field data compared against the Basecase run (calibration). Pure
+    # observation — never a model input, never hashed. The checkbox drives the marker layer.
+    {"id": "gw.wells", "label": "Observation wells", "parent": "gw", "group": False,
+     "check": True, "layers": ("obs_wells",)},
     {"id": "gw.res", "label": "Results", "parent": "gw", "group": True,
      "check": True, "layers": ()},
     {"id": "gw.res.head", "label": "Hydraulic head", "parent": "gw.res", "group": False,
@@ -160,6 +167,16 @@ NODES: list[dict] = [
      "check": False, "layers": ()},
     {"id": "report.fn", "label": "Functional Screening Report", "parent": "report", "group": False,
      "check": False, "layers": ()},
+    # Desktop only (app._push_tree_state hides it in cloud: comparing reads OTHER projects'
+    # folders off the local filesystem). A MANAGER pane plus a built document, never a live view.
+    {"id": "report.cmp", "label": "Cross-Site Comparison", "parent": "report", "group": False,
+     "check": False, "layers": ()},
+    # Desktop only (cloud has no local filesystem for the linked files). The group node is
+    # static; the per-layer child rows are DYNAMIC (one per user reference file) and ride
+    # build_tree_payload(extra_rows=...) with ids "ml:<uid>" — they are NOT in NODES, and
+    # app.py's tree_event dispatch routes them before the static-id guards.
+    {"id": "maplyr", "label": "Map layers", "parent": None, "group": True,
+     "check": True, "layers": ()},
     {"id": "base", "label": "Basemaps", "parent": None, "group": True,
      "check": True, "layers": ()},
     {"id": "base.imagery", "label": "USGS Imagery", "parent": "base", "group": False,
@@ -189,6 +206,7 @@ NODE_STEP: dict[str, str | None] = {
     "sw.wse": _SURFACE, "sw.depth": _SURFACE,
     "gw": _MESH, "gw.k": _K, "gw.mesh": _MESH, "gw.run": _RUN,
     "gw.alt": _RUN,
+    "gw.wells": _MESH,          # armed-click placement rides the mesh step's crosshair branch
     "gw.res": _RESULTS, "gw.res.head": _RESULTS, "gw.res.paths": _RESULTS,
     "gw.res.paths.hyp": _RESULTS, "gw.res.paths.los": _RESULTS,
     "gw.res.paths.gain": _RESULTS, "gw.res.paths.thru": _RESULTS,
@@ -205,6 +223,11 @@ NODE_STEP: dict[str, str | None] = {
     # None, so it is NEVER greyed: `app._push_tree_state` builds its disabled set from the
     # non-None entries here, and the Conceptual Model is openable with no run behind it.
     "report.concept": None,
+    # None for the same reason: the comparison manager must be reachable with no local run
+    # (foreign sites supply results), so only its Open gate asks for anything.
+    "report.cmp": None,
+    # None: reference layers are usable at any point in the workflow (basemaps precedent).
+    "maplyr": None,
     "base": None, "base.imagery": None, "base.topo": None, "base.hydro": None,
 }
 
@@ -362,7 +385,7 @@ def check_subtree(node_id: str) -> list[str]:
 
 
 def build_tree_payload(*, selected=None, statuses=None, checks=None, disabled=(),
-                       hidden=(), dimmed=(), fly=None) -> dict:
+                       hidden=(), dimmed=(), fly=None, extra_rows=()) -> dict:
     """The hype_tree custom-message payload: a flat, ordered node list for www/tree.js.
 
     statuses: {id: "idle"|"running"|"done"|"error"} (missing -> "none" = no icon)
@@ -372,6 +395,12 @@ def build_tree_payload(*, selected=None, statuses=None, checks=None, disabled=()
     dimmed:   checked ids whose layers are nevertheless hidden by an unchecked ancestor
               group — the row dims so the parent override stays visible
     fly:      optional [[south, west], [north, east]] bounds for a tree-initiated zoom
+    extra_rows: FULLY-FORMED dynamic rows (per-session feature lists, e.g. Map layers):
+              each dict carries the same keys as a static row (id/label/parent/depth/
+              group/status/check/disabled/dim) and is inserted directly AFTER its
+              parent's row (tree.js renders strict array order, so appending at the end
+              would draw them at the bottom of the tree). Rows whose parent is hidden
+              are dropped with it.
     """
     statuses = statuses or {}
     checks = checks or {}
@@ -403,6 +432,15 @@ def build_tree_payload(*, selected=None, statuses=None, checks=None, disabled=()
             "disabled": nid in disabled,
             "dim": nid in dimmed,
         })
+    if extra_rows:
+        by_parent: dict = {}
+        for r in extra_rows:
+            by_parent.setdefault(r.get("parent"), []).append(dict(r))
+        merged = []
+        for row in out:
+            merged.append(row)
+            merged.extend(by_parent.pop(row["id"], ()))
+        out = merged                       # extras whose parent didn't render drop with it
     payload = {"selected": selected, "nodes": out}
     if fly:
         payload["fly"] = fly

@@ -227,6 +227,9 @@ def build_results(
     group_hashes: dict | None = None,
     app_version: str | None = None,
     model_version: str | None = None,
+    #: Observed-vs-computed heads at observation wells (GroundwaterCalibration or None).
+    #: Observation data attached at capture time; it never influences any computed metric.
+    calibration=None,
 ) -> AssessmentResultsV2:
     """Compute every metric and return the immutable results model.
 
@@ -306,7 +309,7 @@ def build_results(
         assessment_id=snapshot.assessment_id, input_hash=snapshot.input_hash,
         input_snapshot=snapshot, group_hashes=group_hashes or snapshot.group_hashes(),
         connectivity=conn, residence_time=rtd, zone=zone, thresholds=thresholds,
-        functions=functions, warnings=warnings,
+        functions=functions, calibration=calibration, warnings=warnings,
         untested_uncertainty=["K and soil configuration", "Streamflow", "Geometry",
                               "Grid resolution", "Porosity",
                               "Thermal, chemical, and biological conditions"],

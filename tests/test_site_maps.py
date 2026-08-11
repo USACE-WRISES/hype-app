@@ -179,3 +179,39 @@ def test_logtime_norm_guards():
     assert n.vmin > 0 and n.vmax > n.vmin
     n2 = _logtime_norm([5.0, 5.0])                              # constant times -> widened span
     assert n2.vmax >= n2.vmin * 10
+
+def test_head_map_draws_observation_wells(monkeypatch, fake_spatial):
+    """`wells_lonlat` in the spatial bundle reaches render_head_map as projected wells_xy
+    (markers + labeled names on the calibration figure); absent wells changes nothing."""
+    from pyproj import CRS, Transformer
+
+    from hype_app import figures
+
+    monkeypatch.setattr("hype_app.mesh.fetch_basemap_image", lambda *a, **k: None)
+    tr = Transformer.from_crs(CRS.from_epsg(32617), "EPSG:4326", always_xy=True)
+    lon, lat = tr.transform(500060.0, 4199950.0)
+    fake_spatial = dict(fake_spatial)
+    fake_spatial["wells_lonlat"] = [(lon, lat, "OW-1")]
+
+    seen = {}
+    real = figures.render_head_map
+
+    def spy(**kw):
+        seen["wells_xy"] = kw.get("wells_xy")
+        return real(**kw)
+
+    monkeypatch.setattr(figures, "render_head_map", spy)
+    out = figures.render_map_suite(fake_spatial)
+    assert out.get("map_head") and out["map_head"][:8] == PNG_MAGIC
+    assert seen["wells_xy"] and seen["wells_xy"][0][2] == "OW-1"
+    assert seen["wells_xy"][0][0] == np.float64(500060.0) or abs(
+        seen["wells_xy"][0][0] - 500060.0) < 0.01          # projected back to model metres
+
+    # the direct producer draws with and without wells, and never raises on empty
+    png = real(head_tif=fake_spatial["head_tif"], crs_wkt=fake_spatial["crs_wkt"],
+               bbox=(499990.0, 500130.0, 4199900.0, 4200010.0),
+               wells_xy=[(500060.0, 4199950.0, "OW-1"), (500080.0, 4199960.0, "")])
+    assert png and png[:8] == PNG_MAGIC
+    png2 = real(head_tif=fake_spatial["head_tif"], crs_wkt=fake_spatial["crs_wkt"],
+                bbox=(499990.0, 500130.0, 4199900.0, 4200010.0), wells_xy=None)
+    assert png2 and png2[:8] == PNG_MAGIC

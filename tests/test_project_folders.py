@@ -303,6 +303,9 @@ def test_folder_clash_detects_export_dirs(tmp_path):
     (folder / "inputs").mkdir()
     assert bundle.folder_clash(folder, folder / "New.hype") == \
         (["inputs", "GMS"], False, [])
+    (folder / "aerials").mkdir()
+    assert bundle.folder_clash(folder, folder / "New.hype") == \
+        (["inputs", "GMS", "aerials"], False, [])
 
 
 def test_folder_clash_reports_other_files(tmp_path):
@@ -356,7 +359,7 @@ def test_project_dirs_match_restore_layout():
 def test_export_dirs_contract():
     """EXPORT_DIRS are one-way outputs: in the folder contract for clash/copy purposes,
     but NEVER restore targets (restore must keep dropping their arcs)."""
-    assert bundle.EXPORT_DIRS == ("GMS",)
+    assert bundle.EXPORT_DIRS == ("GMS", "aerials")
     assert not set(bundle.EXPORT_DIRS) & set(bundle.PROJECT_DIRS)
     restored_roots = {v.split("/")[0] for v in bundle._RESTORE_FILES.values()}
     restored_roots |= {dest.split("/")[0] for _, dest in bundle._RESTORE_TREES}
@@ -415,6 +418,22 @@ def test_copy_project_tree_carries_gms(tmp_path):
     assert copied == ["inputs", "model", "ras", "data_sources", "GMS"]
     assert (dst / "GMS" / "Site.gpr").read_bytes() == b"GPR"
     assert not (dst / "GMS.tmp-deadbeef").exists()
+
+
+def test_copy_project_tree_carries_aerials(tmp_path):
+    """Save As carries the aerials reference imagery (EXPORT_DIRS, never zipped)."""
+    src = tmp_path / "SiteA"
+    src.mkdir()
+    _make_workspace(src)
+    (src / "aerials").mkdir()
+    (src / "aerials" / "naip_2022.tif").write_bytes(b"TIF")
+
+    dst = tmp_path / "SiteB"
+    dst.mkdir()
+    copied = bundle.copy_project_tree(src, dst)
+
+    assert copied == ["inputs", "model", "ras", "data_sources", "aerials"]
+    assert (dst / "aerials" / "naip_2022.tif").read_bytes() == b"TIF"
 
 
 def test_copy_project_tree_merges_into_existing_dirs(tmp_path):

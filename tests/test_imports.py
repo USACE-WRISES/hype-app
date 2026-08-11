@@ -48,7 +48,14 @@ HYPE_APP_MODULES = [
     "hype_app.validate",
     "hype_app.alternatives",
     "hype_app.alt_run",    # must import WITHOUT the engine present (child resolves lazily)
+    "hype_app.alt_screening",
     "hype_app.assess",
+    "hype_app.results_lifecycle",
+    # the comparison stack must import WITHOUT report.py's conceptual-figure assets guard
+    "hype_app.comparison",
+    "hype_app.comparison_metrics",
+    "hype_app.comparison_report",
+    "hype_app.contracts.comparison",
 ]
 
 HYPETOOL_MODULES = [

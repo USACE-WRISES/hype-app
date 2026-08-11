@@ -607,6 +607,54 @@ def compile_chd_data(
     return chd_data, len(unique), len(dupes)
 
 
+def guard_chd_bottoms(river_cells, chd_data, botm, idomain, nlay, log=None):
+    """Never hand MF6 a CHD whose head is below its cell bottom (it aborts while reading
+    gwf_model.chd). Side boundaries are botm-filtered in ``compile_chd_data``, but river
+    cells are placed at each column's top ACTIVE layer, and at wetted-edge cells the RAS
+    water surface can sit a few cm below the aggregated bed, putting the head under that
+    layer's bottom. Move such rows down to the shallowest active layer whose bottom clears
+    the head, or drop them (counted) when no layer does. Both lists are repaired together
+    so ``build_gwf_model``'s river/sides split stays consistent and a moved river cell
+    keeps IFACE=6.
+
+    Returns ``(river_cells_out, chd_data_out, n_moved, n_dropped)``. River rows stay
+    tuples, chd rows stay lists.
+    """
+    b3 = np.asarray(botm)
+    idm = np.asarray(idomain) if idomain is not None else None
+    eps = _CHD_MIN_HEAD_ABOVE_BOT
+    nlay = int(nlay)
+    seen = {(int(r[0]), int(r[1]), int(r[2])) for r in river_cells}
+    seen |= {(int(r[0]), int(r[1]), int(r[2])) for r in chd_data}
+    n_moved = n_dropped = 0
+
+    def _repair(rows, as_list):
+        nonlocal n_moved, n_dropped
+        out = []
+        for k, j, i, head in rows:
+            k, j, i, head = int(k), int(j), int(i), float(head)
+            if float(b3[k, j, i]) <= head - eps:
+                out.append([k, j, i, head] if as_list else (k, j, i, head))
+                continue
+            k2 = next((kk for kk in range(k + 1, nlay)
+                       if (idm is None or idm[kk, j, i] == 1)
+                       and float(b3[kk, j, i]) <= head - eps), None)
+            if k2 is None or (k2, j, i) in seen:
+                n_dropped += 1
+                continue
+            seen.add((k2, j, i))
+            out.append([k2, j, i, head] if as_list else (k2, j, i, head))
+            n_moved += 1
+        return out
+
+    river_out = _repair(river_cells, as_list=False)
+    chd_out = _repair(chd_data, as_list=True)
+    if log and (n_moved or n_dropped):
+        log(f"  CHD river/bottom guard: moved {n_moved} cell(s) down to the first layer "
+            f"clearing the head, dropped {n_dropped}.")
+    return river_out, chd_out, n_moved, n_dropped
+
+
 # ----------------------------
 # NEW — WSE edge/endpoint helpers (valid WSE only)
 # ----------------------------
@@ -4380,6 +4428,12 @@ def scenario(
     cfg, idomain: np.ndarray, chd_data: list[list[float]], river_cells: list[tuple[int, int, int, float]],
     write: bool = True, run: bool = True, plot: bool = True, silent: bool = False
 ) -> tuple[flopy.mf6.MFSimulation, flopy.mf6.ModflowGwf]:
+    # Repair CHD rows whose head sits below the assigned layer bottom (MF6 aborts on
+    # head < botm while reading gwf_model.chd). Both lists together, so the river/sides
+    # split below stays consistent and moved river cells keep IFACE=6.
+    river_cells, chd_data, _n_moved, _n_dropped = guard_chd_bottoms(
+        river_cells, chd_data, cfg.botm, idomain, int(cfg.nlay), log=print)
+
     # Build GWF with Option B CHD split
     gwfsim, gwf = build_gwf_model(cfg, chd_data, idomain, river_cells=river_cells)
 

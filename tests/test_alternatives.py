@@ -183,12 +183,23 @@ def test_relaunch_scenarios_retry_vs_continue():
     assert ALL_IDS[0] not in [s.id for s in retry]
 
 
-def test_partial_note_counts_include_the_basecase():
+def test_partial_note_counts_include_the_basecase_and_names_what_did_not_run():
+    """The count says the range is incomplete. The names say WHICH part of the design is missing,
+    which is the difference between a range missing its low-K end and one missing a gradient
+    variant. Reworded 2026-08-02 with the scenario envelope, which is stricter and shows nothing
+    at all when the sweep is partial."""
     full = _manifest(statuses=[AltStatus.completed] * 8)
     assert alt.partial_note(full) is None
     part = _manifest(statuses=[AltStatus.completed] * 4 + [AltStatus.cancelled]
                      + [AltStatus.not_run] * 3)
-    assert alt.partial_note(part) == "Partial scenario range: 5 of 9 runs"
+    note = alt.partial_note(part)
+    assert note.startswith("Partial scenario range: 5 of 9 configured runs completed.")
+    assert "Not completed: " in note
+    # Exactly the runs that did not complete, compared as a LIST rather than by substring:
+    # "Higher K" is a substring of "Higher K + higher gradient", so `in` reports a completed
+    # single-factor run as missing whenever its combined variant is.
+    named = note.split("Not completed: ")[1].rstrip(".").split(", ")
+    assert named == [s.label for s in part.scenarios if s.status != AltStatus.completed]
 
 
 # ---------------------------------------------------------------- ranges
@@ -297,13 +308,18 @@ def test_alternative_range_rows_subset_of_metric_rows(results):
 def test_html_gains_column_and_section_only_with_alternatives(results):
     from hype_app.report import render_html
     plain = render_html(results, app_version="t")
-    assert "Scenario range" not in plain
+    assert "Range across alternatives" not in plain
     assert "Hydraulic Alternatives" not in plain
     html = render_html(_results_with_alternatives(results), app_version="t")
-    assert "Scenario range" in html
+    # Renamed 2026-08-02 with the rest of the sweep vocabulary: this column and the functional
+    # range beneath it are two readings of the same runs, so they say "alternatives" alike.
+    assert "Range across alternatives" in html
     assert "Hydraulic Alternatives" in html
     assert "not confidence intervals" in html
-    assert "2 of 8 alternative runs completed" in html
+    # The note states completion explicitly and names the runs that did not complete, so a partial
+    # hydraulic range in this document can never be mistaken for a full one.
+    assert "2 of 8 configured alternative runs completed" in html
+    assert "Not completed: " in html
     assert "—" not in html.split("Hydraulic Alternatives", 1)[1].split("</details>")[0]
 
 

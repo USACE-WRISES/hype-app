@@ -548,9 +548,11 @@ def render_wse_map(*, wse_tif=None, crs_wkt=None, basemap=None, bbox=None,
 
 
 def render_head_map(*, head_tif=None, crs_wkt=None, basemap=None, bbox=None,
-                    reach_xy=None, domain_xy=None) -> bytes | None:
+                    reach_xy=None, domain_xy=None, wells_xy=None) -> bytes | None:
     """Simulated hydraulic-head contours (top model layer) over the topo basemap, with
-    inline level labels and a head colorbar. Levels/colormap mirror the in-app head layer."""
+    inline level labels and a head colorbar. Levels/colormap mirror the in-app head layer.
+    `wells_xy` = [(x, y, name), ...] observation wells (projected) drawn as labeled markers
+    so calibration points sit in spatial context; an outside-frame well simply clips."""
     try:
         if not bbox:
             return None
@@ -585,6 +587,14 @@ def render_head_map(*, head_tif=None, crs_wkt=None, basemap=None, bbox=None,
         for txt in ax.clabel(cs, inline=True, fontsize=6, fmt=fmt):
             txt.set_path_effects(_halo(1.8))
         drew = _vectors(ax, reach_xy=reach_xy, domain_xy=domain_xy)
+        for wx, wy, wname in (wells_xy or []):
+            ax.plot([wx], [wy], marker="o", ms=4.5, mfc="#15803d", mec="white",
+                    mew=0.9, ls="none", zorder=5)
+            if wname:
+                txt = ax.annotate(str(wname), (wx, wy), xytext=(4, 4),
+                                  textcoords="offset points", fontsize=6,
+                                  color="#111111", zorder=5)
+                txt.set_path_effects(_halo(1.8))
         sm = mpl.cm.ScalarMappable(norm=mpl.colors.Normalize(lo, hi), cmap="viridis")
         sm.set_array([])
         cb = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.03)
@@ -1016,6 +1026,10 @@ def render_map_suite(spatial: dict) -> dict:
         reach_xy = _proj(pv.get("reach_lonlat"))
         domain_xy = _proj(pv.get("domain_lonlat"))
         sides_xy = {k: _proj(v) for k, v in (spatial.get("sides_lonlat") or {}).items() if v}
+        # Observation wells for the head map. Deliberately NOT part of _report_bbox: a stray
+        # outside-domain well must not rescale the shared site-map frame — it just clips.
+        wells_xy = [(x, y, w[2]) for w in (spatial.get("wells_lonlat") or [])
+                    for x, y in [tr.transform(w[0], w[1])]]
         bbox = _report_bbox(xy_lists=[reach_xy, domain_xy], gdfs=[paths_gdf])
         if bbox is None:
             return out
@@ -1036,7 +1050,7 @@ def render_map_suite(spatial: dict) -> dict:
         out["map_wse"] = render_wse_map(wse_tif=spatial.get("wse_tif"), crs_wkt=crs_wkt,
                                         basemap=topo, **common)
         out["map_head"] = render_head_map(head_tif=spatial.get("head_tif"), crs_wkt=crs_wkt,
-                                          basemap=topo, **common)
+                                          basemap=topo, wells_xy=wells_xy, **common)
         out["map_paths"] = render_paths_map(paths_gdf=paths_gdf, basemap=topo, **common)
         out["map_3d"] = render_iso3d(gwf_ws=spatial.get("gwf_ws"),
                                      dem_path=spatial.get("dem_path"), crs_wkt=crs_wkt,

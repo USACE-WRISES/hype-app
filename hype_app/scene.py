@@ -47,7 +47,7 @@ def terrain_payload(dem_path: str, crs, origin, z0: float, *, max_dim: int = 200
 
 def flowpaths_payload(gdf_4326, crs, origin, z0: float, *, max_paths: int = 800,
                       color: str = "#0a3d91", key: str = "paths",
-                      width: int = 2) -> dict | None:
+                      width: float = 2, opacity: float = 1.0) -> dict | None:
     """3-D polylines from a pathlines GeoDataFrame (any CRS set on it; reprojected to
     `crs`). Returns None when the geometries carry no z — flat lines pinned to the
     datum would only mislead."""
@@ -57,9 +57,16 @@ def flowpaths_payload(gdf_4326, crs, origin, z0: float, *, max_paths: int = 800,
     if len(g) > max_paths:
         g = g.iloc[:max_paths]
     ox, oy = float(origin[0]), float(origin[1])
+    # Per-path residence time + particle id ride ALIGNED with polylines so the
+    # client can animate particles along the 3-D lines with the same relative
+    # speeds as the 2-D animator. Optional: absent columns just omit the keys.
+    tds = g["total_time_d"].tolist() if "total_time_d" in g.columns else None
+    pids = g["particleid"].tolist() if "particleid" in g.columns else None
     polylines = []
+    times: list[float] = []
+    part_ids: list[int] = []
     have_z = False
-    for geom in g.geometry:
+    for i, geom in enumerate(g.geometry):
         if geom is None or geom.is_empty or geom.geom_type != "LineString":
             continue
         flat = []
@@ -71,11 +78,27 @@ def flowpaths_payload(gdf_4326, crs, origin, z0: float, *, max_paths: int = 800,
                          round(zv - float(z0), 3)))
         if len(flat) >= 6:
             polylines.append(flat)
+            if tds is not None:
+                try:
+                    times.append(round(float(tds[i]), 6))
+                except (TypeError, ValueError):
+                    times.append(0.0)
+            if pids is not None:
+                try:
+                    part_ids.append(int(pids[i]))
+                except (TypeError, ValueError):
+                    part_ids.append(i + 1)
     if not polylines or not have_z:
         return None
-    return {"key": key, "kind": "lines3d",
-            "data": {"polylines": polylines, "color": color, "width": int(width),
-                     "origin": [ox, oy]}}
+    data = {"polylines": polylines, "color": color,
+            "width": max(1, int(round(float(width)))),
+            "opacity": max(0.0, min(float(opacity), 1.0)),
+            "origin": [ox, oy]}
+    if tds is not None:
+        data["times"] = times
+    if pids is not None:
+        data["pids"] = part_ids
+    return {"key": key, "kind": "lines3d", "data": data}
 
 
 def flowpaths_payload_from_dir(work_dir, crs, origin, z0: float, **kw) -> dict | None:

@@ -38,10 +38,15 @@ warnings.filterwarnings("ignore", message=r".*Widget\.widgets is deprecated.*")
 import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
-from hype_app import (assess, bieger, bundle, carve, delineate, dem, dims, estimate,  # noqa: E402
-                      geocode, geometry, gms, hydro, hz_results, mesh, project_meta,
-                      ras_results, recents, report as report_mod, results, runmode, scene,
-                      signature, snapshot, ui_tree)
+from hype_app import (assess, bieger, bundle, carve, delineate, dem, dims,  # noqa: E402
+                      estimate, geocode, geometry, gms, hydro, hz_results,
+                      map_layers as ml_mod, mesh,
+                      project_meta, ras_results, recents, report as report_mod, results,
+                      results_lifecycle, runmode, scene, signature, snapshot, ui_tree,
+                      video as video_mod, wells as wells_mod)
+from hype_app import alt_screening  # noqa: E402
+from hype_app import comparison as comparison_mod  # noqa: E402
+from hype_app import comparison_metrics  # noqa: E402
 from hype_app import alternatives as alt_mod  # noqa: E402
 from hype_app import gms_run  # noqa: E402
 from hype_app import hz_run  # noqa: E402
@@ -115,6 +120,7 @@ RIGHT_STYLE = {"color": "#d83933", "weight": 3, "opacity": 0.95}     # Right FPL
 UP_STYLE = {"color": "#f08c00", "weight": 3, "opacity": 0.95}        # Upstream boundary (orange)
 DOWN_STYLE = {"color": "#9b59b6", "weight": 3, "opacity": 0.95}      # Downstream boundary (purple)
 KZONE_STYLE = {"color": "#7b3fa0", "weight": 2, "opacity": 0.95, "fill": False}
+WELL_COLOR = "#15803d"   # observation wells (deep green — a free slot in the map palette)
 SOILS_STYLE = {"color": "#8a6d3b", "weight": 1, "opacity": 0.9,        # NRCS SSURGO polygons (tan)
                "fillColor": "#d2b48c", "fillOpacity": 0.22}            # (soils modal review map)
 SOILS_SEL_STYLE = {"color": "#1f6feb", "weight": 2, "opacity": 1.0,    # soils modal: units picked
@@ -145,7 +151,26 @@ MODFLOW_UNAVAILABLE_MSG = (
     "MODFLOW 6 / MODPATH 7 not found — expected mf6 and mp7 in the bundled bin/win "
     "(Windows) or bin/linux folder, or set HYPE_MODFLOW_BIN to a folder containing them.")
 
-APP_VERSION = "2026.07"        # About dialog + run_config.json + the project-file manifest
+APP_VERSION = "1.0.0"          # single source of truth: About dialog, header chip, welcome splash,
+                               # run_config.json, the project-file manifest, and report footers
+APP_VERSION_LABEL = f"v{APP_VERSION}"   # user-visible spelling (header chip + welcome splash)
+
+
+def _desktop_build_line() -> str:
+    """About-modal desktop build identity. desktop-manifest.json sits next to app.py only
+    inside an installed apps payload (build-apps-payload.ps1 via gen_desktop_manifest.py);
+    dev checkouts and cloud deploys have no such file and add nothing."""
+    if not runmode.IS_DESKTOP:
+        return ""
+    try:
+        mf = json.loads((Path(__file__).resolve().parent / "desktop-manifest.json")
+                        .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    apps, env = mf.get("version"), mf.get("requiresEnv")
+    if not apps:
+        return ""
+    return f"\n\nDesktop build {apps}" + (f" (runtime {env})" if env else "")
 
 # pyplot state is process-global and report_task renders its ~10 figures on a worker thread,
 # so concurrent sessions' report builds must serialize. Event-loop pyplot users (xsect profile,
@@ -178,8 +203,8 @@ FLOW_UP_STYLE = {"color": "#1e40af", "weight": 0.5, "opacity": 0.8,
 # flow-path particle animation (www/path_anim.js): swatch palette for the Flow paths pane.
 # Hot magenta default — no layer uses it (paths are teal/red/blue/amber, hover gold,
 # selection orange) and it pops on both USGS basemaps.
-FP_ANIM_COLORS = ("#ff2bd6", "#00e5ff", "#ffffff", "#b4ff39")
-FP_ANIM_COLOR_NAMES = ("Magenta", "Cyan", "White", "Lime")
+FP_ANIM_COLORS = ("#ff2bd6", "#00e5ff", "#ffffff", "#b4ff39", "#000000", "#ff2b2b")
+FP_ANIM_COLOR_NAMES = ("Magenta", "Cyan", "White", "Lime", "Black", "Red")
 HZ_TOTAL = 7
 HZ_STEPS = {0: "Preparing…", 1: "Loading the flow solution", 2: "Seeding particles",
             3: "Tracking forward (endpoints)", 4: "Tracking backward (endpoints)",
@@ -238,10 +263,14 @@ app_ui = ui.page_fillable(
         ui.tags.script(src=_asset("mesh3d.js")),     # lazy-loads vtk.js from a CDN on first Compute
         ui.tags.script(src=_asset("tree.js")),       # layer tree (left panel) + panel chrome
         ui.tags.script(src=_asset("info_tip.js")),   # hover/focus help chips on .hype-info-tip
+        ui.tags.script(src=_asset("export_menu.js")),  # header Export menu + view capture
         # Desktop-only shell bridge (native pickers, window title). Served only when the
         # process runs in desktop mode so the cloud page stays byte-identical; the script
         # itself also no-ops without WebView2 (plain dev browser).
         *([ui.tags.script(src=_asset("desktop_bridge.js"))] if runmode.IS_DESKTOP else []),
+        # Cross-project comparison workspace (desktop only): entirely client-rendered from
+        # "hype_comparison" custom messages; one comparison_event input carries every action.
+        *([ui.tags.script(src=_asset("comparison.js"))] if runmode.IS_DESKTOP else []),
     ),
     ui.div(
         ui.div(
@@ -250,15 +279,71 @@ app_ui = ui.page_fillable(
             ui.div(ui.span("HYPE", ui.tags.small("Hyporheic Exchange Explorer"),
                            class_="hype-brand"),
                    ui.output_ui("project_badge", inline=True),
+                   ui.span(APP_VERSION_LABEL, class_="hype-version-chip",
+                           title=f"HYPE {APP_VERSION}"),
                    class_="hype-header-left"),
             # 2D/3D canvas toggle — plain buttons, delegated via www/tree.js (data-view),
             # active states synced from the hype_tree payload's `view` field. Middle grid
             # column, so it sits at true window center (the map below is full-bleed).
-            ui.div(ui.tags.button("2D map", type="button", class_="hype-view-btn active",
-                                  **{"data-view": "2d"}),
-                   ui.tags.button("3D view", type="button", class_="hype-view-btn",
-                                  **{"data-view": "3d"}),
-                   class_="hype-view-toggle"),
+            # The Export menu rides in the same center cell (www/export_menu.js owns its
+            # open/close and dispatch; the items post export_evt nonce events).
+            ui.div(
+                ui.div(ui.tags.button("2D map", type="button",
+                                      class_="hype-view-btn active",
+                                      **{"data-view": "2d"}),
+                       ui.tags.button("3D view", type="button", class_="hype-view-btn",
+                                      **{"data-view": "3d"}),
+                       class_="hype-view-toggle"),
+                # Snipping-tool-style capture control: the icon button EXECUTES the
+                # capture (camera = still, video = recording, per the selected mode),
+                # the slim arrow opens the options. www/export_menu.js owns the icon
+                # swap, the mode/target state, and the whole dispatch matrix.
+                ui.div(
+                    ui.tags.button(type="button", id="hype-export-btn",
+                                   class_="hype-export-btn",
+                                   title="Capture the view",
+                                   **{"aria-label": "Capture"}),
+                    ui.tags.button(type="button", id="hype-export-arrow",
+                                   class_="hype-export-arrow",
+                                   title="Capture options",
+                                   **{"aria-label": "Capture options"}),
+                    ui.div(
+                        ui.div("Mode", class_="hype-export-head"),
+                        ui.div(
+                            ui.tags.button("Camera", type="button",
+                                           class_="active", **{"data-mode": "camera"}),
+                            ui.tags.button("Video", type="button",
+                                           **{"data-mode": "video"}),
+                            class_="hype-export-modes"),
+                        ui.div("Capture", class_="hype-export-head"),
+                        ui.tags.button(
+                            ui.tags.span("Specified Window"),
+                            ui.tags.small("Drag a rectangle over the view"),
+                            type="button", class_="hype-export-target sel",
+                            **{"data-target": "view"}),
+                        ui.tags.button(
+                            ui.tags.span("Full View Extent"),
+                            ui.tags.small("Everything currently in view"),
+                            type="button", class_="hype-export-target",
+                            **{"data-target": "full"}),
+                        # Video-mode-only settings (export_menu.js shows/hides + posts
+                        # the values with each export_evt, so no Shiny inputs needed)
+                        ui.div(
+                            ui.div("Video settings", class_="hype-export-head"),
+                            ui.div(ui.span("Length (s)"),
+                                   ui.tags.input(type="number", min="2", max="30",
+                                                 step="1", value="8",
+                                                 **{"data-k": "secs"}),
+                                   ui.tags.button("30 fps", type="button",
+                                                  class_="active",
+                                                  **{"data-fps": "30"}),
+                                   ui.tags.button("15 fps", type="button",
+                                                  **{"data-fps": "15"}),
+                                   class_="hype-export-vidrow"),
+                            class_="hype-export-vidset", style="display:none;"),
+                        id="hype-export-menu", class_="hype-export-menu"),
+                    id="hype-export", class_="hype-export"),
+                class_="hype-header-center"),
             ui.div(ui.input_action_link("nav_new", "New"),
                    # Ellipsis = "raises a chooser", the convention `Save As…` already sets in
                    # this nav. Open lands on the start menu, not straight on a file dialog.
@@ -290,6 +375,19 @@ app_ui = ui.page_fillable(
         # Properties panel (right floating card) — content is the server-rendered pane for the
         # selected tree node; www/tree.js shows/hides the card as the output fills/empties.
         ui.div(ui.output_ui("propspane"), id="hype-props-panel", class_="hype-props-panel"),
+        # Hidden Shiny file input, ALWAYS mounted: mesh3d.js drops the recorded 3D-view
+        # webm into it so it rides Shiny's own chunked uploader (dynamic routes are
+        # GET-only, and multi-MB payloads must never ride the websocket). It lives in the
+        # main layout, not the Flow paths pane, so the header capture control can record
+        # while that pane is closed.
+        ui.div(ui.input_file("fp3d_webm", None, accept=[".webm"]), style="display:none;"),
+        # Same pattern for a browser-3D still: export_menu.js drops the captured canvas
+        # PNG here so it reaches the preview modal through the chunked uploader.
+        ui.div(ui.input_file("capture_png", None, accept=[".png"]),
+               style="display:none;"),
+        # Floating bottom-right progress card for the pathline animation build. Lives
+        # in the main layout so it shows regardless of which pane is open.
+        ui.output_ui("fp_video_status"),
         ui.output_ui("readout"),
         ui.output_ui("flow_loading"),
         ui.output_ui("alt_banner"),
@@ -297,6 +395,10 @@ app_ui = ui.page_fillable(
         ui.output_ui("xsect_style"),
         ui.div(id="hype-mesh3d", class_="hype-mesh3d"),     # 3D mesh viewer overlay (vtk.js)
         ui.output_ui("mesh3d_style"),
+        # Cross-project comparison workspace overlay. Hidden until the server sends a
+        # comparison payload, so the normal single-project canvas is untouched; comparison.js
+        # owns everything inside this div.
+        ui.div(id="hype-comparison", class_="hype-compare", hidden=True),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -318,13 +420,31 @@ def server(input, output, session):
     # it. The _ws mirror lets non-reactive readers (teardown, _gated, filename lambdas)
     # see the name; the reactive drives the badge, pane, and tab title.
     project_meta_v = reactive.value({"name": None, "units": project_meta.UNITS_METRIC,
-                                     "created": None})
+                                     "created": None, "project_id": None, "site_id": None})
 
-    def _set_project_meta(name, created, units: str = project_meta.UNITS_METRIC):
+    def _set_project_meta(name, created, units: str = project_meta.UNITS_METRIC, *,
+                          project_id: str | None = None, site_id: str | None = None,
+                          mint_missing: bool = False):
         name = (str(name).strip() if name else "") or None
+        if mint_missing and name:
+            # Immutable identities: minted once for a named project, then carried through
+            # every save. Cross-project comparison keys duplicate detection off these.
+            project_id = project_id or project_meta.new_identity()
+            site_id = site_id or project_meta.new_identity()
         _ws["project_name"] = name
         project_meta_v.set({"name": name, "units": units or project_meta.UNITS_METRIC,
-                            "created": created})
+                            "created": created, "project_id": project_id,
+                            "site_id": site_id})
+
+    # Cross-project comparison: a second, read-only UI mode over frozen snapshots, not
+    # another modeling workspace. These values never participate in work_dir rebinding,
+    # solver inputs, the map, or project autosave.
+    comparison_mode_v = reactive.value(False)
+    comparison_collection_v = reactive.value(None)
+    comparison_file_v = reactive.value(None)
+    comparison_dirty_v = reactive.value(False)
+    comparison_selected_member_v = reactive.value(None)
+    comparison_inspections_v = reactive.value({})
 
     _autosave: dict = {"restoring": False}   # suppresses the autosave effect during restores
 
@@ -384,6 +504,20 @@ def server(input, output, session):
     grad_ver = reactive.value(0)           # ++ on in-place gradient edits (heads recompute without
     #                                        remounting the per-point numeric being typed in)
     grad_adding = reactive.value(None)     # None|"left"|"right" — armed "add gradient point" click
+    obs_wells = reactive.value([])         # observation wells (field data; project-state key):
+    #                                        [{"id","name","lat","lon","screen_elev","obs_head"}]
+    #                                        records mutate IN PLACE via _wells_mirror + wells_ver
+    well_pairs = reactive.value([])        # tracked head-gradient pairs [{"id","a","b"}] (well ids;
+    #                                        project-state key)
+    wells_ver = reactive.value(0)          # ++ on in-place well edits (samples recompute without
+    #                                        remounting the input being typed in)
+    wells_adding = reactive.value(False)   # True while an "Add well on map" click is armed
+    map_layers = reactive.value([])        # user reference layers (path POINTERS, never copies;
+    #                                        project-state key): [{"id","path","name","kind",
+    #                                        "opacity","color","visible"}] — records mutate IN
+    #                                        PLACE for opacity/color/visible via map_layers_ver
+    map_layers_ver = reactive.value(0)     # ++ on in-place record edits (style updates apply
+    #                                        without remounting the slider being dragged)
     mesh_geom = reactive.value(None)       # last computed 3D mesh geometry (for status + viewer)
     kzone_feats = reactive.value([])       # list of GeoJSON polygon features (4326)
     wse_extent_feat = reactive.value(None)  # drawn water-surface (wetted) extent polygon (4326)
@@ -400,7 +534,9 @@ def server(input, output, session):
     _flow = {"gdf": None}                   # cached NHD flowlines GDF (for snapping)
     proj_crs = reactive.value(None)
     dem_path = reactive.value(None)
-    dem_meta = reactive.value(None)        # {"resolution_m", "source"} of the fetched 3DEP DEM
+    dem_meta = reactive.value(None)        # {"resolution_m", "source", "src_name"} of the working DEM
+    dem_src = reactive.value(dem.normalize_dem_source(None))  # terrain source: 3DEP download or a
+    #                                        local-GeoTIFF POINTER {"mode", "path", "src_mtime"}
     carve_active = reactive.value(False)   # a carved channel is applied to the terrain
     carve_meta = reactive.value(None)      # {path, diff_path, cells_cut, max_cut_m}
     _stale_marks = reactive.value(frozenset())  # {"sw","gw"} whose results predate a carve/revert
@@ -432,6 +568,10 @@ def server(input, output, session):
     report_paths = reactive.value(None)     # {format: path} of the last generated report
     _report_stamp = reactive.value(None)    # _report_signature() at the last build (staleness)
     _report_shown_for = reactive.value(None)  # input_hash of the run whose report auto-opened
+    # Monotonic build counter. A superseded worker (the user re-opened after an edit while the
+    # first build was still in its scenario loop) must not land its older documents on top of a
+    # newer build's, so `_report_done` drops any result whose id is not the latest launched.
+    _report_build_id = reactive.value(0)
     gms_status_v = reactive.value(None)     # last GMS folder export: None | {"ok": bool, ...}
     head_tifs = reactive.value([])          # per-layer head GeoTIFF paths (index 0 = top layer)
     head_rng = reactive.value(None)         # global (vmin, vmax) for consistent head coloring
@@ -444,6 +584,14 @@ def server(input, output, session):
     fp_anim_speed_v = reactive.value(3.0)   # slider 0.5..10; median path loops in 36/v seconds
     fp_anim_color_v = reactive.value(FP_ANIM_COLORS[0])
     fp_anim_style_v = reactive.value("comet")   # "comet" (fading tail) or "dots"
+    # flow-path LINE styling (display prefs; persisted in project saves like head_opacity).
+    # Show=False styles the lines to opacity 0 instead of unmounting them, so the animator
+    # keeps its geometry and particles stay visible over an invisible network.
+    fp_line_show_v = reactive.value(True)
+    fp_line_weight_v = reactive.value(1.0)
+    fp_line_opacity_v = reactive.value(0.9)
+    fp_line_mode_v = reactive.value("class")    # "class" (identity palette) or "single"
+    fp_line_color_v = reactive.value("#0d9488")
     # Layer visibility lives in the TREE checkboxes (server-side — ipyleaflet's LayersControl
     # dies under the run-completion layer burst, a client race in jupyter-leaflet 0.20).
     _layer_shadow: dict = {}                # hidden layers parked here so toggles can restore them
@@ -581,6 +729,7 @@ def server(input, output, session):
     # (layer prefs, domain, CRS), so without the guard any of those writes — project restore in
     # particular — re-fires the handler and grafts the stale task result onto the fresh session.
     _task_armed = {"sw": False, "gw": False, "hz": False, "alt": False, "report": False,
+                   "video": False, "video3d": False, "still": False,
                    "gms": False, "pick": False}
     _gms_pending: dict = {}    # one-slot newest-wins payload while a GMS build is in flight
     _gms_epoch = {"n": 0}      # bumped by sweeps/resets; stale builds are undone post-hoc
@@ -671,6 +820,13 @@ def server(input, output, session):
                             hover_style=dict(getattr(lyr, "hover_style", {}) or {}),
                             point_style=dict(getattr(lyr, "point_style", {}) or {}),
                             name=getattr(lyr, "name", "") or "")
+            # Carry the pane placement or the clone jumps to overlayPane above app layers.
+            # The "pane" entry in the OPTIONS list (not the pane trait alone) is what reaches
+            # the L.geoJson constructor and therefore the child paths — see _sync_map_layers.
+            pane = getattr(lyr, "pane", "") or ""
+            if pane:
+                fresh.pane = pane
+                fresh.options = list(getattr(lyr, "options", []) or [])
             cbs = getattr(getattr(lyr, "_click_callbacks", None), "callbacks", [])
             for cb in list(cbs):
                 fresh.on_click(cb)
@@ -694,6 +850,7 @@ def server(input, output, session):
                 return ImageOverlay(url=lyr.url, bounds=lyr.bounds,
                                     opacity=float(getattr(lyr, "opacity", 1.0)),
                                     visible=bool(getattr(lyr, "visible", True)),
+                                    pane=getattr(lyr, "pane", "") or "",
                                     name=getattr(lyr, "name", "") or "")
             except Exception:  # noqa: BLE001
                 return lyr
@@ -1051,7 +1208,7 @@ def server(input, output, session):
     def _mk_mirror_click(nid):
         def _h(**kw):
             with reactive.isolate():        # widget callback: never while a draw/edit/add is live
-                if bnd_slot() is not None or kz_adding() or grad_adding():
+                if bnd_slot() is not None or kz_adding() or grad_adding() or wells_adding():
                     return
                 if current_step() == STEP_REACH and reach_feat() is None:
                     return                  # clicks are point picks / draw vertices until traced
@@ -1085,7 +1242,11 @@ def server(input, output, session):
                 pass
         if feat is None or style is None:
             return                                    # style-less call (a vis toggle) with no widget
-        lyr = GeoJSON(data=want, style=style, name=nm, visible=True)
+        # Construct with the REAL geometry, never the hidden-aware `want`: the empty-FC hide
+        # belongs to the live mutate path above. A hidden key's widget never reaches the map
+        # (_set_layer parks it), and a parked widget must carry its geometry or the un-park
+        # clone renders nothing (the invisible-boundaries-after-open bug).
+        lyr = GeoJSON(data=_fc(feat), style=style, name=nm, visible=True)
         _wire_mirror_click(lyr, nm)
         _set_layer(nm, lyr)
 
@@ -1273,6 +1434,220 @@ def server(input, output, session):
         else:
             _set_layer("grad_pts", LayerGroup(layers=kids, name="Gradient points"))
 
+    def _wells_overlay_children(wls):
+        """LayerGroup children for the observation-well overlay: one ringed glyph per well
+        (per-feature properties.style — never a layer-level style=, which merges over it)
+        plus a name pill."""
+        feats, marks = [], []
+        for w in wls:
+            feats.append({"type": "Feature",
+                          "properties": {"hz_lyr": "obs_wells",
+                                         "style": {"color": "#ffffff", "fillColor": WELL_COLOR,
+                                                   "weight": 2, "fillOpacity": 1.0}},
+                          "geometry": {"type": "Point",
+                                       "coordinates": [float(w["lon"]), float(w["lat"])]}})
+            marks.append(_label_marker((w["lat"], w["lon"]), w.get("name") or "well",
+                                       WELL_COLOR))
+        gj = GeoJSON(data={"type": "FeatureCollection", "features": feats},
+                     point_style={"radius": 5, "weight": 2, "fillOpacity": 1.0},
+                     name="Observation wells")
+        return (gj, *marks)
+
+    @reactive.effect
+    def _sync_wells_overlay():
+        # Observation-well markers: ONE LayerGroup under "obs_wells", children swapped in
+        # place (grad_pts discipline). UNLIKE grad_pts this key IS tree-checkbox wired, so
+        # every swap re-honors the current checkbox via _group_children_visible (the
+        # head-layer owner's discipline): while hidden, fresh children are re-stashed in
+        # _group_hold; re-checking restores them. The empty branch also drops the stash and
+        # any parked shadow so deleted wells can never resurrect on the next re-check.
+        if not _HAS_MAP:
+            return
+        wls = obs_wells()
+        wells_ver()                                    # live name edits repaint the pills
+        grp = _layers.get("obs_wells")
+        if not wls:
+            if isinstance(grp, LayerGroup):
+                _group_hold.pop(id(grp), None)
+                if grp.layers:
+                    grp.layers = ()
+            _layer_shadow.pop("obs_wells", None)
+            return
+        kids = _wells_overlay_children(wls)
+        if isinstance(grp, LayerGroup):
+            grp.layers = kids
+            _group_children_visible(grp, "obs_wells" not in _hidden_keys)
+        else:
+            _set_layer("obs_wells", LayerGroup(layers=kids, name="Observation wells"))
+
+    # ---- user reference map layers (Map layers tree group) --------------------------------
+    # Path pointers to files on the user's machine; missing/error are DISPLAY states surfaced
+    # in the tree row + pane, never grounds for touching the record. Widgets live in the
+    # dedicated hype-ref pane (declared in _build_map) so they always stack above the basemap
+    # and terrain and below every app overlay, whatever order the heal machinery re-adds.
+    _ml_cache: dict = {}     # uid -> {"sig": (path, mtime), "kind", "overlay"|"fc", "bounds"}
+    _ml_status: dict = {}    # uid -> "ok" | "missing" | "error"
+    _ml_err: dict = {}       # uid -> short user-facing reason (status "error" only)
+    _ml_paint = reactive.value(0)   # ++ on status/err transitions (and relink) so the pane
+    #                                 rows repaint — NEVER bumped by slider/color edits, which
+    #                                 would remount the control being dragged
+
+    def _ml_key(uid) -> str:
+        return f"ml:{uid}"
+
+    def _ml_eff(rec) -> bool:
+        # Effective visibility = the row's own checkbox AND the Map layers group checkbox
+        # (dynamic rows are not in ui_tree.NODES, so _eff_checked can't walk them).
+        return bool(rec.get("visible", True)) and _node_checked("maplyr")
+
+    def _apply_ml_vis():
+        """Re-apply EFFECTIVE visibility to every reference-layer key. _set_keys_visible
+        keeps _hidden_keys in sync, so the _set_layer funnel and the heal machinery keep
+        honoring the state without knowing these keys are dynamic."""
+        with reactive.isolate():
+            recs = list(map_layers())
+        for rec in recs:
+            _set_keys_visible((_ml_key(rec.get("id")),), _ml_eff(rec))
+        _bump_vis()
+
+    def _ml_bounds_union():
+        """[[s, w], [n, e]] union of every LOADED layer's bounds (group zoom-to-extent)."""
+        bs = [c.get("bounds") for c in _ml_cache.values() if c.get("bounds")]
+        if not bs:
+            return None
+        return [[min(b[0][0] for b in bs), min(b[0][1] for b in bs)],
+                [max(b[1][0] for b in bs), max(b[1][1] for b in bs)]]
+
+    @reactive.effect
+    async def _sync_map_layers():
+        # Owner of every "ml:<uid>" key. Subscribes to the record list (add/remove/relink)
+        # and the version counter (in-place opacity/color/visible edits). File loads run
+        # off-loop; a records/ver change during the await supersedes this pass (the newer
+        # pass redoes the apply), so a stale load can never clobber fresh edits.
+        if not _HAS_MAP:
+            return
+        recs = [dict(r) for r in map_layers()]
+        ver = map_layers_ver()
+        snap0 = [(r.get("id"), r.get("path"), r.get("kind")) for r in recs]
+        paint0 = (dict(_ml_status), dict(_ml_err))
+        need = []
+        for rec in recs:
+            uid = rec["id"]
+            p = Path(rec["path"])
+            try:
+                sig = (rec["path"], p.stat().st_mtime) if p.is_file() else None
+            except OSError:
+                sig = None
+            if sig is None:                       # the linked file is gone: warn, keep the record
+                _ml_status[uid] = "missing"
+                _ml_err.pop(uid, None)
+                _ml_cache.pop(uid, None)
+                _set_layer(_ml_key(uid), None)
+                continue
+            c = _ml_cache.get(uid)
+            if c is None or c.get("sig") != sig or c.get("kind") != rec["kind"]:
+                need.append((rec, sig))
+        if need:
+            def _load_batch():
+                # Worker-thread matplotlib (colormaps + PNG encode) serializes with the
+                # report builds via the shared lock — same rationale as report_task.
+                out = {}
+                with _REPORT_MPL_LOCK:
+                    for rec, sig in need:
+                        if rec["kind"] == "raster":
+                            ov, err = ml_mod.load_raster_overlay(rec["path"])
+                            out[rec["id"]] = {"sig": sig, "kind": "raster", "overlay": ov,
+                                              "bounds": (ov or {}).get("bounds"),
+                                              "err": err, "simplified": False}
+                        else:
+                            fc, bounds, err, simplified = ml_mod.load_vector_fc(rec["path"])
+                            if fc is not None:
+                                _tag_hz(fc, _ml_key(rec["id"]))   # sweep/verify heal opt-in
+                            out[rec["id"]] = {"sig": sig, "kind": "vector", "fc": fc,
+                                              "bounds": bounds, "err": err,
+                                              "simplified": simplified}
+                return out
+            loaded = await anyio.to_thread.run_sync(_load_batch)
+            with reactive.isolate():
+                stale = (map_layers_ver() != ver
+                         or [(r.get("id"), r.get("path"), r.get("kind"))
+                             for r in map_layers()] != snap0)
+            if stale:
+                return
+            for uid, entry in loaded.items():
+                err = entry.pop("err", None)
+                simplified = entry.pop("simplified", False)
+                nm = next((r["name"] for r in recs if r["id"] == uid), "layer")
+                if err:
+                    _ml_cache.pop(uid, None)
+                    _ml_status[uid] = "error"
+                    _ml_err[uid] = err
+                    _set_layer(_ml_key(uid), None)
+                    ui.notification_show(f"Couldn't read {nm}: {err}",
+                                         type="warning", duration=8)
+                else:
+                    _ml_cache[uid] = entry
+                    _ml_status[uid] = "ok"
+                    _ml_err.pop(uid, None)
+                    if simplified:
+                        ui.notification_show(f"{nm} was simplified for display.", duration=6)
+        # Build or refresh widgets (live prefs mutate traits — no widget churn on a drag).
+        # Per-record try/except: a wedged widget comm or one bad record must never kill
+        # the owner effect for the session (the mesh3d per-handler discipline).
+        for rec in recs:
+            uid = rec["id"]
+            key = _ml_key(uid)
+            c = _ml_cache.get(uid)
+            if not c or _ml_status.get(uid) != "ok":
+                continue
+            live = _layers.get(key) or _layer_shadow.get(key)
+            try:
+                if rec["kind"] == "raster":
+                    ov = c.get("overlay") or {}
+                    if isinstance(live, ImageOverlay) and live.url == ov.get("url"):
+                        if abs(float(getattr(live, "opacity", 1.0))
+                               - float(rec["opacity"])) > 1e-9:
+                            live.opacity = float(rec["opacity"])
+                    else:
+                        _set_layer(key, ImageOverlay(url=ov.get("url"),
+                                                     bounds=ov.get("bounds"),
+                                                     opacity=float(rec["opacity"]),
+                                                     pane=ml_mod.PANE_REF,
+                                                     name=rec["name"]))
+                else:
+                    style = ml_mod.vector_style(rec["color"], rec["opacity"])
+                    if isinstance(live, GeoJSON) and live.data is c.get("fc"):
+                        if dict(live.style or {}) != style:
+                            live.style = style    # client setStyle: restyles children live
+                    else:
+                        gj = GeoJSON(data=c.get("fc"), style=style,
+                                     point_style=ml_mod.vector_point_style(),
+                                     pane=ml_mod.PANE_REF, name=rec["name"])
+                        # "pane" must ride the OPTIONS list: the client builds L.geoJson's
+                        # constructor options from it, which is the only way the pane
+                        # reaches the child paths (the pane trait alone applies after
+                        # children exist).
+                        gj.options = list(gj.options or []) + ["pane"]
+                        _set_layer(key, gj)
+            except Exception:  # noqa: BLE001
+                pass
+        # Tear down removed layers everywhere they could hide (live map, shadow park,
+        # hidden set, caches) — the wells lesson: miss one stash and deletes resurrect.
+        want = {_ml_key(r["id"]) for r in recs}
+        for key in {k for k in list(_layers) + list(_layer_shadow)
+                    if isinstance(k, str) and k.startswith("ml:")} - want:
+            _set_layer(key, None)
+            _hidden_keys.discard(key)
+        for uid in [u for u in list(_ml_cache) if _ml_key(u) not in want]:
+            _ml_cache.pop(uid, None)
+        for uid in [u for u in list(_ml_status) if _ml_key(u) not in want]:
+            _ml_status.pop(uid, None)
+            _ml_err.pop(uid, None)
+        _apply_ml_vis()
+        if (dict(_ml_status), dict(_ml_err)) != paint0:
+            with reactive.isolate():
+                _ml_paint.set(_ml_paint() + 1)
+
     def _render_boundaries(active):
         """Boundaries-step display: each side except the `active` one (which is in the DrawControl)
         as a static colored layer, plus the WSE (unless active) and the reach. Idempotent via
@@ -1368,12 +1743,18 @@ def server(input, output, session):
             _mirror_show("Reach", rch, REACH_STYLE)                # reshow (clean reveal via _decor_show)
 
     @reactive.effect
-    def _dem_overlay_opacity():
+    async def _dem_overlay_opacity():
         # The hillshade's visibility belongs to its "DEM (hillshade)" entry in the layers control
         # (a client-side checkbox: checked = shown, on every step, state persists because the
         # layer object is created once at fetch and only trait-mutated afterwards). This effect
-        # just keeps its opacity in step with the DEM-step slider.
+        # keeps its opacity in step with the DEM-step slider, and mirrors the same value onto
+        # the 3-D terrain surface so the slider is the see-through control in both views.
         opacity = float(dem_opacity_v())
+        try:
+            await session.send_custom_message(
+                "hype3d_style", {"key": "terrain", "opacity": opacity})
+        except Exception:  # noqa: BLE001
+            pass
         lyr = _layers.get("dem")       # created with the current opacity at fetch time
         if lyr is None:
             return
@@ -1637,8 +2018,16 @@ def server(input, output, session):
 
     if _HAS_MAP:
         def _build_map():
+            # Custom panes are the ONLY z-order mechanism in this app (stacking is otherwise
+            # pure Map.add append order, and the heal/relayer machinery re-adds in arbitrary
+            # order). Terrain rasters live in hype-terrain (320) and user reference layers in
+            # hype-ref (340), both under the default overlayPane (400) where every
+            # app-generated overlay stays. CONSTRUCTOR-ONLY: mutating Map.panes later makes
+            # the jupyter-leaflet client re-render the entire map.
             m = Map(center=(39.5, -98.35), zoom=4, scroll_wheel_zoom=True,
-                    zoom_control=False, max_zoom=19, layout=Layout(height="100%"))
+                    zoom_control=False, max_zoom=19, layout=Layout(height="100%"),
+                    panes={ml_mod.PANE_TERRAIN: {"zIndex": 320},
+                           ml_mod.PANE_REF: {"zIndex": 340, "pointerEvents": "none"}})
             m.clear()
             m.add(ZoomControl(position="topright"))
             # USGS basemap caches stop at zoom 16 — cap max_native_zoom so Leaflet upscales the
@@ -1688,14 +2077,18 @@ def server(input, output, session):
         def _view():
             return reactive_read(_MAP, "zoom"), reactive_read(_MAP, "center")
 
-    # ---- DEM fetch ----
+    # ---- DEM acquire (3DEP download or local-raster import) ----
     @reactive.extended_task
-    async def dem_task(domain_geojson: dict, out_path: str, resolution) -> dict:
+    async def dem_task(payload: dict) -> dict:
         def _work():
-            g = geometry.single_feature_gdf(domain_geojson)
-            info = dem.fetch_dem(g, out_path, resolution=resolution)
-            return {"path": info["path"], "resolution_m": info["resolution_m"],
-                    "source": info["source"], "summary": dem.dem_summary(info["path"])}
+            g = geometry.single_feature_gdf(payload["aoi"])
+            if payload.get("mode") == "local":
+                info = dem.import_local_dem(payload["src"], g, payload["out"],
+                                            reach_feat_4326=payload.get("reach"))
+            else:
+                info = dem.fetch_dem(g, payload["out"], resolution=payload["resolution"])
+            return {**info, "mode": payload.get("mode", "3dep"),
+                    "summary": dem.dem_summary(info["path"])}
         return await anyio.to_thread.run_sync(_work)
 
     def _reach_meta():
@@ -1738,17 +2131,44 @@ def server(input, output, session):
         except (TypeError, ValueError):
             return False
 
+    _dem_last = {"mode": "3dep"}       # which acquire branch launched last (error wording)
+
+    def _dem_local_active() -> bool:
+        """Local-raster mode is honored on desktop only: a cloud-restored local project
+        degrades to the 3DEP download (no local filesystem to link against)."""
+        return runmode.IS_DESKTOP and (dem_src() or {}).get("mode") == "local"
+
     def _launch_dem_fetch(rf):
-        # Shared by the pane button and the reach→terrain auto-chain.
+        # Shared by the pane buttons, the source-pick handler, and the reach→terrain
+        # auto-chain. Branches on the terrain source; both branches write inputs/dem.tif.
         import geopandas as gpd
         from shapely.geometry import mapping, shape as _shape
         meta = _reach_meta() or {}
         half = min(max(8.0 * max(meta.get("width_m", 1.0), 1.0), 250.0), 800.0)
         buf = (gpd.GeoSeries([_shape(rf["geometry"])], crs=4326).to_crs(5070)
                .buffer(half + 60.0).to_crs(4326).iloc[0])
-        stage.set("Downloading 3DEP terrain for the reach…")
-        dem_task({"type": "Feature", "properties": {}, "geometry": mapping(buf)},
-                 str(work_dir / "inputs" / "dem.tif"), _safe("dem_res", "auto"))
+        aoi = {"type": "Feature", "properties": {}, "geometry": mapping(buf)}
+        out = str(work_dir / "inputs" / "dem.tif")
+        with reactive.isolate():       # source reads must not re-trigger the calling effect
+            local = _dem_local_active()
+            src = (dem_src() or {}).get("path")
+        if local:
+            if not src:
+                ui.notification_show("Choose a raster file first.", type="warning",
+                                     duration=5)
+                return
+            if not Path(src).is_file():
+                ui.notification_show("The linked raster was not found. Use \"Locate the "
+                                     "file...\" to repoint it.", type="warning", duration=6)
+                return
+            _dem_last["mode"] = "local"
+            stage.set("Importing terrain from the local raster…")
+            dem_task({"mode": "local", "src": src, "aoi": aoi, "reach": rf, "out": out})
+        else:
+            _dem_last["mode"] = "3dep"
+            stage.set("Downloading 3DEP terrain for the reach…")
+            dem_task({"mode": "3dep", "aoi": aoi, "out": out,
+                      "resolution": _safe("dem_res", "auto")})
 
     @reactive.effect
     def _fetch_dem():
@@ -1765,6 +2185,43 @@ def server(input, output, session):
             return
         _launch_dem_fetch(rf)
 
+    @reactive.effect
+    def _mirror_dem_src_mode():
+        # Radio → record mirror. A mode switch mid-acquire cancels the in-flight task so the
+        # wrong terrain can never land after the user changed their mind; nothing else runs
+        # automatically (switching modes must never clobber terrain without a click).
+        try:
+            v = input.dem_src_mode()
+        except Exception:  # noqa: BLE001 — pane not mounted yet
+            return
+        v = "local" if v == "local" else "3dep"
+        with reactive.isolate():
+            rec = dict(dem_src() or {})
+        if rec.get("mode") == v:
+            return
+        rec["mode"] = v
+        dem_src.set(rec)
+        if _task_state(dem_task) == "running":
+            try:
+                dem_task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            stage.set("")
+
+    @reactive.effect
+    @reactive.event(input.dem_import_evt)
+    def _dem_import_click():
+        rf = reach_feat()
+        if rf is None:
+            ui.notification_show("Define a reach first (stage 1 in the bar above).",
+                                 type="warning", duration=5)
+            return
+        if delineate_mode() == "manual" and not _manual_da_valid():
+            ui.notification_show("Enter the drainage area (km²) first. It sizes the terrain "
+                                 "extent and the boundaries.", type="warning", duration=6)
+            return
+        _launch_dem_fetch(rf)
+
     def _show_dem_overlay(path):
         """Hillshade backdrop for `path` — the render block every DEM producer shares
         (fetch completion, project restore)."""
@@ -1775,7 +2232,8 @@ def server(input, output, session):
                 hs = float(dem_hs_v()); op = float(dem_opacity_v())
             ov = dem.dem_overlay(path, vert_exag=hs)
             _set_layer("dem", ImageOverlay(url=ov["url"], bounds=ov["bounds"],
-                                           name="DEM (hillshade)", opacity=op))
+                                           name="DEM (hillshade)", opacity=op,
+                                           pane=ml_mod.PANE_TERRAIN))
             _dem_shade_sig["sig"] = (path, hs, None)   # skip the duplicate re-render
             dem_lohi_v.set((ov["vmin"], ov["vmax"]))
             _map_ui["dem_bounds"] = ov["bounds"]              # zoom-to-extent target
@@ -1787,13 +2245,18 @@ def server(input, output, session):
         if dem_task.status() in ("initial", "running"):
             return
         stage.set("")
-        if dem_task.status() == "error":
-            ui.notification_show("DEM fetch failed at all 3DEP resolutions — try a smaller area.",
-                                 type="error", duration=8)
-            return
         try:
             res = dem_task.result()
-        except Exception:
+        except dem.DemImportError as e:    # local-import validation: message written for the user
+            ui.notification_show(str(e), type="error", duration=9)
+            return
+        except Exception:                  # cancelled stays silent; only a real error toasts
+            if dem_task.status() == "error":
+                ui.notification_show(
+                    "Terrain import failed. Check that the file is a valid GeoTIFF."
+                    if _dem_last["mode"] == "local" else
+                    "DEM fetch failed at all 3DEP resolutions. Try a smaller area.",
+                    type="error", duration=8)
             return
         dem_path.set(res["path"])
         with reactive.isolate():
@@ -1812,10 +2275,23 @@ def server(input, output, session):
                     _decor_show("Reach", fixed, REACH_STYLE)
                     ui.notification_show("Centerline direction corrected to upstream → "
                                          "downstream (from the terrain).", duration=6)
-        dem_meta.set({"resolution_m": res.get("resolution_m"), "source": res.get("source")})
+        dem_meta.set({"resolution_m": res.get("resolution_m"), "source": res.get("source"),
+                      "src_name": res.get("src_name")})
         dem_stretch_v.set(None)            # a fresh DEM starts at the full-raster stretch
         _unhide_node_layers("terrain.dem")  # a fresh fetch always shows itself
         _show_dem_overlay(res["path"])      # hillshade backdrop
+        if res.get("mode") == "local":
+            # Stamp the source file's mtime so the pane's "changed on disk" hint resets.
+            with reactive.isolate():
+                rec = dict(dem_src() or {})
+            try:
+                rec["src_mtime"] = (Path(rec["path"]).stat().st_mtime
+                                    if rec.get("path") else None)
+            except OSError:
+                rec["src_mtime"] = None
+            dem_src.set(rec)
+            if res.get("note"):            # partial coverage / decimation: warn, don't block
+                ui.notification_show(res["note"], type="warning", duration=9)
         # A fresh original DEM invalidates any carve built on the previous one.
         with reactive.isolate():
             had_carve = carve_active()
@@ -1823,11 +2299,12 @@ def server(input, output, session):
             carve_active.set(False)
             carve_meta.set(None)
             _set_layer("dem_carve", None)
+        _mark_stale_from_results()         # results computed on the replaced terrain go amber
         with reactive.isolate():           # chain-aware wording (light, isolated reads)
             will_chain = (_domain_build() is None
                           and not any(f is not None for f in
                                       (up_feat(), left_feat(), right_feat(), down_feat())))
-        ui.notification_show("Terrain ready — generating boundaries…" if will_chain
+        ui.notification_show("Terrain ready. Generating boundaries…" if will_chain
                              else "Terrain ready.", duration=4)
 
     # ---- channel carving (Terrain ▸ Channel modification) ----
@@ -1889,9 +2366,9 @@ def server(input, output, session):
             if marks:
                 _stale_marks.set(frozenset(_stale_marks() | marks))
         if marks:
-            ui.notification_show("Terrain changed — existing surface/groundwater results were "
-                                 "computed on the previous terrain; re-run to update them.",
-                                 type="warning", duration=8)
+            ui.notification_show("Terrain changed. Existing surface/groundwater results "
+                                 "were computed on the previous terrain; re-run to update "
+                                 "them.", type="warning", duration=8)
 
     @reactive.effect
     def _carve_btn():
@@ -1919,7 +2396,8 @@ def server(input, output, session):
                 mx = max(float(meta.get("max_cut_m") or 0.5), 0.25)
                 ov = results.raster_overlay(meta["diff_path"], vmin=0.0, vmax=mx, cmap="Blues")
                 _set_layer("dem_carve", ImageOverlay(url=ov["url"], bounds=ov["bounds"],
-                                                     name="Channel modification", opacity=0.85))
+                                                     name="Channel modification", opacity=0.85,
+                                                     pane=ml_mod.PANE_TERRAIN))
                 _unhide_node_layers("terrain.chanmod")
             except Exception:  # noqa: BLE001
                 pass
@@ -2323,6 +2801,10 @@ def server(input, output, session):
             return                # in flight, or this generation already tried (no retry loop)
         if delineate_mode() == "manual" and not _manual_da_valid():
             return                # subscribing read — fires again the moment a valid DA arrives
+        with reactive.isolate():  # source reads stay isolated: the PICK handler launches the
+            rec = dem_src() or {}  # import when a raster arrives, never this chain
+            if _dem_local_active() and not (rec.get("path") and Path(rec["path"]).is_file()):
+                return            # local mode without a usable raster: nothing to auto-run
         _chain["dem"] = g
         _launch_dem_fetch(reach_feat())
 
@@ -2524,6 +3006,43 @@ def server(input, output, session):
         _wire_state.set(v)
         await session.send_custom_message("hype3d_wire", {"on": v})
 
+    # 3-D grid style (Model grid pane, "3D display"): opacity on the body+top actors,
+    # color on the wireframe lines and surface cell edges. None color = the stock
+    # elevation coloring. Session-scoped like the wireframe toggle.
+    grid_opacity3d_v = reactive.value(1.0)
+    grid_color3d_v = reactive.value(None)
+
+    async def _send_grid_style():
+        with reactive.isolate():
+            await session.send_custom_message("hype3d_grid_style", {
+                "opacity": float(grid_opacity3d_v()),
+                "color": grid_color3d_v()})
+
+    @reactive.effect
+    @reactive.event(input.grid_opacity3d, ignore_init=True)
+    async def _grid_opacity3d_change():
+        try:
+            v = max(0.05, min(float(input.grid_opacity3d()), 1.0))
+        except Exception:  # noqa: BLE001
+            return
+        if abs(v - float(grid_opacity3d_v())) < 1e-9:
+            return          # pane remounts re-register at the kept value: no re-send
+        grid_opacity3d_v.set(v)
+        await _send_grid_style()
+
+    @reactive.effect
+    @reactive.event(input.grid_color3d_evt)    # nonce event input: no ignore_init
+    async def _grid_color3d_change():
+        c = (input.grid_color3d_evt() or {}).get("c")
+        if c == "default":
+            c = None
+        elif not isinstance(c, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+            return
+        if c == grid_color3d_v():
+            return
+        grid_color3d_v.set(c)
+        await _send_grid_style()
+
     @reactive.effect
     def _cancel_mesh3d():
         if not _clicked_dynamic("mesh3d_cancel"):
@@ -2564,6 +3083,7 @@ def server(input, output, session):
             if auto:
                 log_lines.append("[auto grid] failed: " + str(g["error"])[:300])
                 log_tick.set(len(log_lines))
+                print("[auto grid] failed:", str(g["error"])[:300], flush=True)
             else:
                 ui.notification_show(f"Mesh build failed: {g['error']}", type="error", duration=10)
             return
@@ -2669,11 +3189,12 @@ def server(input, output, session):
                  "alt_k_lo_on", "alt_k_hi_on", "alt_g_lo_on", "alt_g_hi_on",
                  "alt_k_lo", "alt_k_hi", "alt_g_lo", "alt_g_hi", "alt_combos",
                  "site_name", "site_analyst", "site_org", "site_date", "site_notes",
+                 "report_fn_envelope",
                  "ras_flow", "ras_slope", "ras_n", "ras_cell", "ras_hours", "ras_dt",
                  "ras_out_min", "wetted_filter", "show_removed_pools",
                  "kh", "kv", "porosity", "use_kzones", "kzone_kh", "kzone_kv",
                  "cell_size", "gw_mod_depth", "z",
-                 "grid_wireframe",
+                 "grid_wireframe", "grid_opacity3d",
                  "carve_bw", "carve_depth", "carve_slope", "hz_ppc", "hz_sample",
                  "fn_do", "fn_no3", "fn_o2_rate", "fn_do_thresh", "fn_do_gate",
                  "fn_denit_rate", "fn_tau",
@@ -3755,6 +4276,7 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             adate = None
         return SiteMetadata(
+            site_id=(project_meta_v() or {}).get("site_id"),
             site_name=(str(_safe("site_name", "")).strip() or None),
             analyst=(str(_safe("site_analyst", "")).strip() or None),
             organization=(str(_safe("site_org", "")).strip() or None),
@@ -3834,6 +4356,8 @@ def server(input, output, session):
                                       class_="btn-sm btn-outline-secondary"),
                    ui.download_button("dl_report_html", "HTML",
                                       class_="btn-sm btn-outline-secondary")]),
+                # The data exports are the CURRENT SITE's numbers; the Conceptual Model
+                # carries no results at all.
                 *([] if doc == "concept" else [
                     ui.download_button("dl_report_csv", "Metrics CSV", class_="btn-sm btn-outline-secondary"),
                     ui.download_button("dl_report_summary", "Run summary", class_="btn-sm btn-outline-secondary"),
@@ -3842,57 +4366,12 @@ def server(input, output, session):
                 ui.modal_button("Close", class_="btn-sm btn-primary"),
                 class_="hype-report-actions"))
 
-    def _flux_metrics(hz_stats: dict, hz_dir):
-        """Flux-weighted §8.3 interface-pass metrics as a dict bundle: exchange (m3/s),
-        transit_times, transit_weights, path_depths (returning subset; None when the depth pass did
-        not run), censored, transit_rows. The model budget is m3/day; the canonical results +
-        streamflow are m3/s, hence the /86400."""
-        from hype_app.metrics import ExchangeAccounting
-        DAY = 86400.0
-        out = {"exchange": None, "transit_times": None, "transit_weights": None,
-               "path_depths": None, "path_lengths": None, "censored": None, "transit_rows": [],
-               "downwelling_cells": None, "iface_ppc": None}
-        acct = ((hz_stats or {}).get("flux") or {}).get("accounting") \
-            if isinstance((hz_stats or {}).get("flux"), dict) else None
-        if acct:
-            # Provenance of the returning-path count, straight off the saved accounting so an
-            # older project reports whatever density IT was run at.
-            out["downwelling_cells"] = acct.get("n_stream_cells_downwelling")
-            out["iface_ppc"] = acct.get("particles_per_cell")
-            out["exchange"] = ExchangeAccounting(
-                total_downwelling=acct["total_downwelling"] / DAY,
-                returning_hyporheic=acct["returning"] / DAY,
-                losing_to_sides=acct["losing"] / DAY,
-                unresolved=acct["unresolved"] / DAY)
-            if acct.get("total_downwelling"):
-                out["censored"] = acct["unresolved"] / acct["total_downwelling"]
-        fx = hz_results.flux_arrays(hz_dir) if hz_dir else None
-        if fx is not None:
-            ret = fx["cls"] == 1
-            has_depth = "max_depth_m" in fx
-            # Path LENGTH, for the particulate module. Written by the same optional pathline pass
-            # as the depth and absent from artifacts saved before it existed, so the microplastic
-            # capture check degrades to "re-run the calculations" instead of breaking.
-            has_length = "path_length_m" in fx
-            if ret.any():
-                out["transit_times"] = fx["time_days"][ret]
-                out["transit_weights"] = fx["weight"][ret]
-                if has_depth:
-                    out["path_depths"] = fx["max_depth_m"][ret]
-                if has_length:
-                    out["path_lengths"] = fx["path_length_m"][ret]
-            cls_names = {0: "unresolved", 1: "returning", 2: "losing",
-                         3: "gaining", 4: "throughflow"}
-            out["transit_rows"] = [
-                {"particle_id": int(i), "source_cell": int(fx["source_node"][i]),
-                 "flow_weight": float(fx["weight"][i] / DAY),
-                 "endpoint_class": cls_names.get(int(fx["cls"][i]), "unresolved"),
-                 "transit_time_days": float(fx["time_days"][i]),
-                 "max_depth_m": (float(fx["max_depth_m"][i]) if has_depth
-                                 and fx["max_depth_m"][i] == fx["max_depth_m"][i] else None),
-                 "termination": int(fx["status"][i])}
-                for i in range(len(fx["cls"]))]
-        return out
+    # Flux-weighted §8.3 interface metrics. THE BODY LIVES IN `hz_results` because it captures
+    # nothing from the session and the scenario-envelope build calls it from the report worker
+    # thread, where a `server()` closure has no business being. Kept as a local name so the call
+    # sites below read the same as they always did.
+    def _flux_metrics(hz_stats: dict, hz_dir, *, transit_rows: bool = True):
+        return hz_results.flux_metrics(hz_stats, hz_dir, transit_rows=transit_rows)
 
     def _migrate_pollutant_keys() -> None:
         """Carry a project saved under either older endpoint shape onto the current picker.
@@ -4179,6 +4658,9 @@ def server(input, output, session):
                 for k, f in (("up", up_feat()), ("left", left_feat()),
                              ("right", right_feat()), ("down", down_feat()))
                 if f and (f.get("geometry") or {}).get("type") == "LineString"}
+            spatial["wells_lonlat"] = [(float(w["lon"]), float(w["lat"]),
+                                        str(w.get("name") or ""))
+                                       for w in obs_wells()]
         except Exception:  # noqa: BLE001 — the site maps are optional
             pass
         return spatial
@@ -4189,16 +4671,76 @@ def server(input, output, session):
         # (no reactive reads anywhere under hype_app/report.py), and a Windows spawn child
         # would pay 2-4 s of interpreter+import tax per report.
         def _work():
+            res = payload["res"]
+            # THE SCENARIO ENVELOPE, off-loop and OUTSIDE the matplotlib lock (it needs no
+            # pyplot). Every completed alternative is re-screened here from its retained
+            # per-particle artifacts, which is minutes of MODFLOW already paid for and
+            # milliseconds of numpy now. Withheld whole rather than short, and never silently:
+            # the warning rides `res.warnings` into both documents, because the build is
+            # off-loop and a ticked box that produced nothing would otherwise be unexplainable.
+            envp = payload.get("envelope")
+            if envp:
+                env, warn = alt_screening.build_envelope(
+                    envp["manifest"], work_dir=envp["work_dir"], snapshot=envp["snapshot"],
+                    base_functions=res.functions, function_inputs=envp["knobs"],
+                    reach_length_m=envp["reach_length_m"], app_version=APP_VERSION)
+                upd = {}
+                if env is not None:
+                    upd["function_envelope"] = env
+                if warn is not None:
+                    upd["warnings"] = list(res.warnings) + [warn]
+                if upd:
+                    res = res.model_copy(update=upd)
             with _REPORT_MPL_LOCK:
                 paths = report_mod.generate_report(
-                    payload["res"], payload["out_dir"],
+                    res, payload["out_dir"],
                     transit_rows=payload["transit_rows"], spatial=payload["spatial"],
                     app_version=APP_VERSION,
                     model_version="MODFLOW 6 / MODPATH 7",
                     project_name=payload["project_name"],
                     include_functions=payload.get("include_functions", True))
-            return {"paths": paths, "doc": payload.get("doc")}
+            return {"paths": paths, "doc": payload.get("doc"),
+                    "build_id": payload.get("build_id"), "res": res}
         return await anyio.to_thread.run_sync(_work)
+
+    def _alt_manifest_current(input_hash=None):
+        """The alternatives manifest when it is CURRENT, else None.
+
+        ONE DEFINITION OF CURRENT, because two surfaces ask the question: the report attaches the
+        manifest so its Scenario range column is honest, and the screening pane offers the
+        envelope option only when there is something to build it from. Those used to be the same
+        four conditions written out twice, which is how they come to disagree.
+
+        Current means computed against THIS basecase (hash match), at least one completed run, and
+        not mid-sweep or halted. A stale manifest must never print ranges against a basecase it
+        never ran on."""
+        try:
+            _ar = alt_result() or {}
+            _amf = _ar.get("manifest")
+            if not _amf or _ar.get("running") or _ar.get("halted_on"):
+                return None
+            if input_hash is None:
+                input_hash = (input_snapshot() or {}).get("input_hash")
+            if _amf.get("base_input_hash") != input_hash:
+                return None
+            if not any(s.get("status") == "completed" for s in _amf.get("scenarios") or []):
+                return None
+            from hype_app.contracts import HydraulicAlternativesManifest
+            return HydraulicAlternativesManifest.model_validate(_amf)
+        except Exception:  # noqa: BLE001 — the report never fails on the sweep's account
+            return None
+
+    def _envelope_state() -> tuple[bool, str]:
+        """(can a hydraulic scenario envelope be built, why not). Drives the checkbox AND the
+        build, so a ticked box cannot mean one thing to the pane and another to the worker."""
+        mf = _alt_manifest_current()
+        return alt_screening.envelope_available(mf, work_dir=work_dir)
+
+    def _envelope_on() -> bool:
+        """The EFFECTIVE selection. A saved tick whose sweep has since been wiped, gone stale or
+        gone partial resolves to False here rather than lingering as a checked box whose value is
+        quietly ignored, which is the state the option must never sit in."""
+        return bool(_keep("report_fn_envelope", False)) and _envelope_state()[0]
 
     def _report_signature() -> str:
         """Everything a built report depends on, as one comparable string.
@@ -4212,21 +4754,133 @@ def server(input, output, session):
             # The alternatives manifest rides along so finishing (or wiping) a sweep marks a
             # built report stale — the document gains or loses its Scenario range column.
             _ar = alt_result() or {}
+            # Well records mutate IN PLACE, so wells_ver() is read for reactivity (an edit
+            # re-evaluates every consumer) but the SERIALIZED values are what decide staleness
+            # — a heal/no-op bump must not stale a built document.
+            wells_ver()
             return json.dumps({"hash": snap.get("input_hash"),
                                "fn": _fn_inputs(), "site": _site_metadata(),
                                "alts": (None if _ar.get("running") or _ar.get("halted_on")
-                                        else _ar.get("manifest"))},
+                                        else _ar.get("manifest")),
+                               # Ticking the envelope must mark a built document stale, or the
+                               # Open button reopens the file that has no envelope in it.
+                               "env": _envelope_on(),
+                               # Observation wells feed the calibration table: any edit to the
+                               # wells or the tracked pairs makes the built file stale.
+                               "wells": [dict(w) for w in obs_wells()],
+                               "pairs": [dict(p) for p in well_pairs()]},
                               sort_keys=True, default=str)
         except Exception:  # noqa: BLE001 — an unhashable knob means "assume stale"
             return ""
 
+    #: document -> the built file that proves it exists.
+    _STALE_WANT = {"hydraulics": "html", "screening": "screening_html"}
+
     def _report_stale(doc: str) -> bool:
         """Whether the named document has to be rebuilt before it can be opened."""
-        want = "html" if doc == "hydraulics" else "screening_html"
+        want = _STALE_WANT[doc]
         if not _report_files().get(want):
             return True
         stamp = _report_stamp()
         return not stamp or stamp != _report_signature()
+
+    def _capture_canonical_results(hz=None, snap_dict=None):
+        """Build and persist the validated result snapshot independently of any report.
+
+        Called the moment HZ completes and again by the report gather; both routes produce the
+        SAME canonical contract, so a saved project is comparable without ever opening a
+        report (a report is a downstream renderer, never the event that creates results)."""
+        hz = hz if hz is not None else hz_result()
+        snap_dict = snap_dict if snap_dict is not None else input_snapshot()
+        if not hz or not snap_dict:
+            raise ValueError("Hyporheic results and frozen inputs are required")
+        from hype_app.contracts import AssessmentInputSnapshot
+        snap = AssessmentInputSnapshot.model_validate(snap_dict)
+        # Overlay the CURRENT site metadata (name/analyst/date…) so fields filled after the
+        # run still appear — descriptive metadata, never physics, so this doesn't reopen the
+        # frozen inputs. The overlay re-stamps the results' computed input hash, which is why
+        # the alternatives attach below also accepts the frozen spelling (extra_hashes).
+        try:
+            snap = snap.model_copy(update={"site": _site_metadata()})
+        except Exception:  # noqa: BLE001
+            pass
+        full_stats = hz.get("stats") or {}
+        stats = full_stats.get("classes") or full_stats or {}
+        hyp = stats.get("hyporheic") or {}
+        acct = (full_stats.get("flux") or {}).get("accounting") or {}
+        net_exch = acct.get("net_stream_exchange")
+        domain_vol = (full_stats.get("domain") or {}).get("active_saturated_volume_m3")
+        fm = _flux_metrics(full_stats, hz.get("hz_dir"))
+        transit_rows = fm["transit_rows"]
+        # POROSITY: the HYPORHEIC run's, not the snapshot's.
+        #
+        # This used to read `snap.k.porosity`, which is frozen at the GROUNDWATER run, while
+        # the screening panes read the knobs the hyporheic run tracked at. Editing porosity
+        # between the two runs made the pane and this report print different pore volumes.
+        # The hyporheic value is the correct one: porosity is a MODPATH input, so it set the
+        # pore velocity, the travel times, which particles returned inside the tracking window,
+        # and therefore the volume the pore storage scales. `snapshot_porosity` stays as the
+        # fallback for a run whose knobs predate the field, and validate.py raises a warning
+        # when the two disagree rather than letting the choice pass silently.
+        porosity = signature.as_float((full_stats.get("knobs") or {}).get("porosity"))
+        if porosity is None:
+            porosity = snap.k.porosity
+        _fn_knobs = _fn_inputs()
+        frozen_hash = frozenset(h for h in (snap_dict.get("input_hash"),) if h)
+        # Observation-well calibration rides the RESULTS side (never the input snapshot — a
+        # wells edit must not re-stamp input_hash). Isolated read: the HZ-done effect and the
+        # report gather both land here, and neither may re-fire on later well edits (staleness
+        # is _report_signature's job).
+        cal = None
+        try:
+            with reactive.isolate():
+                srows, prows = well_samples(), well_pair_rows()
+            if srows:
+                from hype_app.contracts import (CalibrationPair, CalibrationStats,
+                                                CalibrationWell, GroundwaterCalibration)
+                stats_d = wells_mod.residual_stats(srows)
+                cal = GroundwaterCalibration(
+                    wells=[CalibrationWell(
+                        well_id=r["id"], name=r["name"], lat=r["lat"], lon=r["lon"],
+                        screen_elevation_m=r["screen_elev"], observed_head_m=r["obs_head"],
+                        model_layer=r["layer"], computed_head_m=r["computed"],
+                        residual_m=r["residual"], note=r["reason"]) for r in srows],
+                    pairs=[CalibrationPair(
+                        pair_id=r["id"], well_a=r["name_a"], well_b=r["name_b"],
+                        distance_m=r["distance"], computed_gradient=r["computed_gradient"],
+                        observed_gradient=r["observed_gradient"], note=r["reason"])
+                        for r in prows],
+                    stats=(CalibrationStats(
+                        n_observed=stats_d["n"], mean_error_m=stats_d["mean_error"],
+                        mean_absolute_error_m=stats_d["mean_abs_error"],
+                        rmse_m=stats_d["rmse"]) if stats_d else None))
+        except Exception:  # noqa: BLE001 — calibration is observation data, never a blocker
+            cal = None
+        # Attaches the Hydraulic Alternatives manifest when it is CURRENT: computed against
+        # this basecase (identity match), at least one completed run, and not mid-sweep or
+        # halted. A stale manifest must never print ranges against a basecase it never ran on.
+        res = results_lifecycle.build_canonical_results(
+            snap, alternatives_state=alt_result(), extra_hashes=frozen_hash,
+            hz_stats=stats, streamflow_cms=snap.streamflow.value_cms,
+            reach_length_m=_reach_length_m(), exchange=fm["exchange"],
+            transit_times_days=fm["transit_times"], transit_weights=fm["transit_weights"],
+            path_depths=fm["path_depths"], path_lengths=fm["path_lengths"],
+            footprint_weighted_m2=hyp.get("footprint_m2"), porosity=porosity,
+            snapshot_porosity=snap.k.porosity,
+            censored_fraction=fm["censored"],
+            streambed_area_m2=acct.get("streambed_area_m2"),
+            active_streambed_area_m2=acct.get("active_streambed_area_m2"),
+            return_streambed_area_m2=acct.get("return_streambed_area_m2"),
+            connected_streambed_area_m2=acct.get("connected_streambed_area_m2"),
+            net_stream_exchange_cms=(net_exch / 86400.0 if net_exch is not None else None),
+            domain_volume_m3=domain_vol, hz_accounting=acct,
+            # the same knobs the Screening panes show live, so the two never disagree. Held
+            # in a local because the scenario envelope must screen every alternative with
+            # THIS dict, not a second `_fn_inputs()` call that could resolve differently.
+            function_inputs=_fn_knobs, calibration=cal,
+            app_version=APP_VERSION)
+        results_model.set(res.model_dump(mode="json"))
+        return res, transit_rows, snap, _fn_knobs
 
     def _start_report_build(doc: str | None = None) -> bool:
         """GATHER phase of the report build, shared by the Open buttons and the auto-open effect:
@@ -4238,80 +4892,29 @@ def server(input, output, session):
         if not hz or not snap_dict:
             return False
         try:
-            from hype_app.contracts import AssessmentInputSnapshot
-            snap = AssessmentInputSnapshot.model_validate(snap_dict)
-            # Overlay the CURRENT site metadata (name/analyst/date…) so fields filled after the
-            # run still appear — descriptive metadata, never physics, so this doesn't reopen the
-            # frozen inputs.
-            try:
-                snap = snap.model_copy(update={"site": _site_metadata()})
-            except Exception:  # noqa: BLE001
-                pass
-            full_stats = hz.get("stats") or {}
-            stats = full_stats.get("classes") or full_stats or {}
-            hyp = stats.get("hyporheic") or {}
-            acct = (full_stats.get("flux") or {}).get("accounting") or {}
-            net_exch = acct.get("net_stream_exchange")
-            domain_vol = (full_stats.get("domain") or {}).get("active_saturated_volume_m3")
-            fm = _flux_metrics(full_stats, hz.get("hz_dir"))
-            exchange, transit_rows = fm["exchange"], fm["transit_rows"]
-            # POROSITY: the HYPORHEIC run's, not the snapshot's.
-            #
-            # This used to read `snap.k.porosity`, which is frozen at the GROUNDWATER run, while
-            # the screening panes read the knobs the hyporheic run tracked at. Editing porosity
-            # between the two runs made the pane and this report print different pore volumes.
-            # The hyporheic value is the correct one: porosity is a MODPATH input, so it set the
-            # pore velocity, the travel times, which particles returned inside the tracking window,
-            # and therefore the volume the pore storage scales. `snapshot_porosity` stays as the
-            # fallback for a run whose knobs predate the field, and validate.py raises a warning
-            # when the two disagree rather than letting the choice pass silently.
-            porosity = signature.as_float((full_stats.get("knobs") or {}).get("porosity"))
-            if porosity is None:
-                porosity = snap.k.porosity
-
-            res = assess.build_results(
-                snap, hz_stats=stats, streamflow_cms=snap.streamflow.value_cms,
-                reach_length_m=_reach_length_m(), exchange=exchange,
-                transit_times_days=fm["transit_times"], transit_weights=fm["transit_weights"],
-                path_depths=fm["path_depths"], path_lengths=fm["path_lengths"],
-                footprint_weighted_m2=hyp.get("footprint_m2"), porosity=porosity,
-                snapshot_porosity=snap.k.porosity,
-                censored_fraction=fm["censored"],
-                streambed_area_m2=acct.get("streambed_area_m2"),
-                active_streambed_area_m2=acct.get("active_streambed_area_m2"),
-                return_streambed_area_m2=acct.get("return_streambed_area_m2"),
-                connected_streambed_area_m2=acct.get("connected_streambed_area_m2"),
-                net_stream_exchange_cms=(net_exch / 86400.0 if net_exch is not None else None),
-                domain_volume_m3=domain_vol, hz_accounting=acct,
-                # the same knobs the Screening panes show live, so the two never disagree
-                function_inputs=_fn_inputs(),
-                app_version=APP_VERSION)
-            # Attach the Hydraulic Alternatives manifest when it is CURRENT: computed against
-            # this basecase (hash match), at least one completed run, and not mid-sweep or
-            # halted. A stale manifest must never print ranges against a basecase it never
-            # ran on.
-            try:
-                _ar = alt_result() or {}
-                _amf = _ar.get("manifest")
-                if (_amf and not _ar.get("running") and not _ar.get("halted_on")
-                        and _amf.get("base_input_hash") == snap_dict.get("input_hash")
-                        and any(s.get("status") == "completed"
-                                for s in _amf.get("scenarios") or [])):
-                    from hype_app.contracts import HydraulicAlternativesManifest
-                    res = res.model_copy(update={
-                        "alternatives": HydraulicAlternativesManifest.model_validate(_amf)})
-            except Exception:  # noqa: BLE001 — the report never fails on the sweep's account
-                pass
-            results_model.set(res.model_dump(mode="json"))
+            res, transit_rows, snap, _fn_knobs = _capture_canonical_results(hz, snap_dict)
+            _cur_mf = res.alternatives
             spatial = None
             try:
                 spatial = _report_spatial(hz.get("hz_dir"))
             except Exception:  # noqa: BLE001 — figures are best-effort
                 spatial = None
+            # THE ENVELOPE'S IMMUTABLE BUILD SNAPSHOT. Everything the worker needs is frozen
+            # here as plain data: the manifest object, the work dir, the validated snapshot and
+            # THE SAME knobs dict `build_results` just used for the Basecase. Passing the same
+            # object rather than calling `_fn_inputs()` twice is what makes "the same assumptions
+            # for every case" structural. The worker reads no live state, so artifacts changing
+            # after the checkbox enabled cannot race the build.
+            _env_on = _envelope_on() and res.functions is not None
             payload = {"res": res, "out_dir": work_dir / "report",
                        "transit_rows": transit_rows, "spatial": spatial,
                        "project_name": (project_meta_v() or {}).get("name"),
                        "doc": doc,
+                       "build_id": _report_build_id() + 1,
+                       "envelope": ({"manifest": _cur_mf, "work_dir": work_dir,
+                                     "snapshot": snap, "knobs": _fn_knobs,
+                                     "reach_length_m": _reach_length_m()}
+                                    if _env_on and _cur_mf is not None else None),
                        # Part B is droppable, Part A never is (spec §9.4: a complete hydraulic
                        # signature must be obtainable without entering any chemistry). It drops
                        # when every screening is switched off, which is the same state that leaves
@@ -4323,6 +4926,7 @@ def server(input, output, session):
             return False
         _task_armed["report"] = True
         _report_stamp.set(_report_signature())
+        _report_build_id.set(payload["build_id"])
         report_task(payload)
         return True
 
@@ -4361,12 +4965,22 @@ def server(input, output, session):
         with reactive.isolate():
             if hz_result() is None:     # results cleared mid-build; never resurrect them
                 return
+            # A SUPERSEDED WORKER LANDS NOTHING. Re-opening after an edit while a build is still
+            # in its scenario loop launches a second one; without this the slower first build
+            # would overwrite the newer documents and the paths pointing at them.
+            if out.get("build_id") is not None and out["build_id"] != _report_build_id():
+                return
             res_d = results_model()
         if not res_d:
             return
         try:
             from hype_app.contracts import AssessmentResultsV2
-            res = AssessmentResultsV2.model_validate(res_d)
+            # The worker's copy carries the scenario envelope and any warning it raised; the
+            # reactive model predates both. Preferring the worker's keeps the modal's fallback
+            # render (which reads `results_model`) agreeing with the files on disk.
+            res = out.get("res") or AssessmentResultsV2.model_validate(res_d)
+            if out.get("res") is not None:
+                results_model.set(res.model_dump(mode="json"))
             report_paths.set(paths)
             # WHICHEVER DOCUMENT WAS ASKED FOR. It used to always be the hydraulics one, which was
             # right while the only trigger was a Generate button, and wrong the moment the
@@ -4722,6 +5336,22 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             pass
 
+    def _sync_canonical_alternatives(state, *, persist: bool = True) -> None:
+        """Attach/detach the settled, identity-matched sweep on the canonical results without
+        rebuilding hydraulics. `state` is the alt_result wrapper (or None to detach)."""
+        current = results_model()
+        if not current:
+            return
+        try:
+            frozen = frozenset(h for h in ((input_snapshot() or {}).get("input_hash"),) if h)
+            updated = results_lifecycle.with_current_alternatives(current, state,
+                                                                  extra_hashes=frozen)
+            results_model.set(updated.model_dump(mode="json"))
+            if persist and not _autosave["restoring"]:
+                _save_project_file()
+        except Exception as exc:  # noqa: BLE001 — alternatives must never cost the Basecase
+            print(f"[alt] canonical attachment skipped: {exc}", flush=True)
+
     def _sweep_alt_dir():
         """Kill + disarm + wipe the alternatives batch: reactives, displayed run, on-disk dir.
         Fires on every {"gw","hz"} cascade slice and on re-delineation — the batch is only
@@ -4741,6 +5371,9 @@ def server(input, output, session):
         with reactive.isolate():
             alt_view.set(None)
             alt_result.set(None)
+            # Detach from the canonical results too (no immediate save: the cascade that
+            # called this persists through the normal autosave path).
+            _sync_canonical_alternatives(None, persist=False)
 
     def _alt_selection() -> dict:
         """The variant selection off the setup inputs: {role: multiplier|None, combos: bool}.
@@ -4898,6 +5531,7 @@ def server(input, output, session):
                 row["status"] = "not_run"
         alt_result.set({"manifest": mf, "running": False})
         _write_alt_index(mf)
+        _sync_canonical_alternatives({"manifest": mf, "running": False})
 
     @reactive.effect
     @reactive.event(input.alt_retry_evt)
@@ -5034,6 +5668,9 @@ def server(input, output, session):
         alt_result.set(out)
         if not out.get("halted_on"):
             _write_alt_index(out["manifest"])
+        # Canonical results reflect the settled sweep immediately (a halted wrapper detaches;
+        # Stop re-attaches the completed subset through _alt_finalize_halt).
+        _sync_canonical_alternatives(out)
         if child_error:
             ui.notification_show("The alternatives run failed. See the run log.",
                                  type="error", duration=8)
@@ -5707,6 +6344,48 @@ def server(input, output, session):
             return rows
         return rows
 
+    _wells_grid_cache: dict = {}    # (grb path, mtime) -> wells_mod.load_grid dict (one entry)
+    _wells_seen: dict = {}          # last input value applied per well field (mirror change guard)
+
+    @reactive.calc
+    def well_samples():
+        """Sampled rows for every observation well (computed head at the screen elevation,
+        residual, or a reason string).
+
+        Reads the BASECASE artifacts directly (work_dir paths) — never head_tifs(), which
+        follows the displayed alternative, and never alt_view(): calibration is defined
+        against the Basecase, exactly like the report. run_result() is the lifecycle dep
+        that blanks every computed cell the moment GW results clear and refills them on
+        the next completed run."""
+        wls = obs_wells()
+        wells_ver()                                     # in-place edits recompute
+        crs = proj_crs()
+        if not wls:
+            return []
+        run = run_result()
+        try:
+            if run is None:
+                return wells_mod.sample_wells(wls, crs=crs, no_run=True)
+            tifs = results.head_rasters(work_dir)
+            gwf_ws = work_dir / "model" / "gwf_workspace"
+            grid = None
+            grb = next(gwf_ws.glob("*.dis.grb"), None) if gwf_ws.exists() else None
+            if grb is not None:
+                key = (str(grb), grb.stat().st_mtime)
+                grid = _wells_grid_cache.get(key)
+                if grid is None:
+                    _wells_grid_cache.clear()           # one run's geometry at a time
+                    grid = wells_mod.load_grid(gwf_ws)
+                    if grid is not None:
+                        _wells_grid_cache[key] = grid
+            return wells_mod.sample_wells(wls, crs=crs, tifs=tifs, grid=grid)
+        except Exception:  # noqa: BLE001 — sampling must never take the session down
+            return wells_mod.sample_wells(wls, crs=None, no_run=(run is None))
+
+    @reactive.calc
+    def well_pair_rows():
+        return wells_mod.pair_rows(well_pairs(), {r["id"]: r for r in well_samples()})
+
     @render.ui
     def gradient_qual_preview():
         # Text-only (the slope + multiplier inputs live statically in the pane — re-rendering
@@ -5843,6 +6522,212 @@ def server(input, output, session):
         except ValueError as e:
             parts.append(ui.div(str(e), class_="hype-warn"))
         return ui.TagList(*parts)
+
+    # ---- observation wells pane (gw.wells) --------------------------------------------------
+    def _wells_cell_text(r):
+        """Display strings for one well row — shared by the initial table paint and the
+        hype_wells_cells patch so both surfaces always agree. Missing values render "n/a"
+        (the fmt convention), with the reason in the cell tooltip."""
+        if r.get("computed") is None:
+            return {"comp": "n/a", "resid": "n/a", "title": r.get("reason") or ""}
+        resid = "n/a" if r.get("residual") is None else f"{r['residual']:+.2f}"
+        return {"comp": f"{r['computed']:.2f}", "resid": resid,
+                "title": f"model layer {r['layer']}" if r.get("layer") else ""}
+
+    def _wells_pair_text(r):
+        """Display strings for one tracked-pair row (same shared-formatter discipline)."""
+        return {"dist": "n/a" if r.get("distance") is None else f"{r['distance']:.1f}",
+                "cg": ("n/a" if r.get("computed_gradient") is None
+                       else f"{r['computed_gradient']:.4f}"),
+                "og": ("n/a" if r.get("observed_gradient") is None
+                       else f"{r['observed_gradient']:.4f}"),
+                "title": r.get("reason") or ""}
+
+    @reactive.effect
+    async def _push_wells_cells():
+        # Typing a screen elevation / observed head recomputes samples, but the table output
+        # must NOT re-render per keystroke (a re-render remounts the input being typed in and
+        # drops focus) — the computed cells are patched in place instead (tree.js:
+        # hype_wells_cells). Names ride along so pair rows and the pickers follow renames live.
+        if sel_node() != "gw.wells":
+            return
+        srows, prows = well_samples(), well_pair_rows()
+        if not srows and not prows:
+            return
+        await session.send_custom_message("hype_wells_cells", {
+            "wells": {r["id"]: _wells_cell_text(r) for r in srows},
+            "names": {r["id"]: (r.get("name") or "") for r in srows},
+            "pairs": {p["id"]: _wells_pair_text(p) for p in prows}})
+
+    @render.ui
+    def wells_table():
+        # STRUCTURAL renderer only (obs_wells + wells_adding): the per-well inputs mount here
+        # once per add/remove. Edits route through _wells_mirror; the computed cells start
+        # from an isolated snapshot and stay live via _push_wells_cells. Nothing here may
+        # subscribe to well_samples() or input values (the gradient-table rule).
+        wls, arm = obs_wells(), wells_adding()
+        with reactive.isolate():
+            snap = {r["id"]: _wells_cell_text(r) for r in well_samples()}
+
+        def _row(w):
+            uid = w["id"]
+            cells = snap.get(uid) or {"comp": "n/a", "resid": "n/a", "title": ""}
+            return ui.tags.tr(
+                ui.tags.td(ui.input_text(f"wl_nm_{uid}", None, value=w.get("name") or "",
+                                         width="92px")),
+                ui.tags.td(ui.input_numeric(f"wl_se_{uid}", None, value=w.get("screen_elev"),
+                                            step=0.01, width="78px")),
+                ui.tags.td(ui.input_numeric(f"wl_oh_{uid}", None, value=w.get("obs_head"),
+                                            step=0.01, width="78px")),
+                ui.tags.td(cells["comp"], class_="gwl-comp", title=cells["title"]),
+                ui.tags.td(cells["resid"], class_="gwl-resid"),
+                ui.tags.td(ui.tags.button(
+                    "×", type="button", class_="hype-gpt-rm", title="Remove well",
+                    onclick=("Shiny.setInputValue('wells_rm','" + uid
+                             + ":'+Date.now(),{priority:'event'})"))),
+                data_uid=uid)
+
+        parts = []
+        if wls:
+            parts.append(ui.tags.table(
+                ui.tags.thead(ui.tags.tr(
+                    ui.tags.th("Well"),
+                    ui.tags.th("Screen elev (m)",
+                               title="Elevation of the well screen midpoint, same vertical "
+                                     "datum as the terrain. Picks the model layer sampled."),
+                    ui.tags.th("Observed (m)",
+                               title="Hydraulic head measured in the well, when available"),
+                    ui.tags.th("Computed (m)", class_="num",
+                               title="Head from the groundwater model at the screen elevation"),
+                    ui.tags.th("Residual (m)", class_="num", title="Computed minus observed"),
+                    ui.tags.th(""))),
+                ui.tags.tbody(*[_row(w) for w in wls]),
+                class_="table table-sm hype-wells-table"))
+        else:
+            parts.append(ui.div("No wells yet. Add a well on the map, then enter its screen "
+                                "elevation and any observed head.", class_="hype-instr"))
+        if arm:
+            parts.append(ui.div(
+                ui.span("Click the map to place the well…"),
+                ui.tags.button("cancel", type="button", class_="hype-link",
+                               onclick="Shiny.setInputValue('wells_arm','off:'+Date.now(),"
+                                       "{priority:'event'})"),
+                class_="hype-instr"))
+        else:
+            parts.append(ui.div(ui.tags.button(
+                "+ Add well on map", type="button", class_="btn btn-sm btn-outline-secondary",
+                onclick="Shiny.setInputValue('wells_arm','on:'+Date.now(),{priority:'event'})"),
+                class_="hype-actions"))
+        return ui.TagList(*parts)
+
+    @render.ui
+    def wells_pairs():
+        # STRUCTURAL renderer (obs_wells + well_pairs): pair cells are painted from an
+        # isolated snapshot and patched live; renames patch through the same message.
+        wls, prs = obs_wells(), well_pairs()
+        if len(wls) < 2 and not prs:
+            return None
+        with reactive.isolate():
+            snap = {p["id"]: _wells_pair_text(p) for p in well_pair_rows()}
+        names = {w["id"]: (w.get("name") or w["id"]) for w in wls}
+        parts = [ui.tags.h6("Head gradient between wells", class_="hype-wells-h")]
+        if prs:
+            def _prow(p):
+                cells = snap.get(p["id"]) or {"dist": "n/a", "cg": "n/a", "og": "n/a",
+                                              "title": ""}
+                return ui.tags.tr(
+                    ui.tags.td(ui.span(names.get(p["a"], "?"), data_wname=p["a"]), " to ",
+                               ui.span(names.get(p["b"], "?"), data_wname=p["b"]),
+                               title=cells["title"]),
+                    ui.tags.td(cells["dist"], class_="gwp-dist"),
+                    ui.tags.td(cells["cg"], class_="gwp-cg"),
+                    ui.tags.td(cells["og"], class_="gwp-og"),
+                    ui.tags.td(ui.tags.button(
+                        "×", type="button", class_="hype-gpt-rm", title="Stop tracking",
+                        onclick=("Shiny.setInputValue('wells_pair_rm','" + p["id"]
+                                 + ":'+Date.now(),{priority:'event'})"))),
+                    data_pid=p["id"])
+            parts.append(ui.tags.table(
+                ui.tags.thead(ui.tags.tr(
+                    ui.tags.th("Pair"), ui.tags.th("Distance (m)", class_="num"),
+                    ui.tags.th("Computed (m/m)", class_="num",
+                               title="(head A minus head B) / distance, from the model"),
+                    ui.tags.th("Observed (m/m)", class_="num",
+                               title="Needs an observed head at both wells"),
+                    ui.tags.th(""))),
+                ui.tags.tbody(*[_prow(p) for p in prs]),
+                class_="table table-sm hype-wells-pairs"))
+        if len(wls) >= 2:
+            parts.append(ui.div(
+                ui.input_select("wlp_a", None, names, width="108px"),
+                ui.span("to", class_="hype-wells-to"),
+                ui.input_select("wlp_b", None, names, width="108px"),
+                ui.tags.button("Track pair", type="button",
+                               class_="btn btn-sm btn-outline-secondary",
+                               onclick="Shiny.setInputValue('wells_pair_add',Date.now(),"
+                                       "{priority:'event'})"),
+                class_="hype-actions hype-wells-pickrow"))
+        return ui.TagList(*parts)
+
+    @render.ui
+    def wells_msgs():
+        # Hints + the residual summary; free to re-render (contains no inputs).
+        rows = well_samples()
+        if not rows:
+            return None
+        parts = []
+        if any(r.get("reason") == "no groundwater run" for r in rows):
+            parts.append(ui.div("Run the groundwater model to sample computed heads.",
+                                class_="hype-instr hype-dim"))
+        stats = wells_mod.residual_stats(rows)
+        if stats:
+            parts.append(ui.div(
+                f"Residuals (n = {stats['n']}): mean error {stats['mean_error']:+.2f} m, "
+                f"mean absolute error {stats['mean_abs_error']:.2f} m, "
+                f"RMSE {stats['rmse']:.2f} m.", class_="hype-instr hype-dim"))
+        return ui.TagList(*parts) if parts else None
+
+    @render.ui
+    def maplyr_rows():
+        # STRUCTURAL renderer for the Map layers list: subscribes the record list
+        # (add/remove/reorder) and _ml_paint (status transitions, relink) — NEVER
+        # map_layers_ver, which bumps on every slider drag and would remount the slider
+        # mid-drag. Slider/color values are painted from the record; the mirror keeps the
+        # record current, so a structural repaint never jumps a control backwards.
+        recs = map_layers()
+        _ml_paint()
+        with reactive.isolate():
+            status, errs = dict(_ml_status), dict(_ml_err)
+        add_btn = ui.div(_evt_btn("ml_add", "Add layers...", "btn-sm btn-outline-secondary"),
+                         class_="hype-actions")
+        if not recs:
+            return ui.TagList(
+                ui.div('No map layers yet. Click "Add layers..." to link GeoTIFF, VRT, '
+                       'Shapefile, or GeoJSON files.', class_="hype-instr hype-dim"),
+                add_btn)
+
+        def _row(rec):
+            # A whole-row button: clicking opens the layer's own pane (its tree row).
+            # Opacity, color, locate, and remove all live there now.
+            uid = rec["id"]
+            st = status.get(uid)
+            bits = [ui.span(rec.get("name") or "layer", class_="hype-ml-name",
+                            title=rec.get("path") or ""),
+                    ui.span("Raster" if rec.get("kind") == "raster" else "Vector",
+                            class_="hype-ml-kind")]
+            if st == "missing":
+                bits.append(ui.span(class_="hype-st st-warn", title="file is missing"))
+            elif st == "error":
+                bits.append(ui.span(errs.get(uid) or "could not be displayed",
+                                    class_="hype-ml-err",
+                                    title=errs.get(uid) or ""))
+            return ui.tags.button(
+                *bits, type="button", class_="hype-ml-row hype-ml-openrow",
+                data_uid=uid, title="Open this layer's settings",
+                onclick=("Shiny.setInputValue('ml_open','" + uid
+                         + ":'+Date.now(),{priority:'event'})"))
+
+        return ui.TagList(ui.div(*[_row(r) for r in recs], class_="hype-ml-list"), add_btn)
 
     @reactive.effect
     async def _start_surface():
@@ -6919,8 +7804,11 @@ def server(input, output, session):
             for cls in HZ_CLASSES:
                 gj = _tag_hz(hz_results.class_paths_geojson(hz_dir, cls), f"hz_paths_{cls}")
                 if gj:
-                    lyr = GeoJSON(data=gj, style=HZ_PATH_STYLE[cls],
-                                  hover_style=PATH_HOVER, name=f"{HZ_LABEL[cls]} paths")
+                    # style composed from the user's line prefs, not the raw constant —
+                    # this rebuild path runs on run switching and restore, and the styled
+                    # look must survive it.
+                    lyr = GeoJSON(data=gj, style=_fp_line_style(cls),
+                                  hover_style=_fp_hover_style(), name=f"{HZ_LABEL[cls]} paths")
                     lyr.on_click(_on_hz_path_click)
                     _set_layer(f"hz_paths_{cls}", lyr)
                     # entry/return dots for this class — folded into the class node's ui_tree
@@ -6995,29 +7883,21 @@ def server(input, output, session):
         combined_4326 = await _show_hz_layers(hz_dir)
         with reactive.isolate():
             _stale_marks.set(frozenset(_stale_marks() - {"hz"}))
-        # 3-D per class: classed lines + translucent zone volumes
-        origin, z0 = _scene_frame()
-        if origin is not None:
-            crs_s = _scene.get("crs")
-            for cls in HZ_CLASSES:
-                try:
-                    sub = combined_4326
-                    if sub is not None:
-                        sub = sub[sub["hz_class"] == cls]
-                    p3 = (scene.flowpaths_payload(sub, crs_s, origin, z0,
-                                                  key=f"hz3d_paths_{cls}", color=HZ_COLORS[cls],
-                                                  width=3) if sub is not None and len(sub) else None)
-                    await _send_3d(p3)
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    va = hz_results.volume_arrays(hz_dir, cls)
-                    if va is not None:
-                        await _send_3d(scene.volume_payload(
-                            f"hz3d_vol_{cls}", va[0], va[1], origin, z0,
-                            color=HZ_COLORS[cls], opacity=0.35))
-                except Exception:  # noqa: BLE001
-                    pass
+        # Canonical results are captured the moment HZ completes (readiness was established
+        # just above, so the saved state cannot pair a fresh result with a stale HZ marker).
+        # Reports and cross-project comparisons are downstream renderers of this snapshot.
+        try:
+            _capture_canonical_results(hz=res)
+            _save_project_file()
+        except Exception as exc:  # noqa: BLE001 — the successful HZ run itself remains usable
+            hz_log_lines.append(f"[canonical results] capture failed: {exc}")
+            hz_log_tick.set(len(hz_log_lines))
+            ui.notification_show("Hyporheic results completed, but the canonical result "
+                                 f"snapshot could not be saved: {exc}", type="warning",
+                                 duration=10)
+        # 3-D per class: classed lines + translucent zone volumes (shared with the
+        # restore/reconnect scene rebuild)
+        await _send_hz_3d(hz_dir, combined_4326)
         st = (res.get("stats") or {}).get("classes", {}).get("hyporheic", {})
         vol = st.get("volume_m3", 0.0)
         counts = (res.get("stats") or {}).get("counts", {})
@@ -7112,6 +7992,153 @@ def server(input, output, session):
             except Exception:  # noqa: BLE001
                 pass
 
+    async def _send_hz_3d(hz_dir=None, combined_4326=None):
+        """Classed 3-D pathlines + zone volumes for the Basecase HZ result. Fired at
+        delineation completion and by the restore/reconnect scene rebuild; inputs
+        default to the session's (restored) state."""
+        with reactive.isolate():
+            if hz_dir is None:
+                hz_dir = (hz_result() or {}).get("hz_dir")
+            if combined_4326 is None:
+                combined_4326 = hz_gdf()
+            origin, z0 = _scene_frame()
+        if not hz_dir or origin is None:
+            return
+        crs_s = _scene.get("crs")
+        for cls in HZ_CLASSES:
+            try:
+                sub = combined_4326
+                if sub is not None:
+                    sub = sub[sub["hz_class"] == cls]
+                _lst = _fp_line_style(cls)
+                with reactive.isolate():
+                    _lw3 = max(1.0, float(fp_line_weight_v()) * 1.5)
+                p3 = (scene.flowpaths_payload(sub, crs_s, origin, z0,
+                                              key=f"hz3d_paths_{cls}", color=_lst["color"],
+                                              width=_lw3, opacity=_lst["opacity"])
+                      if sub is not None and len(sub) else None)
+                await _send_3d(p3)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                va = hz_results.volume_arrays(hz_dir, cls)
+                if va is not None:
+                    await _send_3d(scene.volume_payload(
+                        f"hz3d_vol_{cls}", va[0], va[1], origin, z0,
+                        color=HZ_COLORS[cls], opacity=0.35))
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _rebuild_3d_scene():
+        """Re-send the whole 3-D scene from current state. Every content send lives in
+        a compute-time completion effect, so a restored project (or a reloaded client,
+        which loses all vtk state) would otherwise show bare terrain: no grid, no
+        basemap drape (its textures ride ONLY the hype_mesh payload), no classed
+        paths, no volumes. Idempotent and quiet; each step no-ops without its inputs.
+        Terrain needs no step here — _push_terrain_3d self-heals off the DEM."""
+        if not _HAS_MAP:
+            return
+        with reactive.isolate():
+            g = mesh_geom()
+        if g:
+            # Reconnect: the payload (drape textures included) is still warm in this
+            # session — resend directly, no mesh-child respawn, no basemap refetch.
+            await session.send_custom_message("hype_mesh", g)
+            await session.send_custom_message(
+                "hype3d_vis", {"key": "basemap", "on": _eff_checked("base.imagery")})
+            await session.send_custom_message(
+                "hype3d_vis", {"key": "basemap_topo", "on": _eff_checked("base.topo")})
+        else:
+            # Restore: rebuild from the run's DIS on disk (the _run_done recipe — the
+            # pre-run preview bed can sit metres above the run's, so never use it here).
+            try:
+                gwf_ws = work_dir / "model" / "gwf_workspace"
+                if next(gwf_ws.glob("*.dis.grb"), None) is not None:
+                    with reactive.isolate():
+                        origin0, z00 = _scene_frame()
+                        build = _domain_build()
+                        # proj_crs() can still be None mid-restore; _scene_frame() just
+                        # resolved the frame CRS (same source as every other payload).
+                        crs_obj = _scene.get("crs")
+                        crs_wkt = (crs_obj.to_wkt()
+                                   if origin0 is not None and crs_obj is not None else None)
+                    if origin0 is not None and crs_wkt is not None:
+                        _grid_auto["on"] = True     # quiet build — stay in the current view
+                        mesh_task({
+                            "run_ws": str(gwf_ws), "crs": crs_wkt,
+                            "sides": ({k: build[k] for k in ("up", "left", "right", "down")}
+                                      if build else None),
+                            "scene_z0": z00,
+                        })
+                        print("[3d rebuild] grid mesh task fired", flush=True)
+                    else:
+                        print("[3d rebuild] grid skipped: no scene frame", flush=True)
+            except Exception as e:  # noqa: BLE001 — the grid is a nicety
+                _grid_auto["on"] = False
+                print("[3d rebuild] grid skipped:", repr(e)[:300], flush=True)
+        # Re-assert the saved 3D display prefs. The checkbox/slider VALUES restore via
+        # _kept, but the pre-open clear reset the client (S.wireframe false) and the
+        # server mirrors, and the toggle effects' ignore_init swallows the pane-mount
+        # value — so without this send the pane shows ON while the scene renders OFF
+        # (the toggle-off-and-on report). Read _kept, not the inputs: the pane may
+        # never have mounted.
+        wire = bool(_kept.get("grid_wireframe", False))
+        if wire:
+            with reactive.isolate():
+                _wire_state.set(True)    # keep the toggle's change guard truthful
+            await session.send_custom_message("hype3d_wire", {"on": True})
+            print("[3d rebuild] wireframe re-asserted", flush=True)
+        try:
+            op_kept = max(0.05, min(float(_kept.get("grid_opacity3d", 1.0)), 1.0))
+        except (TypeError, ValueError):
+            op_kept = 1.0
+        with reactive.isolate():
+            if abs(op_kept - float(grid_opacity3d_v())) > 1e-9:
+                grid_opacity3d_v.set(op_kept)
+            non_default_grid = (grid_color3d_v() is not None
+                                or abs(float(grid_opacity3d_v()) - 1.0) > 1e-9)
+        if non_default_grid:
+            await _send_grid_style()     # a reloaded client lost its stored grid style
+        await _send_hz_3d()
+        with reactive.isolate():
+            origin, z0 = _scene_frame()
+        if origin is None:
+            return
+        crs_s = _scene.get("crs")
+        try:
+            if _ras_overlays.get("depth") is not None:
+                await _send_3d(scene.drape_payload("depth", _ras_overlays.get("depth"),
+                                                   crs_s, origin, lift=0.45, opacity=0.85))
+            if _ras_overlays.get("wse") is not None:
+                await _send_3d(scene.drape_payload("wse", _ras_overlays.get("wse"),
+                                                   crs_s, origin, lift=0.35, opacity=0.85))
+        except Exception:  # noqa: BLE001
+            pass
+        with reactive.isolate():
+            av = alt_view()
+            try:
+                hl = int(head_layer_v() or 1)
+            except Exception:  # noqa: BLE001
+                hl = 1
+        if av is None:
+            try:
+                ov = _head_cache.get(hl - 1)
+                if ov is not None:
+                    await _send_3d(scene.drape_payload("head", ov, crs_s, origin,
+                                                       lift=0.6, opacity=0.8))
+            except Exception:  # noqa: BLE001
+                pass
+
+    @reactive.effect
+    async def _rebuild_3d_on_reconnect():
+        # A page reload drops every vtk actor client-side while the server stays warm:
+        # the tree's ready ping (fires on every (re)connect) re-arms the whole scene
+        # exactly like restore does. No-ops on a fresh session; every read inside the
+        # rebuild is isolated, so _tree_ready is this effect's only dependency.
+        if _tree_ready() == 0:
+            return
+        await _rebuild_3d_scene()
+
     _relayer_due = reactive.value(0.0)      # monotonic deadline to re-assert scheduled layers
     _relayer_keys: set = set()              # layer keys queued for the post-burst re-add
 
@@ -7165,6 +8192,7 @@ def server(input, output, session):
             try:                            # fresh overlay, same payload — same rationale
                 _set_layer(key, ImageOverlay(url=lyr.url, bounds=lyr.bounds,
                                              opacity=float(getattr(lyr, "opacity", 1.0)),
+                                             pane=getattr(lyr, "pane", "") or "",
                                              name=getattr(lyr, "name", key) or key))
             except Exception:  # noqa: BLE001
                 _set_layer(key, lyr)
@@ -7262,7 +8290,7 @@ def server(input, output, session):
         healed: list = []
         for k in list(_layers):
             lyr = _layers.get(k)
-            if lyr is None or k in ("head", "grad_pts"):
+            if lyr is None or k in ("head", "grad_pts", "obs_wells"):
                 continue
             try:
                 fresh = _clone_layer(lyr)
@@ -7286,6 +8314,8 @@ def server(input, output, session):
                 pass
         if _layers.get("grad_pts") is not None:
             grad_ver.set(grad_ver() + 1)    # overlay owner rebuilds pins with live wiring
+        if _layers.get("obs_wells") is not None:
+            wells_ver.set(wells_ver() + 1)  # same owner-rebuild rule for the well markers
         if healed:
             # The rebuild is itself a burst the client can drop from (observed: the DEM
             # overlay vanished on a second heal pass) — trickle every healed key through the
@@ -7428,6 +8458,681 @@ def server(input, output, session):
             on = bool(fp_anim_on_v())
         if on:
             await _send_fp_anim()
+
+    # ---- flow-path LINE styling (lines are the four hz_paths_* GeoJSON layers) ----
+    def _fp_line_style(cls) -> dict:
+        # Composes the class constant with the user's display prefs. className stays: the
+        # click-routing whitelist and box select key on "hype-fp-line". Reads are isolated
+        # because _show_hz_layers calls this from inside arbitrary effects.
+        with reactive.isolate():
+            show = bool(fp_line_show_v())
+            weight = float(fp_line_weight_v())
+            opacity = float(fp_line_opacity_v())
+            mode = fp_line_mode_v()
+            color = fp_line_color_v()
+        st = dict(HZ_PATH_STYLE[cls])
+        st["weight"] = weight
+        st["opacity"] = (opacity if show else 0.0)
+        if mode == "single":
+            st["color"] = color
+        return st
+
+    def _fp_hover_style() -> dict:
+        # Invisible lines must not flash on hover, so hiding also blanks the hover style.
+        with reactive.isolate():
+            return dict(PATH_HOVER) if fp_line_show_v() else {}
+
+    async def _apply_fp_line_style():
+        # Live restyle of the four class layers (and their parked shadows, so a later
+        # clone carries the style) without any widget churn — the _sync_map_layers idiom.
+        hover = _fp_hover_style()
+        with reactive.isolate():
+            weight = float(fp_line_weight_v())
+            show = bool(fp_line_show_v())
+            opacity = float(fp_line_opacity_v()) if show else 0.0
+        for cls in HZ_CLASSES:
+            key = f"hz_paths_{cls}"
+            st = _fp_line_style(cls)
+            for obj in (_layers.get(key), _layer_shadow.get(key)):
+                if obj is None:
+                    continue
+                try:
+                    obj.style = st
+                    obj.hover_style = hover
+                except Exception:  # noqa: BLE001 — a dying widget must not kill the batch
+                    pass
+            # 3-D parity rides the same state: a light style message per class actor, no
+            # geometry re-send. mesh3d ignores keys it has not built yet.
+            try:
+                await session.send_custom_message("hype3d_style", {
+                    "key": f"hz3d_paths_{cls}", "color": st["color"],
+                    "width": max(1.0, weight * 1.5), "opacity": opacity})
+            except Exception:  # noqa: BLE001
+                pass
+
+    @reactive.effect
+    @reactive.event(input.fp_line_show, ignore_init=True)
+    async def _fp_line_show():
+        v = bool(input.fp_line_show())
+        if v == fp_line_show_v():
+            return
+        fp_line_show_v.set(v)
+        await _apply_fp_line_style()
+
+    @reactive.effect
+    @reactive.event(input.fp_line_weight, ignore_init=True)
+    async def _fp_line_weight():
+        v = float(input.fp_line_weight())
+        if v == fp_line_weight_v():
+            return
+        fp_line_weight_v.set(v)
+        await _apply_fp_line_style()
+
+    @reactive.effect
+    @reactive.event(input.fp_line_opacity, ignore_init=True)
+    async def _fp_line_opacity():
+        v = float(input.fp_line_opacity())
+        if v == fp_line_opacity_v():
+            return
+        fp_line_opacity_v.set(v)
+        await _apply_fp_line_style()
+
+    @reactive.effect
+    @reactive.event(input.fp_line_mode_evt)    # nonce event input: no ignore_init (the
+    async def _fp_line_mode():                 # input first exists at the first click)
+        m = (input.fp_line_mode_evt() or {}).get("m")
+        if m not in ("class", "single") or m == fp_line_mode_v():
+            return
+        fp_line_mode_v.set(m)      # un-isolated pane read moves the active button
+        await _apply_fp_line_style()
+
+    @reactive.effect
+    @reactive.event(input.fp_line_color_evt)   # nonce event input: no ignore_init
+    async def _fp_line_color():
+        c = (input.fp_line_color_evt() or {}).get("c")
+        if not isinstance(c, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", c) \
+                or c == fp_line_color_v():
+            return
+        fp_line_color_v.set(c)
+        await _apply_fp_line_style()
+
+    # ---- flow-path animation video export (rendered by hype_app/video.py) ----
+    _video_build_id = reactive.value(0)
+    _video_result = reactive.value(None)     # last completed build: video.py result dict
+    # worker-thread progress bridged by a polled tick — the _ras_prog idiom
+    _video_prog: dict = {"stage": "", "i": 0, "n": 0, "t0": 0.0}
+    _video_cancel = threading.Event()
+    video_tick = reactive.value(0)
+
+    def _label_from_marker(mk):
+        """(lat, lon, text, color) from a DivIcon label marker, or None.
+
+        Only the simple pattern the app itself produces is parsed
+        (<div ... style="...color:{c}...">TEXT</div>); anything else is skipped.
+        """
+        try:
+            icon = getattr(mk, "icon", None)
+            html = getattr(icon, "html", None) or ""
+            loc = getattr(mk, "location", None)
+            if not html or not loc:
+                return None
+            text = re.sub(r"<[^>]+>", " ", html).strip()
+            if not text or len(text) > 40:
+                return None
+            m = re.search(r"color\s*:\s*(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)", html)
+            return {"lat": float(loc[0]), "lon": float(loc[1]), "text": text,
+                    "color": (m.group(1) if m else "#1f3864")}
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _gather_map_scene() -> dict:
+        """Freeze the visible 2-D map into plain data for hype_app/video.py.
+
+        Walks the live layer registry (the same server-side truth the map runs
+        on), classifies each widget, and emits draw-ordered buckets: pane
+        rasters (terrain 320, ref 340), default-pane rasters, filled polygons,
+        lines, flow paths, selection, points. DivIcon labels ride separately
+        and draw last. Panes are the only z-order Leaflet guarantees, so this
+        ordering is faithful; within buckets, registry insertion order holds.
+        """
+        import base64 as _b64
+
+        buckets = {k: [] for k in ("terrain", "ref", "raster", "fill", "line",
+                                   "paths", "sel", "point")}
+        labels = []
+
+        def _vector_bucket(key, gj):
+            feats = (gj.data or {}).get("features") or []
+            if not feats:
+                return None
+            if key.startswith("hz_paths_sel"):
+                return "sel"
+            if key.startswith("hz_paths_"):
+                return "paths"
+            gt = ((feats[0].get("geometry") or {}).get("type")) or ""
+            if gt in ("Point", "MultiPoint"):
+                return "point"
+            if gt in ("Polygon", "MultiPolygon"):
+                return "fill"
+            return "line"
+
+        def _classify(key, obj):
+            if obj is None:
+                return
+            if isinstance(obj, GeoJSON):
+                b = _vector_bucket(key, obj)
+                if b:
+                    buckets[b].append({"kind": "vector", "key": key,
+                                       "data": obj.data,
+                                       "style": dict(obj.style or {}),
+                                       "point_style": dict(obj.point_style or {})})
+                return
+            if isinstance(obj, ImageOverlay):
+                url = obj.url or ""
+                if not url.startswith("data:image/"):
+                    return
+                try:
+                    png = _b64.b64decode(url.split(",", 1)[1])
+                except Exception:  # noqa: BLE001
+                    return
+                pane = (getattr(obj, "pane", "") or "")
+                b = ("terrain" if pane == ml_mod.PANE_TERRAIN
+                     else "ref" if pane == ml_mod.PANE_REF else "raster")
+                buckets[b].append({"kind": "raster", "key": key, "png": png,
+                                   "bounds": [[float(obj.bounds[0][0]), float(obj.bounds[0][1])],
+                                              [float(obj.bounds[1][0]), float(obj.bounds[1][1])]],
+                                   "opacity": float(getattr(obj, "opacity", 1.0) or 1.0)})
+                return
+            if isinstance(obj, Marker):
+                lab = _label_from_marker(obj)
+                if lab:
+                    labels.append(lab)
+                return
+            if isinstance(obj, LayerGroup):
+                for child in (obj.layers or ()):
+                    _classify(key, child)
+
+        for key, obj in list(_layers.items()):
+            if obj is None or key in _hidden_keys:
+                continue
+            _classify(key, obj)
+        items = (buckets["terrain"] + buckets["ref"] + buckets["raster"]
+                 + buckets["fill"] + buckets["line"] + buckets["paths"]
+                 + buckets["sel"] + buckets["point"])
+        return {"items": items, "labels": labels}
+
+    def _fp_video_settings(d: dict) -> tuple[float, int]:
+        # Clip length and fps ride the export_evt payload now (the Capture dropdown's
+        # Video settings group); clamp whatever the client sent.
+        try:
+            secs = float(d.get("secs"))
+        except (TypeError, ValueError):
+            secs = 8.0
+        try:
+            fps = int(d.get("fps"))
+        except (TypeError, ValueError):
+            fps = 30
+        return max(2.0, min(secs, 30.0)), (15 if fps == 15 else 30)
+
+    def _on_video_progress(stage, i, n):
+        # Worker-thread writer; the poller mirrors it into video_tick. Plain dict
+        # mutation only — no reactives off-loop (the _ras_prog idiom).
+        _video_prog["stage"] = str(stage)
+        _video_prog["i"] = int(i)
+        _video_prog["n"] = int(n)
+
+    @reactive.extended_task
+    async def video_task(payload: dict) -> dict:
+        # Worker thread like report_task. build_flowpath_video is pyplot-free (OO Figure +
+        # Agg only), so it does not take _REPORT_MPL_LOCK and can overlap a report build.
+        def _work():
+            res = video_mod.build_flowpath_video(
+                payload["spec"], payload["out"], log=lambda m: None,
+                progress=_on_video_progress, cancel=_video_cancel)
+            return {"res": res, "build_id": payload["build_id"]}
+        return await anyio.to_thread.run_sync(_work)
+
+    @reactive.effect
+    def _video_poll():
+        # 0.5 s mirror of the worker's progress dict while the task runs (_ras_poll).
+        # The tick value comes from the PLAIN dict, never from video_tick itself: a
+        # self-read would make this effect depend on the value it sets and spin the
+        # session in a synchronous invalidation loop for the whole build.
+        if video_task.status() != "running":
+            return
+        reactive.invalidate_later(0.5)
+        video_tick.set(int(_video_prog["i"]) * 100003 + int(time.monotonic() * 2))
+
+    @reactive.effect
+    @reactive.event(input.fp_video_cancel)
+    def _fp_video_cancel():
+        # The only mechanism that actually stops a worker thread: the cooperative
+        # event, checked every frame in the encode loop (task.cancel alone cannot).
+        _video_cancel.set()
+
+    def _launch_video_build(b_override=None, w_override=None,
+                            secs: float = 8.0, fps: int = 30) -> bool:
+        # GATHER on-loop: every reactive read happens here; the worker gets plain data.
+        # Fired from the header capture control (export_evt); returns True once the
+        # task is actually launched so the caller can add start feedback. b_override
+        # and w_override carry a Specified Window rubber-band rect (bounds + CSS px
+        # width) so the render covers exactly the dragged area.
+        hz = hz_view()
+        if not hz or not hz.get("hz_dir"):
+            ui.notification_show("Run the hyporheic calculations first.", type="warning")
+            return False
+        b = b_override or (input.map_bounds() if "map_bounds" in input else None)
+        if not b or not all(k in (b or {}) for k in ("west", "south", "east", "north")):
+            ui.notification_show("Move the map once so the view is known, then record.",
+                                 type="warning")
+            return False
+        visible = [cls for cls in HZ_CLASSES
+                   if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[cls]}")]
+        if not visible:
+            ui.notification_show("Every flow path class is unchecked. Show at least one "
+                                 "class to record.", type="warning")
+            return False
+        with reactive.isolate():
+            line = {"show": bool(fp_line_show_v()), "weight": float(fp_line_weight_v()),
+                    "opacity": float(fp_line_opacity_v()), "mode": fp_line_mode_v(),
+                    "color": fp_line_color_v()}
+            anim = {"speed": float(fp_anim_speed_v()), "style": fp_anim_style_v(),
+                    "color": fp_anim_color_v()}
+        try:
+            width_px = int(w_override or b.get("w") or 1280)
+        except Exception:  # noqa: BLE001
+            width_px = 1280
+        basemap = ("imagery" if _eff_checked("base.imagery")
+                   else "topo" if _eff_checked("base.topo") else "none")
+        spec = {
+            "hz_dir": hz["hz_dir"],
+            "bounds4326": {k: float(b[k]) for k in ("west", "south", "east", "north")},
+            "basemap": basemap,
+            "visible_classes": visible,
+            "line": line, "anim": anim,
+            "class_colors": dict(HZ_COLORS),
+            "scene": _gather_map_scene(),
+            "duration_s": secs, "fps": fps, "width_px": width_px,
+        }
+        bid = _video_build_id() + 1
+        _video_build_id.set(bid)
+        _task_armed["video"] = True
+        _video_cancel.clear()
+        _video_prog.update({"stage": "starting", "i": 0, "n": 0,
+                            "t0": time.monotonic()})
+        video_task({"spec": spec, "out": str(work_dir / "report" / "flowpaths_animation"),
+                    "build_id": bid})
+        return True
+
+    def _video_modal(res: dict):
+        p = Path(res["path"])
+
+        def _serve(request):
+            from starlette.responses import FileResponse
+
+            mt = {"mp4": "video/mp4", "webm": "video/webm",
+                  "png": "image/png"}.get(res["format"], "image/webp")
+            return FileResponse(p, media_type=mt,
+                                headers={"Cache-Control": "no-store"})
+
+        url = session.dynamic_route("fp_video", _serve)
+        is_still = res["format"] == "png"
+        if res["format"] in ("mp4", "webm"):
+            body = ui.tags.video(src=url, controls=True, autoplay=True, loop=True,
+                                 muted=True, class_="hype-capture-media")
+            if res["format"] == "mp4":
+                note = (f"{res['frames']} frames at {res['fps']} fps, MP4 (H.264)."
+                        if res.get("frames") else
+                        f"MP4 (H.264) at {res['fps']} fps." if res.get("fps") else
+                        "MP4 (H.264).")
+            else:
+                note = "WebM video. Install imageio-ffmpeg for MP4 output."
+        elif is_still:
+            body = ui.tags.img(src=url, class_="hype-capture-media")
+            kind = res.get("kind")
+            note = ("PNG of the whole application window."
+                    if kind == "app" else
+                    "PNG of the 3D view." if kind == "view3d" else
+                    "PNG of the selected area at twice the screen resolution."
+                    if kind == "rect" else
+                    "PNG of the current map view at twice the screen resolution.")
+            if res.get("copied"):
+                note += " Copied to the clipboard."
+        else:
+            body = ui.tags.img(src=url, class_="hype-capture-media")
+            note = ("No MP4 encoder was available, so this is an animated WebP. "
+                    "Install imageio-ffmpeg to get MP4 output.")
+        footer = [ui.download_button("dl_fp_video",
+                                     "Save image" if is_still else "Save video")]
+        if is_still:
+            # Clipboard writes need a client gesture, so the copy runs in
+            # export_menu.js (delegated on this class) from the served PNG.
+            footer.insert(0, ui.tags.button("Copy image", type="button",
+                                            class_="btn btn-default hype-copy-still",
+                                            **{"data-url": url}))
+        if is_still:
+            title = ("Window capture" if res.get("kind") == "app" else
+                     "Area capture" if res.get("kind") == "rect" else "View capture")
+        else:
+            title = ("3D view recording" if res.get("kind") == "video3d"
+                     else "Pathline animation")
+        return ui.modal(
+            body, ui.div(note, class_="hype-instr"),
+            title=title,
+            footer=ui.TagList(*footer, ui.modal_button("Close")),
+            size="l", easy_close=True)
+
+    @reactive.effect
+    def _video_done():
+        if video_task.status() in ("initial", "running", "cancelled"):
+            return
+        if not _task_armed["video"]:
+            return
+        _task_armed["video"] = False
+        try:
+            out = video_task.result()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Video build failed: {e}", type="error", duration=8)
+            return
+        with reactive.isolate():
+            if out.get("build_id") != _video_build_id():
+                return          # superseded build lands nothing
+        if (out.get("res") or {}).get("cancelled"):
+            ui.notification_show("Video build canceled.", duration=4)
+            return
+        _video_result.set(out["res"])
+        ui.modal_show(_video_modal(out["res"]))
+
+    @render.download(filename=lambda: Path((_video_result() or {}).get("path", "video")).name)
+    def dl_fp_video():
+        res = _video_result()
+        if res and Path(res["path"]).exists():
+            yield Path(res["path"]).read_bytes()
+
+    @render.ui
+    def fp_video_status():
+        if video_task.status() != "running":
+            return None
+        _ = video_tick()          # the only reactive dependency; the rest is the plain dict
+        stage = _video_prog["stage"]
+        i, n = _video_prog["i"], _video_prog["n"]
+        t0 = _video_prog["t0"]
+        if stage == "frames" and n:
+            pct = int(round(100.0 * i / n))
+            line = f"Rendering frame {i} of {n}"
+            elapsed = max(time.monotonic() - t0, 0.001)
+            if i >= 10:
+                remaining = int(round((n - i) * elapsed / i))
+                line += f", about {remaining} s left"
+        elif stage == "basemap":
+            pct, line = 2, "Fetching the basemap from the USGS service"
+        elif stage == "scene":
+            pct, line = 5, "Drawing the map layers"
+        else:
+            pct, line = 0, "Starting the video build"
+        return ui.div(
+            ui.div("Saving pathline animation", class_="hype-video-notifier-title"),
+            ui.div(ui.div(class_="hype-spinner"), ui.span(line), class_="hype-busy"),
+            ui.div(ui.div(class_="hype-prog-bar", style=f"width:{pct}%;"),
+                   class_="hype-prog"),
+            ui.input_action_button("fp_video_cancel", "Cancel", class_="hype-edit-btn"),
+            class_="hype-video-notifier",
+        )
+
+    # ---- 3-D view recording (frame-stepped capture + server MP4 assembly; the live
+    # MediaRecorder path stays as the fallback whose webm plays without ffmpeg) ----
+    _video3d_pending: dict = {}
+    _ffmpeg_probe: dict = {}
+
+    def _ffmpeg_available() -> bool:
+        if "ok" not in _ffmpeg_probe:
+            _ffmpeg_probe["ok"] = bool(video_mod.resolve_ffmpeg(lambda *_: None))
+        return _ffmpeg_probe["ok"]
+
+    async def _launch_3d_record(crop=None, secs: float = 8.0, fps: int = 30):
+        # Frames mode steps the animation on an ideal clock and the server
+        # assembles a constant-rate MP4 (the 2D builder's smoothness, in 3D).
+        mode = "frames" if _ffmpeg_available() else "recorder"
+        _video3d_pending.update(fps=int(fps), frames=int(round(secs * fps)))
+        msg = {"seconds": secs, "fps": fps, "input_id": "fp3d_webm", "mode": mode}
+        if isinstance(crop, dict):
+            msg["crop"] = crop      # canvas-pixel rect from the rubber band
+        await session.send_custom_message("hype3d_record", msg)
+        if mode == "frames":
+            ui.notification_show("Building the 3D video, one frame at a time…",
+                                 duration=5)
+        else:
+            ui.notification_show(f"Recording the 3D view for {secs:.0f} seconds…",
+                                 duration=secs + 2)
+
+    @reactive.extended_task
+    async def video3d_task(payload: dict) -> dict:
+        def _work():
+            if payload.get("mjpeg"):
+                res = video_mod.assemble_mjpeg_to_mp4(
+                    payload["mjpeg"], payload["out"], payload.get("fps") or 30,
+                    frames=payload.get("frames"), log=lambda m: None)
+                if res.get("format") == "mp4":
+                    try:                    # the frame dump is tens of MB, drop it
+                        Path(payload["mjpeg"]).unlink()
+                    except OSError:
+                        pass
+            else:
+                res = video_mod.transcode_webm_to_mp4(
+                    payload["webm"], payload["out"], log=lambda m: None,
+                    fps=payload.get("fps"))
+            return {"res": res}
+        return await anyio.to_thread.run_sync(_work)
+
+    @reactive.effect
+    @reactive.event(input.fp3d_webm)
+    def _fp3d_uploaded():
+        files = input.fp3d_webm() or []
+        if not files:
+            return
+        src = Path(files[0]["datapath"])
+        name = str(files[0].get("name") or "")
+        out = work_dir / "report"
+        out.mkdir(parents=True, exist_ok=True)
+        pend = dict(_video3d_pending)
+        _task_armed["video3d"] = True
+        if name.lower().endswith(".mjpeg"):
+            dst = out / "view3d.mjpeg"
+            shutil.copy2(src, dst)
+            video3d_task({"mjpeg": str(dst), "out": str(out / "view3d"),
+                          "fps": pend.get("fps"), "frames": pend.get("frames")})
+        else:
+            dst = out / "view3d.webm"
+            shutil.copy2(src, dst)
+            video3d_task({"webm": str(dst), "out": str(out / "view3d"),
+                          "fps": pend.get("fps")})
+
+    @reactive.effect
+    def _video3d_done():
+        if video3d_task.status() in ("initial", "running", "cancelled"):
+            return
+        if not _task_armed["video3d"]:
+            return
+        _task_armed["video3d"] = False
+        try:
+            out = video3d_task.result()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"3D video transcode failed: {e}", type="error", duration=8)
+            return
+        res = dict(out["res"])
+        res.setdefault("frames", "")
+        res.setdefault("fps", "")
+        res["kind"] = "video3d"
+        if res["format"] == "mjpeg":
+            # frames mode with a failed assembly: the raw frame dump is unplayable
+            ui.notification_show("The 3D video could not be assembled into an MP4. "
+                                 "Try recording again.", type="error", duration=8)
+            return
+        _video_result.set(res)
+        if res["format"] == "webm":
+            ui.notification_show("No MP4 encoder was available. The recording stayed webm.",
+                                 type="warning", duration=8)
+        ui.modal_show(_video_modal(res))
+
+    @reactive.effect
+    @reactive.event(input.hype3d_record_done)
+    def _fp3d_record_done():
+        d = input.hype3d_record_done() or {}
+        if not d.get("ok"):
+            ui.notification_show("3D recording did not produce a video"
+                                 + (f" ({d.get('err')})" if d.get("err") else "."),
+                                 type="error", duration=8)
+        elif d.get("mode") == "download":
+            ui.notification_show("The recording downloaded directly as .webm (upload path "
+                                 "unavailable in this browser).", duration=8)
+
+    # ---- Export menu (header): view capture dispatch + server-rendered 2D still ----
+    # export_evt is a nonce event posted by www/export_menu.js. The client already
+    # resolved the local branches (browser + 3D acts on the vtk canvas directly), so
+    # what arrives here is: desktop full-window capture, the browser 2D still, and
+    # the two video builds.
+    @reactive.extended_task
+    async def still_task(payload: dict) -> dict:
+        def _work():
+            res = video_mod.build_flowpath_still(payload["spec"], payload["out"],
+                                                 log=lambda m: None)
+            return {"res": res}
+        return await anyio.to_thread.run_sync(_work)
+
+    def _launch_still_build(b_override=None, w_override=None) -> bool:
+        # Unlike the video, a still must work on ANY project state: no flow paths,
+        # nothing visible, animation off are all fine (the builder draws nothing).
+        # b_override and w_override carry a Specified Window rubber-band rect.
+        b = b_override or (input.map_bounds() if "map_bounds" in input else None)
+        if not b or not all(k in (b or {}) for k in ("west", "south", "east", "north")):
+            ui.notification_show("Move the map once so the view is known, then export.",
+                                 type="warning")
+            return False
+        hz = hz_view() or {}
+        visible = [cls for cls in HZ_CLASSES
+                   if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[cls]}")]
+        with reactive.isolate():
+            anim = {"on": bool(fp_anim_on_v()), "speed": float(fp_anim_speed_v()),
+                    "style": fp_anim_style_v(), "color": fp_anim_color_v()}
+        try:
+            width_px = int(w_override or b.get("w") or 1280)
+        except Exception:  # noqa: BLE001
+            width_px = 1280
+        basemap = ("imagery" if _eff_checked("base.imagery")
+                   else "topo" if _eff_checked("base.topo") else "none")
+        spec = {
+            "hz_dir": hz.get("hz_dir") or "",
+            "bounds4326": {k: float(b[k]) for k in ("west", "south", "east", "north")},
+            "basemap": basemap,
+            "visible_classes": visible,
+            "anim": anim,
+            "class_colors": dict(HZ_COLORS),
+            "scene": _gather_map_scene(),
+            "width_px": width_px,
+            "scale": 2,        # supersample: crisper than any screen grab
+            "kind": "rect" if b_override else "view",
+        }
+        _task_armed["still"] = True
+        still_task({"spec": spec, "out": str(work_dir / "report" / "map_view")})
+        return True
+
+    @reactive.effect
+    def _still_done():
+        if still_task.status() in ("initial", "running", "cancelled"):
+            return
+        if not _task_armed.get("still"):
+            return
+        _task_armed["still"] = False
+        try:
+            out = still_task.result()
+        except Exception as e:  # noqa: BLE001
+            ui.notification_show(f"Image export failed: {e}", type="error", duration=8)
+            return
+        _video_result.set(out["res"])
+        ui.modal_show(_video_modal(out["res"]))
+
+    @reactive.effect
+    @reactive.event(input.export_evt)
+    async def _export_evt():
+        # Nonce event input (setInputValue only), so NO ignore_init: it would eat
+        # the first menu click of the session. export_menu.js already resolved the
+        # local branches (browser 3D acts on the vtk canvas directly), so what
+        # arrives here is: the whole-window shell capture, the server-rendered view
+        # still, and the two video builds.
+        d = input.export_evt() or {}
+        act = d.get("a")
+        # Optional Specified Window rubber-band rect: b = 4326 bounds of the dragged
+        # area, w = its CSS pixel width (the render width). crop = canvas pixels for
+        # the 3D recorder. Absent for Full View Extent captures.
+        b_ov = d.get("b") if isinstance(d.get("b"), dict) else None
+        w_ov = d.get("w")
+        if act == "still_view":
+            if _launch_still_build(b_ov, w_ov):
+                ui.notification_show("Rendering the view…", duration=4)
+        elif act == "save_anim":
+            secs, fps = _fp_video_settings(d)
+            _launch_video_build(b_ov, w_ov, secs, fps)
+        elif act == "record_3d":
+            secs, fps = _fp_video_settings(d)
+            await _launch_3d_record(d.get("crop"), secs, fps)
+
+    def _show_capture_preview(src: Path, kind: str, copied: bool = True):
+        # Snipping-tool flow: every camera capture lands in the preview modal with
+        # Copy image and Save image. The capture is copied into the project's report
+        # folder so dl_fp_video and the dynamic route serve a stable file.
+        dst = work_dir / "report" / "window_capture.png"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        res = {"path": str(dst), "format": "png", "kind": kind, "copied": copied}
+        _video_result.set(res)
+        ui.modal_show(_video_modal(res))
+
+    @reactive.effect
+    @reactive.event(input.capture_png)
+    def _capture_png_uploaded():
+        # Browser 3D still: the canvas PNG arrives through the chunked uploader
+        # (same reasoning as fp3d_webm). export_menu.js tried the clipboard while
+        # the click gesture was live and encoded the outcome in the file name.
+        files = input.capture_png() or []
+        if files:
+            copied = "-nocopy" not in str(files[0].get("name") or "")
+            _show_capture_preview(Path(files[0]["datapath"]), "view3d", copied)
+
+    @reactive.effect
+    @reactive.event(input.desktop_capture)
+    def _desktop_capture_done():
+        # Outcome relay from the shell (via desktop_bridge.js), plus the client-side
+        # timeout export_menu.js posts when a pre-capture shell never answers.
+        d = input.desktop_capture() or {}
+        if d.get("ok") and d.get("path"):
+            src = Path(str(d["path"]))
+            if src.exists():
+                _show_capture_preview(src, "app")
+                try:
+                    src.unlink()
+                except OSError:
+                    pass       # temp file cleanup only, never worth surfacing
+            else:
+                ui.notification_show("The shell capture file was not found.",
+                                     type="error", duration=8)
+        elif d.get("reason") == "timeout":
+            ui.notification_show("The desktop shell did not respond. Update the desktop "
+                                 "app to enable view capture.", type="warning", duration=8)
+        elif not d.get("ok"):
+            ui.notification_show("View capture failed"
+                                 + (f" ({d.get('err')})" if d.get("err") else "."),
+                                 type="error", duration=8)
+
+    @reactive.effect
+    @reactive.event(input.export_client_note)
+    def _export_client_note():
+        # Small outcomes of the client-local 3D capture branch, surfaced through the
+        # app's own notification styling instead of an alien toast.
+        d = input.export_client_note() or {}
+        if d.get("msg"):
+            ui.notification_show(str(d["msg"]),
+                                 type="warning" if d.get("warn") else "message",
+                                 duration=5)
 
     # ---- raster hover probe (value chip rendered client-side by www/raster_probe.js) ----
     # While a raster-valued tree node is selected AND effectively visible, ship the SAME
@@ -7740,6 +9445,11 @@ def server(input, output, session):
                 obj = _layer_shadow.pop(k, None)
                 if obj is not None and _layers.get(k) is None:
                     _set_layer(k, _clone_vector(obj))   # fresh model id — see _clone_vector
+                    if k in _decor_feat:
+                        # Re-push the cached geometry through the decor channel: a widget
+                        # parked while hidden may carry empty data (any past creator), and
+                        # the clone above copies data verbatim. No-op when already correct.
+                        _decor_show(k, _decor_feat.get(k), None)
             else:
                 if obj is None:
                     continue
@@ -7795,6 +9505,7 @@ def server(input, output, session):
                     except Exception:  # noqa: BLE001
                         pass
             _set_keys_visible(ui_tree.NODE_LAYERS.get(nid, ()), on)
+        _apply_ml_vis()                    # dynamic Map-layers keys sit outside NODE_LAYERS
         _bump_vis()
 
     def _hide_node_layers(nid):
@@ -7831,6 +9542,10 @@ def server(input, output, session):
                 return _feat_bounds(reach_feat())
             if nid in ("terrain", "terrain.dem", "terrain.chanmod"):
                 return _map_ui.get("dem_bounds") or _feat_bounds(reach_feat())
+            if nid == "maplyr":
+                return _ml_bounds_union()
+            if nid.startswith("ml:"):
+                return (_ml_cache.get(nid[3:]) or {}).get("bounds")
             if nid in ui_tree.NODE_SLOT and nid != "sw.wetted":
                 sv = _slot_value(ui_tree.NODE_SLOT[nid])
                 return _feat_bounds(sv() if sv else None) or _feat_bounds(domain_feat())
@@ -7947,6 +9662,13 @@ def server(input, output, session):
         except Exception:  # noqa: BLE001
             return
         await _send_3d(payload)
+        # A rebuilt terrain actor starts at full opacity: re-assert the DEM slider so
+        # the see-through setting survives fetches and restores.
+        with reactive.isolate():
+            op = float(dem_opacity_v())
+        if op < 0.999:
+            await session.send_custom_message(
+                "hype3d_style", {"key": "terrain", "opacity": op})
 
     def _task_state(t):
         try:
@@ -8058,6 +9780,9 @@ def server(input, output, session):
         else:
             disabled.discard("terrain.chanmod")
         hidden = set()
+        if not runmode.IS_DESKTOP:
+            hidden.add("report.cmp")           # cloud has no filesystem access to other projects
+            hidden.add("maplyr")               # reference layers link LOCAL files — desktop only
         if _task_state(run_task) == "initial" and run_result() is None:
             hidden.add("gw.run")               # the run row appears once a run first starts
         if run_result() is None:
@@ -8070,9 +9795,23 @@ def server(input, output, session):
             hidden.add("fn")                   # function screening reads the delineation's RTD
         dimmed = {nid for nid in ui_tree.NODE_LAYERS
                   if checks.get(nid) and not _eff_checked(nid)}
+        extras = []
+        if runmode.IS_DESKTOP:
+            # Dynamic per-layer rows under the Map layers group (ids "ml:<uid>", NOT in
+            # ui_tree.NODES — the dispatch below routes them before the static-id guards).
+            group_on = _node_checked("maplyr")
+            for rec in map_layers():           # subscribing read: add/remove re-pushes the tree
+                uid = rec.get("id")
+                vis = bool(rec.get("visible", True))
+                extras.append({"id": _ml_key(uid), "label": rec.get("name") or "layer",
+                               "parent": "maplyr", "depth": 1, "group": False,
+                               "status": {"missing": "warn",
+                                          "error": "error"}.get(_ml_status.get(uid), "none"),
+                               "check": vis, "disabled": False,
+                               "dim": vis and not group_on})
         payload = ui_tree.build_tree_payload(
             selected=sel_node(), statuses=statuses, checks=checks,
-            disabled=disabled, hidden=hidden, dimmed=dimmed)
+            disabled=disabled, hidden=hidden, dimmed=dimmed, extra_rows=extras)
         payload["view"] = view_mode_v()        # header 2D/3D buttons sync from this
         await session.send_custom_message("hype_tree", payload)
 
@@ -8085,6 +9824,14 @@ def server(input, output, session):
             _tree_ready.set(_tree_ready() + 1)
         elif kind == "select":
             nid = evt.get("id")
+            if isinstance(nid, str) and nid.startswith("ml:"):
+                # Dynamic layer rows get their own per-layer pane; stale ids no-op.
+                with reactive.isolate():
+                    known = any(_ml_key(r.get("id")) == nid for r in map_layers())
+                if known:
+                    sel_src.set("tree")
+                    sel_node.set(nid)
+                return
             if nid in ui_tree.NODE:            # selection never moves the view — the props
                 sel_src.set("tree")            # header's Zoom-to-extent button does that
                 sel_node.set(nid)
@@ -8105,11 +9852,11 @@ def server(input, output, session):
             # Empty-map click → deselect (clears the props context). Skipped when a map-driven
             # selection consumed the same click (mirror/boundary/path picks and flow-path box
             # selects stamp map_sel_ts),
-            # and while an "add gradient point" click is armed — that click IS the placement
-            # (tree.js can't see this state, and near-line clicks land on tiles, not the line;
-            # message order vs the widget interaction is not guaranteed).
+            # and while an "add gradient point" or "add well" click is armed — that click IS
+            # the placement (tree.js can't see this state, and near-line clicks land on tiles,
+            # not the line; message order vs the widget interaction is not guaranteed).
             with reactive.isolate():
-                if grad_adding() is not None:
+                if grad_adding() is not None or wells_adding():
                     return
             ts = _map_ui.get("map_sel_ts")
             if ts is not None and (time.monotonic() - float(ts)) < 0.8:
@@ -8134,16 +9881,32 @@ def server(input, output, session):
                                      if k.startswith("hz_") and _layers.get(k) is None])
         elif kind == "check":
             nid = evt.get("id")
+            if isinstance(nid, str) and nid.startswith("ml:"):
+                # Dynamic Map-layers row: intent lives on the RECORD (persisted), not in
+                # _check_state; the ver bump drives autosave and the tree re-push.
+                with reactive.isolate():
+                    rec = next((r for r in map_layers() if _ml_key(r.get("id")) == nid), None)
+                if rec is not None:
+                    rec["visible"] = bool(evt.get("on"))
+                    _set_keys_visible((nid,), _ml_eff(rec))
+                    with reactive.isolate():
+                        map_layers_ver.set(map_layers_ver() + 1)
+                    _bump_vis()
+                return
             if nid not in ui_tree.NODE:
                 return
             on = bool(evt.get("on"))
             _check_state[nid] = on             # raw intent; ancestors stay authoritative
             affected = _apply_check_effective(nid)
+            if nid == "maplyr":                # group toggle: the static walk finds no children
+                _apply_ml_vis()
             if on and nid in ("base.imagery", "base.topo"):    # base maps act as a radio
                 other = "base.topo" if nid == "base.imagery" else "base.imagery"
                 _check_state[other] = False
                 # fold the sibling's nodes into the 3-D vis sync below, or the unticked
-                # basemap's drape key (basemap/basemap_topo) keeps its stale visibility
+                # basemap's drape key (basemap/basemap_topo) keeps its stale visibility.
+                # Unticking the ACTIVE leaf is allowed (both off = no basemap, per user);
+                # the client picker's ready-texture fallback keeps SWITCHES from blanking.
                 affected = list(affected) + list(_apply_check_effective(other))
             for mid in affected:               # the same checkboxes drive the 3-D scene
                 key3d = ui_tree.NODE_3D.get(mid)
@@ -8179,6 +9942,16 @@ def server(input, output, session):
             # Nothing selected: first-run shows the Get-started card; once work exists an
             # empty output keeps the card hidden (tree.js follows the output's content).
             return _pane_welcome() if not _has_workspace() else None
+        if isinstance(nid, str) and nid.startswith("ml:"):
+            # Dynamic map-layer rows: a per-layer pane. The record + _ml_paint reads make
+            # this output repaint on add/remove/status transitions, never on slider drags
+            # (the mirror mutates the record in place). A stale id (layer removed, cloud
+            # session) falls back to the group pane.
+            uid = nid[3:]
+            rec = next((r for r in map_layers() if r.get("id") == uid), None)
+            if runmode.IS_DESKTOP and rec is not None:
+                return _props_shell(str(rec.get("name") or "Layer"), _pane_ml_layer(uid))
+            return _props_shell(ui_tree.NODE["maplyr"]["label"], _pane_maplyr())
         fn = PANE_FOR_NODE.get(nid)
         if fn is None:
             return None
@@ -8190,7 +9963,7 @@ def server(input, output, session):
                 return _props_shell(title, ui.div(msg, class_="hype-instr"),
                                     _next_hint(jump, jlabel))
         return _props_shell(title, fn(), clear_btn=(nid in ("bnd", "sw", "gw")),
-                            wide=(nid == "gw.alt"))
+                            wide=(nid in ("gw.alt", "gw.wells")))
 
     # ---- navigation ----
     def _reachable():
@@ -8466,6 +10239,195 @@ def server(input, output, session):
             grad_adding.set(None)
 
     @reactive.effect
+    @reactive.event(last_click)
+    def _wells_add_on_click():
+        # Observation-well placement: an armed click anywhere on the map becomes a well.
+        # No snap tolerance (unlike gradient points) — a well outside the model grid is
+        # legal to place and simply samples as "outside model grid".
+        if not wells_adding() or sel_node() != "gw.wells":
+            return
+        c = last_click()
+        if not c:
+            return
+        import uuid
+        wls = list(obs_wells())
+        wls.append({"id": uuid.uuid4().hex[:8],
+                    "name": wells_mod.default_name([w.get("name") for w in wls]),
+                    "lat": float(c[0]), "lon": float(c[1]),
+                    "screen_elev": None, "obs_head": None})
+        _map_ui["map_sel_ts"] = time.monotonic()   # consumed — mapclear must not deselect
+        obs_wells.set(wls)
+        wells_adding.set(False)
+
+    @reactive.effect
+    @reactive.event(input.wells_arm)
+    def _wells_arm():
+        # Value-encoded nonce input ("on:<ts>" / "off:<ts>") — remount-proof (gpt_arm idiom).
+        on = str(input.wells_arm() or "").split(":", 1)[0] == "on"
+        wells_adding.set(on)
+        if on:
+            view_mode_v.set("2d")                  # wells are placed on the 2-D map
+
+    @reactive.effect
+    @reactive.event(input.wells_rm)
+    def _wells_rm():
+        uid = str(input.wells_rm() or "").split(":", 1)[0]
+        wls = [w for w in obs_wells() if w["id"] != uid]
+        if len(wls) == len(obs_wells()):
+            return
+        obs_wells.set(wls)
+        for k in [k for k in _wells_seen if k.endswith(uid)]:
+            _wells_seen.pop(k, None)
+        kept = [p for p in well_pairs() if uid not in (p["a"], p["b"])]
+        if len(kept) != len(well_pairs()):
+            well_pairs.set(kept)
+            ui.notification_show("Removed a tracked pair that referenced the deleted well.",
+                                 duration=4)
+
+    @reactive.effect
+    def _wells_mirror():
+        # The _gpt_mirror idiom for the per-well inputs (name, screen elevation, observed
+        # head): on change, write the record IN PLACE and bump wells_ver — samples re-read
+        # without remounting the input being typed in. Unlike gradients, a cleared numeric
+        # is a VALID value here (None = no observation), so the change guard compares
+        # against the record, not a seen-cache of non-None values.
+        changed = False
+        for w in obs_wells():                      # re-arms when rows are added/removed
+            uid = w["id"]
+            for fld, iid in (("name", f"wl_nm_{uid}"), ("screen_elev", f"wl_se_{uid}"),
+                             ("obs_head", f"wl_oh_{uid}")):
+                try:
+                    v = input[iid]()               # subscribes; SilentException until mounted
+                except Exception:  # noqa: BLE001
+                    continue
+                if fld == "name":
+                    v = str(v or "").strip()
+                    if not v:                      # never blank a name — the report prints it
+                        continue
+                else:
+                    try:
+                        v = None if v is None else float(v)
+                    except (TypeError, ValueError):
+                        continue
+                if v == w.get(fld):
+                    continue
+                w[fld] = v
+                changed = True
+        if changed:
+            with reactive.isolate():
+                wells_ver.set(wells_ver() + 1)
+
+    @reactive.effect
+    @reactive.event(input.wells_pair_add)
+    def _wells_pair_add():
+        import uuid
+        try:
+            a, b = str(input.wlp_a() or ""), str(input.wlp_b() or "")
+        except Exception:  # noqa: BLE001
+            return
+        ids = {w["id"] for w in obs_wells()}
+        if a not in ids or b not in ids:
+            return
+        if a == b:
+            ui.notification_show("Choose two different wells.", duration=4)
+            return
+        if any({p["a"], p["b"]} == {a, b} for p in well_pairs()):
+            ui.notification_show("That pair is already tracked.", duration=4)
+            return
+        well_pairs.set(list(well_pairs()) + [{"id": uuid.uuid4().hex[:8], "a": a, "b": b}])
+
+    @reactive.effect
+    @reactive.event(input.wells_pair_rm)
+    def _wells_pair_rm():
+        pid = str(input.wells_pair_rm() or "").split(":", 1)[0]
+        kept = [p for p in well_pairs() if p["id"] != pid]
+        if len(kept) != len(well_pairs()):
+            well_pairs.set(kept)
+
+    @reactive.effect
+    def _reset_wells_adding():
+        # Disarm when the user navigates off the wells pane (mirrors _reset_grad_adding) —
+        # a stale arm would swallow the next unrelated map click.
+        if wells_adding() and sel_node() != "gw.wells":
+            wells_adding.set(False)
+
+    # ---- Map layers pane events (reference layers; see _sync_map_layers) ----
+    @reactive.effect
+    @reactive.event(input.ml_add)
+    async def _ml_add():
+        await _pick_map_layers("maplayer_add")
+
+    @reactive.effect
+    @reactive.event(input.ml_warn)
+    async def _ml_warn():
+        # The missing-file warning button: locate the moved/renamed file (relink in place).
+        uid = str(input.ml_warn() or "").split(":", 1)[0]
+        if uid:
+            await _pick_map_layers(f"maplayer_relink:{uid}")
+
+    @reactive.effect
+    @reactive.event(input.ml_rm)
+    def _ml_rm():
+        uid = str(input.ml_rm() or "").split(":", 1)[0]
+        with reactive.isolate():
+            recs = [dict(r) for r in map_layers()]
+        keep = [r for r in recs if r.get("id") != uid]
+        if len(keep) != len(recs):
+            map_layers.set(keep)           # the owner effect tears down widget + caches
+            with reactive.isolate():
+                cur = sel_node()
+            if cur == _ml_key(uid):        # the open pane's layer is gone: show the group
+                _select("maplyr")
+
+    @reactive.effect
+    @reactive.event(input.ml_open)
+    def _ml_open():
+        # Group-pane layer rows: clicking one selects its tree row (per-layer pane).
+        uid = str(input.ml_open() or "").split(":", 1)[0]
+        with reactive.isolate():
+            known = any(r.get("id") == uid for r in map_layers())
+        if known:
+            _select(_ml_key(uid))
+
+    @reactive.effect
+    @reactive.event(input.ml_color_evt)
+    def _ml_color():
+        evt = input.ml_color_evt() or {}
+        uid = str(evt.get("u") or "")
+        c = str(evt.get("c") or "")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+            return
+        with reactive.isolate():
+            rec = next((r for r in map_layers() if r.get("id") == uid), None)
+        if rec is not None and rec.get("color") != c:
+            rec["color"] = c               # in place; the owner effect applies the restyle
+            with reactive.isolate():
+                map_layers_ver.set(map_layers_ver() + 1)
+
+    @reactive.effect
+    def _ml_op_mirror():
+        # The _wells_mirror idiom for the per-layer opacity sliders: write the record IN
+        # PLACE and bump the ver — _sync_map_layers (the single widget writer) applies it,
+        # so nothing here touches widgets and nothing remounts the slider being dragged.
+        changed = False
+        for rec in map_layers():                   # re-arms when rows are added/removed
+            try:
+                v = input[f"ml_op_{rec['id']}"]()  # subscribes; SilentException until mounted
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                v = min(1.0, max(0.0, float(v)))
+            except (TypeError, ValueError):
+                continue
+            if abs(v - float(rec.get("opacity", 0.8))) < 1e-9:
+                continue
+            rec["opacity"] = v
+            changed = True
+        if changed:
+            with reactive.isolate():
+                map_layers_ver.set(map_layers_ver() + 1)
+
+    @reactive.effect
     def _reach_edit_toggle():
         # Props-pane "Edit centerline" / "Done editing" button → flip reach_edit. Strict-increment
         # guard (reach_edit_ctl re-renders, resetting the click count) — like _bnd_edit_buttons.
@@ -8675,7 +10637,11 @@ def server(input, output, session):
         await _cascade_clear("bnd", include_self=True)   # boundaries + sw/gw/hz + report + GMS
         kzone_feats.set([]); bnd_slot.set(None)
         grad_pts.set([]); grad_adding.set(None); ref_slope_override.set(None)
+        obs_wells.set([]); well_pairs.set([]); wells_adding.set(False)   # wells anchor to this
+        _wells_seen.clear(); _wells_grid_cache.clear()                   # reach's domain
         dem_path.set(None); dem_meta.set(None)   # also drop the downloaded DEM + its overlay
+        # dem_src deliberately SURVIVES a reach clear: the source choice belongs to the
+        # project, and the auto-chain re-imports the linked raster for the redrawn reach.
         dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _set_layer("dem", None)
         carve_active.set(False); carve_meta.set(None)    # active_dem() must not keep serving a
@@ -8784,7 +10750,7 @@ def server(input, output, session):
         _autosave["restoring"] = True
         session.on_flushed(lambda: _autosave.update(restoring=False), once=True)
         _task_armed.update(sw=False, gw=False, hz=False, alt=False, report=False,
-                           gms=False, pick=False)
+                           gms=False, pick=False, cmp=False)
         _gms_epoch["n"] += 1               # detached GMS builds must never swap post-reset
         _gms_pending.clear()
         try:
@@ -8806,7 +10772,17 @@ def server(input, output, session):
         _chain["dem"] = _chain["bnd"] = None
         up_feat.set(None); left_feat.set(None); right_feat.set(None); down_feat.set(None)
         kzone_feats.set([]); wse_extent_feat.set(None); bnd_slot.set(None)
+        grad_pts.set([]); grad_adding.set(None); ref_slope_override.set(None)
+        _gpt_seen.clear()   # was skipped here for years: New project inherited the previous
+        #                     project's gradient points until a restore/reach-clear overwrote them
+        obs_wells.set([]); well_pairs.set([]); wells_adding.set(False)
+        _wells_seen.clear(); _wells_grid_cache.clear()
+        map_layers.set([])                 # reference-layer POINTERS are per-project too
+        with reactive.isolate():
+            map_layers_ver.set(map_layers_ver() + 1)
+        _ml_cache.clear(); _ml_status.clear(); _ml_err.clear()
         dem_path.set(None); dem_meta.set(None)
+        dem_src.set(dem.normalize_dem_source(None))   # back to the 3DEP default
         dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
         _drop_gw_artifacts()               # run result + head/grid/WSE layers + the grid preview
         _set_project_meta(None, None)      # create/open re-establish it (or the gate re-arms)
@@ -8942,7 +10918,8 @@ def server(input, output, session):
     def _about():
         ui.modal_show(ui.modal(
             ui.markdown(
-                f"**HYPE — Hyporheic Exchange Explorer**\n\nVersion {APP_VERSION}\n\n"
+                f"**HYPE - Hyporheic Exchange Explorer**\n\nVersion {APP_VERSION}"
+                f"{_desktop_build_line()}\n\n"
                 "Build a reach-scale hyporheic-exchange model from a map: trace a reach, fetch "
                 "terrain, model the water surface, run the groundwater model, and delineate "
                 "the hyporheic zone.\n\n"
@@ -9014,6 +10991,7 @@ def server(input, output, session):
                 "delineate_mode": delineate_mode(),
                 "reach_gen": reach_gen(), "dem_gen": dem_gen(),
                 "dem_meta": dem_meta(),
+                "dem_source": _tokenize_paths(dict(dem_src() or {})),
                 "carve_active": carve_active(),
                 "carve_meta": _tokenize_paths(carve_meta()),
                 "dem_hs": dem_hs_v(), "dem_opacity": dem_opacity_v(),
@@ -9021,6 +10999,12 @@ def server(input, output, session):
                 "origin_override": origin_override(),
                 "ref_slope_override": ref_slope_override(),
                 "grad_pts": list(grad_pts()),
+                "obs_wells": [dict(w) for w in obs_wells()],
+                "well_pairs": [dict(p) for p in well_pairs()],
+                # Path POINTERS only, never copies. tokenize_paths rewrites in-workspace
+                # paths to $WORKSPACE$ tokens and leaves foreign absolute paths untouched,
+                # so external reference files survive save/restore byte-identical.
+                "map_layers": _tokenize_paths([dict(r) for r in map_layers()]),
                 "wse_mode": wse_mode_v(),
                 "ras_result": _tokenize_paths(ras_result()),
                 "ras_opacity": ras_opacity_v(),
@@ -9038,6 +11022,9 @@ def server(input, output, session):
                                                if k != "running"} or None),
                 "head_layer": head_layer_v(), "head_opacity": head_opacity_v(),
                 "head_contours": hd_contours_v(),
+                "fp_line_show": fp_line_show_v(), "fp_line_weight": fp_line_weight_v(),
+                "fp_line_opacity": fp_line_opacity_v(), "fp_line_mode": fp_line_mode_v(),
+                "fp_line_color": fp_line_color_v(),
                 "hz_result": _tokenize_paths(hz_result()),
                 "wse_used": _tokenize_paths(_wse_used.get("path")),
                 "stale_marks": sorted(_stale_marks()),
@@ -9045,6 +11032,8 @@ def server(input, output, session):
                 "project_units": (project_meta_v() or {}).get("units")
                                  or project_meta.UNITS_METRIC,
                 "project_created": (project_meta_v() or {}).get("created"),
+                "project_id": (project_meta_v() or {}).get("project_id"),
+                "site_id": (project_meta_v() or {}).get("site_id"),
                 "kept": dict(_kept),
                 "check_state": dict(_check_state),
                 "hidden_keys": sorted(_hidden_keys),
@@ -9414,6 +11403,683 @@ def server(input, output, session):
                             alt_task, soil_task, usgs_flow_task, gms_task)
                 if _task_state(t) == "running"]
 
+    # ---- Cross-project comparison workspace (desktop only) --------------------------------
+    # A full-screen overlay over frozen, read-only snapshots of OTHER saved projects. It never
+    # touches work_dir, the engines, or the map: sources are read through comparison.py, edits
+    # live in a ComparisonCollectionV1, and persistence is a standalone .hypecompare file.
+    # Keeping that boundary here makes it mechanically impossible for a comparison read to
+    # switch or save the active model.
+    def _comparison_path() -> Path | None:
+        raw = comparison_file_v()
+        return Path(str(raw)) if raw else None
+
+    def _comparison_inspect(collection=None):
+        collection = collection or comparison_collection_v()
+        if collection is None:
+            comparison_inspections_v.set({})
+            return {}
+        try:
+            findings = comparison_mod.inspect_collection(
+                collection, collection_path=_comparison_path())
+        except Exception as exc:  # inspection never invalidates the frozen collection
+            print(f"[comparison] source inspection failed: {exc}", flush=True)
+            findings = {}
+        comparison_inspections_v.set(findings)
+        return findings
+
+    def _comparison_set(collection, *, dirty: bool = True, autosave: bool = True):
+        """Install a collection and atomically persist edits after its first Save."""
+        path = _comparison_path()
+        if dirty:
+            collection = collection.model_copy(
+                update={"updated_at": datetime.now(timezone.utc)})
+        if dirty and autosave and path is not None:
+            try:
+                collection = comparison_mod.save_collection(collection, path)
+                dirty = False
+            except Exception as exc:  # retain dirty state so Back cannot lose the edit
+                ui.notification_show(f"Comparison autosave failed: {exc}", type="warning",
+                                     duration=8)
+        comparison_collection_v.set(collection)
+        comparison_dirty_v.set(bool(dirty))
+        _comparison_inspect(collection)
+
+    async def _comparison_title(collection=None):
+        if not _shell_present():
+            return
+        collection = collection or comparison_collection_v()
+        title = ((collection.name + " · Comparison · HYPE") if collection is not None
+                 else "HYPE Desktop")
+        await session.send_custom_message("hype_desktop", {"type": "setTitle", "title": title})
+
+    async def _comparison_open_path(path: Path):
+        if _busy_tasks():
+            ui.notification_show("A model task is still running. Wait for it to finish before "
+                                 "opening a comparison.", type="warning", duration=7)
+            return
+        try:
+            collection = comparison_mod.load_collection(path)
+        except Exception as exc:
+            ui.notification_show(f"Couldn't open the comparison: {exc}", type="error",
+                                 duration=10)
+            recents.forget_comparison(path)
+            _ensure_welcome()
+            return
+        ui.modal_remove()
+        comparison_file_v.set(str(path.resolve()))
+        comparison_collection_v.set(collection)
+        comparison_dirty_v.set(False)
+        comparison_selected_member_v.set(None)
+        comparison_mode_v.set(True)
+        recents.touch_comparison(path)
+        cmp_recents_ver.set(cmp_recents_ver() + 1)
+        _comparison_inspect(collection)
+        await _comparison_title(collection)
+
+    async def _comparison_start(*, add_current: bool):
+        if _busy_tasks():
+            ui.notification_show("A model task is still running. Wait for it to finish before "
+                                 "comparing projects.", type="warning", duration=7)
+            return
+        collection = comparison_mod.new_collection()
+        comparison_file_v.set(None)
+        comparison_dirty_v.set(False)
+        comparison_selected_member_v.set(None)
+        comparison_mode_v.set(True)
+        ui.modal_remove()
+        if add_current:
+            # The workspace compares SAVED projects: the current one seeds the roster only
+            # when its main file carries current canonical results.
+            why = None
+            if not _ws["project_file"]:
+                why = "it has not been saved yet"
+            elif results_model() is None:
+                why = "it has no hyporheic results yet"
+            elif {"gw", "hz"} & set(_stale_marks()):
+                why = "its results predate an input change"
+            if why is None:
+                try:
+                    collection = comparison_mod.add_projects(
+                        collection, [Path(_ws["project_file"])])
+                    comparison_dirty_v.set(True)
+                except Exception as exc:  # noqa: BLE001
+                    ui.notification_show(f"The current project couldn't be added: {exc}",
+                                         type="warning", duration=8)
+            else:
+                ui.notification_show(f"The open project wasn't added because {why}. "
+                                     "Use Add projects to pick saved sites.",
+                                     type="message", duration=8)
+        comparison_collection_v.set(collection)
+        _comparison_inspect(collection)
+        await _comparison_title(collection)
+
+    async def _comparison_save_to(path: Path, *, close_after: bool = False):
+        collection = comparison_collection_v()
+        if collection is None:
+            return
+        path = path.with_suffix(".hypecompare")
+        try:
+            saved = comparison_mod.save_collection(collection, path)
+        except Exception as exc:
+            ui.notification_show(f"Couldn't save the comparison: {exc}", type="error",
+                                 duration=9)
+            return
+        comparison_file_v.set(str(path.resolve()))
+        comparison_collection_v.set(saved)
+        comparison_dirty_v.set(False)
+        recents.touch_comparison(path)
+        cmp_recents_ver.set(cmp_recents_ver() + 1)
+        _comparison_inspect(saved)
+        await _comparison_title(saved)
+        if close_after:
+            await _comparison_finish_back(discard=True)
+
+    async def _comparison_finish_back(*, discard: bool = False):
+        if not discard and comparison_dirty_v() and _comparison_path() is not None:
+            await _comparison_save_to(_comparison_path())
+            if comparison_dirty_v():
+                return                     # the save failed and said so; stay in the workspace
+        if not discard and comparison_dirty_v() and _comparison_path() is None:
+            ui.modal_show(ui.modal(
+                ui.p("Save this comparison collection before closing it?"),
+                title="Unsaved comparison",
+                footer=ui.TagList(
+                    ui.input_action_button("comparison_back_cancel", "Cancel"),
+                    ui.input_action_button("comparison_back_discard", "Discard"),
+                    ui.input_action_button("comparison_back_save", "Save",
+                                           class_="btn-primary")), easy_close=True))
+            return
+        comparison_mode_v.set(False)
+        comparison_collection_v.set(None)
+        comparison_file_v.set(None)
+        comparison_dirty_v.set(False)
+        comparison_selected_member_v.set(None)
+        comparison_inspections_v.set({})
+        await _comparison_title(None)
+        await _post_title()
+        if _gated():
+            _show_welcome()
+
+    async def _comparison_add_paths(paths):
+        collection = comparison_collection_v()
+        if collection is None:
+            return
+        incoming = [Path(str(path)) for path in paths if str(path)]
+        remaining = max(0, 10 - len(collection.members))
+        if not remaining:
+            ui.notification_show("A comparison can contain up to 10 projects.",
+                                 type="warning", duration=6)
+            return
+        if len(incoming) > remaining:
+            incoming = incoming[:remaining]
+            ui.notification_show(f"Only the first {remaining} selected projects were added "
+                                 "(10-project limit).", type="warning", duration=7)
+        try:
+            updated = await anyio.to_thread.run_sync(
+                lambda: comparison_mod.add_projects(
+                    collection, incoming, comparison_path=_comparison_path()))
+        except Exception as exc:
+            ui.notification_show(f"Couldn't add projects: {exc}", type="error", duration=9)
+            return
+        _comparison_set(updated)
+
+    @reactive.effect
+    async def _sync_comparison_client():
+        visible = bool(comparison_mode_v())
+        collection = comparison_collection_v()
+        dirty = bool(comparison_dirty_v())
+        selected = comparison_selected_member_v()
+        inspections = comparison_inspections_v()
+        if not visible or collection is None:
+            await session.send_custom_message("hype_comparison", {"visible": False})
+            return
+        payload = comparison_mod.comparison_ui_payload(collection, inspections=inspections)
+        payload.update({"visible": True, "dirty": dirty,
+                        "selected_member_id": selected})
+        await session.send_custom_message("hype_comparison", payload)
+
+    async def _pick_comparison(purpose: str, *, save: bool = False,
+                               multiple: bool = False, directory: bool = False):
+        """Pick comparison sources/collections/exports on the comparison-only route."""
+        shell = _shell_present()
+        mode = "native" if shell else ("tk" if runmode.picker_mode() == "auto" else "modal")
+        if shell:
+            _pending_pick["purpose"] = purpose
+            if multiple:
+                msg = {"type": "pickProjectsMultiple", "purpose": purpose}
+            elif directory:
+                msg = {"type": "pickComparisonExport", "purpose": purpose}
+            else:
+                collection = comparison_collection_v()
+                stem = project_meta.filename_stem(
+                    getattr(collection, "name", None), "Hydraulic comparison")
+                msg = {"type": "pickComparisonSave" if save else "pickComparisonOpen",
+                       "purpose": purpose, "fileName": f"{stem}.hypecompare"}
+            await session.send_custom_message("hype_desktop", msg)
+            return
+        if mode == "tk":
+            if _task_state(pick_task) == "running":
+                ui.notification_show("A file picker window is already open. Look for it on "
+                                     "your taskbar.", type="warning", duration=6)
+                return
+            collection = comparison_collection_v()
+            stem = project_meta.filename_stem(
+                getattr(collection, "name", None), "Hydraulic comparison")
+            payload = {"mode": ("directory" if directory else
+                                "open_multiple" if multiple else
+                                "save" if save else "open"),
+                       "kind": "comparison" if not multiple else "project",
+                       "purpose": purpose,
+                       "title": ("Choose comparison export folder" if directory else
+                                 "Select HYPE projects to compare" if multiple else
+                                 "Save HYPE comparison" if save else "Open HYPE comparison"),
+                       "initial_file": f"{stem}.hypecompare" if save else "",
+                       "initial_dir": _pick_initial_dir()}
+            _pending_pick["purpose"] = purpose
+            _pick_flight["purpose"] = purpose
+            ui.notification_show("Opening a file window...", duration=4, id="pick_opening")
+            _task_armed["pick"] = True
+            pick_task(payload)
+            return
+        _show_comparison_typed_pick_modal(purpose)
+
+    def _show_comparison_typed_pick_modal(purpose: str, *, value: str = "",
+                                          error: str | None = None):
+        _pending_pick["purpose"] = purpose
+        multi = purpose == "comparison_add"
+        directory = purpose == "comparison_export"
+        instruction = ("Enter one full .hype path per line." if multi else
+                       "Enter the export folder path." if directory else
+                       "Enter the full .hypecompare file path.")
+        body = [ui.p(instruction),
+                ui.input_text_area("comparison_pick_path", None, value=value, width="100%",
+                                   rows=4 if multi else 2)]
+        if error:
+            body.append(ui.div(error, class_="text-danger", style="font-size: 0.9em;"))
+        ui.modal_show(ui.modal(
+            *body, title="Comparison path",
+            footer=ui.TagList(
+                ui.input_action_button("comparison_pick_cancel", "Cancel"),
+                ui.input_action_button("comparison_pick_go", "OK", class_="btn-primary")),
+            easy_close=True))
+
+    @reactive.effect
+    def _comparison_pick_cancel():
+        if _clicked_dynamic("comparison_pick_cancel"):
+            ui.modal_remove()
+            _pending_pick.pop("comparison_close_after_save", None)
+            if not comparison_mode_v():
+                _ensure_welcome()
+
+    @reactive.effect
+    async def _comparison_typed_pick():
+        if not _clicked_dynamic("comparison_pick_go"):
+            return
+        purpose = str(_pending_pick.get("purpose") or "")
+        raw = str(_safe("comparison_pick_path", "") or "").strip()
+        if purpose == "comparison_add":
+            paths = [Path(line.strip().strip('"')) for line in raw.splitlines()
+                     if line.strip()]
+            bad = [str(path) for path in paths if path.suffix.lower() != ".hype"
+                   or not path.is_file()]
+            if not paths or bad:
+                _show_comparison_typed_pick_modal(
+                    purpose, value=raw,
+                    error="Every entry must be an existing .hype project file.")
+                return
+            ui.modal_remove()
+            await _comparison_add_paths(paths)
+            return
+        path = Path(raw.strip('"')) if raw else None
+        if path is None:
+            _show_comparison_typed_pick_modal(purpose, value=raw, error="Enter a path.")
+            return
+        if purpose == "comparison_export":
+            if not path.is_dir():
+                _show_comparison_typed_pick_modal(
+                    purpose, value=raw, error="Choose an existing folder.")
+                return
+        elif purpose == "comparison_open":
+            if path.suffix.lower() != ".hypecompare" or not path.is_file():
+                _show_comparison_typed_pick_modal(
+                    purpose, value=raw, error="Choose an existing .hypecompare file.")
+                return
+        elif purpose.startswith("comparison_relink:"):
+            if path.suffix.lower() != ".hype" or not path.is_file():
+                _show_comparison_typed_pick_modal(
+                    purpose, value=raw, error="Choose an existing .hype project file.")
+                return
+        ui.modal_remove()
+        await _dispatch_picked_result({"purpose": purpose, "path": str(path),
+                                       "cancelled": False})
+
+    _comparison_recent: dict = {"items": []}
+
+    async def _show_comparison_add_dialog():
+        collection = comparison_collection_v()
+        if collection is None:
+            return
+        present = set()
+        for member in collection.members:
+            try:
+                present.add(str(Path(member.source_absolute).resolve()).lower())
+            except OSError:
+                present.add(str(member.source_absolute).lower())
+        items = []
+        for item in recents.load():
+            try:
+                key = str(Path(item["path"]).resolve()).lower()
+            except OSError:
+                key = str(item["path"]).lower()
+            if key not in present and Path(item["path"]).is_file():
+                items.append(item)
+        _comparison_recent["items"] = items[:10]
+        if not _comparison_recent["items"]:
+            await _pick_comparison("comparison_add", multiple=True)
+            return
+        choices = {str(index): f"{item['name']} · {Path(item['path']).parent}"
+                   for index, item in enumerate(_comparison_recent["items"])}
+        ui.modal_show(ui.modal(
+            ui.p("Add recent projects, or browse to projects stored elsewhere."),
+            ui.input_checkbox_group("comparison_recent_projects", "Recent projects",
+                                    choices, selected=[]),
+            title="Add projects",
+            footer=ui.TagList(
+                ui.input_action_button("comparison_add_cancel", "Cancel"),
+                ui.input_action_button("comparison_add_browse", "Browse files…"),
+                ui.input_action_button("comparison_add_recent", "Add selected",
+                                       class_="btn-primary")), easy_close=True))
+
+    @reactive.effect
+    def _comparison_add_cancel():
+        if _clicked_dynamic("comparison_add_cancel"):
+            ui.modal_remove()
+
+    @reactive.effect
+    async def _comparison_add_browse():
+        if not _clicked_dynamic("comparison_add_browse"):
+            return
+        ui.modal_remove()
+        await _pick_comparison("comparison_add", multiple=True)
+
+    @reactive.effect
+    async def _comparison_add_recent():
+        if not _clicked_dynamic("comparison_add_recent"):
+            return
+        raw = _safe("comparison_recent_projects", []) or []
+        selected = [raw] if isinstance(raw, str) else list(raw)
+        paths = []
+        for token in selected:
+            try:
+                paths.append(_comparison_recent["items"][int(token)]["path"])
+            except (ValueError, TypeError, IndexError):
+                continue
+        if not paths:
+            ui.notification_show("Select at least one recent project, or choose Browse files.",
+                                 type="warning", duration=5)
+            return
+        ui.modal_remove()
+        await _comparison_add_paths(paths)
+
+    async def _comparison_export_to(folder: Path):
+        collection = comparison_collection_v()
+        if collection is None:
+            return
+        inspections = comparison_inspections_v()
+        ui.notification_show("Building comparison export…", id="comparison_exporting",
+                             duration=None)
+
+        def _run_export():
+            # The overview figure is matplotlib: pyplot is process-global, so exports share
+            # the report builds' lock rather than racing them.
+            with _REPORT_MPL_LOCK:
+                return comparison_mod.generate_comparison_report(
+                    collection, folder, include_pdf=True, inspections=inspections)
+
+        try:
+            paths = await anyio.to_thread.run_sync(_run_export)
+        except Exception as exc:
+            ui.notification_show(f"Couldn't export the comparison: {exc}", type="error",
+                                 duration=10)
+            return
+        finally:
+            ui.notification_remove("comparison_exporting")
+        ui.notification_show(f"Exported {len(paths)} files to {folder}", duration=8)
+
+    @reactive.effect
+    @reactive.event(input.comparison_event)
+    async def _comparison_event():
+        msg = input.comparison_event() or {}
+        kind = str(msg.get("type") or "")
+        collection = comparison_collection_v()
+        if not comparison_mode_v() or collection is None:
+            return
+        if kind == "add_projects":
+            await _show_comparison_add_dialog()
+            return
+        if kind == "refresh":
+            ui.notification_show("Refreshing captured hydraulic snapshots…",
+                                 id="comparison_refreshing", duration=None)
+            try:
+                updated = await anyio.to_thread.run_sync(
+                    lambda: comparison_mod.refresh_collection(
+                        collection, collection_path=_comparison_path()))
+                _comparison_set(updated)
+                ui.notification_show("Comparison snapshots refreshed.", duration=5)
+            except Exception as exc:
+                ui.notification_show(f"Refresh failed: {exc}", type="error", duration=9)
+            finally:
+                ui.notification_remove("comparison_refreshing")
+            return
+        if kind == "save":
+            if _comparison_path() is None:
+                await _pick_comparison("comparison_save", save=True)
+            else:
+                await _comparison_save_to(_comparison_path())
+            return
+        if kind == "save_as":
+            await _pick_comparison("comparison_save_as", save=True)
+            return
+        if kind == "export":
+            await _pick_comparison("comparison_export", directory=True)
+            return
+        if kind == "back":
+            await _comparison_finish_back()
+            return
+        if kind == "relink_member":
+            member_id = str(msg.get("id") or "")
+            if member_id:
+                await _pick_comparison(f"comparison_relink:{member_id}")
+            return
+        if kind == "member_select":
+            comparison_selected_member_v.set(str(msg.get("id") or "") or None)
+            return
+
+        dirty = False
+        if kind in ("view", "axis_scale", "sort_order"):
+            updates = {}
+            if kind == "view" and msg.get("view") in ("overview", "metric", "relationships"):
+                updates["view"] = msg["view"]
+            elif kind == "axis_scale" and msg.get("axis_scale") in ("auto", "linear", "log"):
+                updates["scale"] = msg["axis_scale"]
+            elif kind == "sort_order" and msg.get("sort_order") in \
+                    ("added", "ascending", "descending"):
+                updates["order"] = msg["sort_order"]
+            if updates:
+                collection = collection.model_copy(update={
+                    "view_settings": collection.view_settings.model_copy(update=updates)})
+                dirty = True
+        elif kind in ("metric_add", "metric_remove"):
+            # The Metric tab holds a LIST of aligned panels; the client mirrors the 6-panel
+            # cap, and a refused add still pokes the reactive so an optimistic render can
+            # never drift from the collection.
+            metric_id = str(msg.get("metric_id") or "")
+            ids = list(collection.view_settings.metric_ids)
+            if (kind == "metric_add" and metric_id in comparison_metrics.METRICS_BY_ID
+                    and metric_id not in ids):
+                if len(ids) >= 6:
+                    ui.notification_show("Up to 6 metric panels can be shown at once. "
+                                         "Remove one to add another.", type="warning",
+                                         duration=6)
+                    comparison_collection_v.set(collection.model_copy())
+                    return
+                ids.append(metric_id)
+            elif kind == "metric_remove" and metric_id in ids:
+                ids.remove(metric_id)
+            if ids != list(collection.view_settings.metric_ids):
+                collection = collection.model_copy(update={
+                    "view_settings": collection.view_settings.model_copy(
+                        update={"metric_ids": ids})})
+                dirty = True
+        elif kind in ("member_include", "remove_member", "member_alias"):
+            member_id = str(msg.get("id") or "")
+            members = []
+            for member in collection.members:
+                if str(member.member_id) != member_id:
+                    members.append(member)
+                    continue
+                if kind == "remove_member":
+                    continue
+                if kind == "member_include":
+                    member = member.model_copy(update={"included": bool(msg.get("included"))})
+                else:
+                    alias = str(msg.get("alias") or "").strip() or None
+                    member = member.model_copy(update={"alias": alias})
+                members.append(member)
+            if members != collection.members:
+                collection = collection.model_copy(update={"members": members})
+                dirty = True
+                if kind == "remove_member" and comparison_selected_member_v() == member_id:
+                    comparison_selected_member_v.set(None)
+        if dirty:
+            _comparison_set(collection)
+
+    @reactive.effect
+    async def _comparison_back_cancel():
+        if _clicked_dynamic("comparison_back_cancel"):
+            ui.modal_remove()
+
+    @reactive.effect
+    async def _comparison_back_discard():
+        if not _clicked_dynamic("comparison_back_discard"):
+            return
+        ui.modal_remove()
+        await _comparison_finish_back(discard=True)
+
+    @reactive.effect
+    async def _comparison_back_save():
+        if not _clicked_dynamic("comparison_back_save"):
+            return
+        ui.modal_remove()
+        _pending_pick["comparison_close_after_save"] = True
+        await _pick_comparison("comparison_save", save=True)
+
+    def _dem_src_picked(path: Path):
+        """A picked local-DEM raster: link it as THE terrain source and import right away
+        when a reach exists (pick = import in one step); without a reach (or drainage
+        area) the auto-chain imports the moment those land. First pick, re-pick, and
+        locate all funnel through here."""
+        if path.suffix.lower() not in dem.DEM_SUFFIXES:
+            ui.notification_show("Use a GeoTIFF (.tif or .tiff).", type="warning",
+                                 duration=6)
+            return
+        with reactive.isolate():
+            rec = dict(dem_src() or {})
+        rec.update(mode="local", path=str(path), src_mtime=None)
+        dem_src.set(rec)
+        rf = reach_feat()
+        if rf is None:
+            ui.notification_show("Raster linked. Draw the reach centerline to import "
+                                 "the terrain.", duration=6)
+            return
+        if delineate_mode() == "manual" and not _manual_da_valid():
+            ui.notification_show("Raster linked. Enter the drainage area (km²) to "
+                                 "import the terrain.", duration=6)
+            return
+        if _task_state(dem_task) == "running":
+            try:                # a queued import runs after the cancelled fetch unwinds
+                dem_task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        _launch_dem_fetch(rf)
+
+    @reactive.effect
+    @reactive.event(input.dem_choose_evt)
+    async def _dem_choose_click():
+        await _pick_dem_raster()
+
+    async def _add_map_layers(paths):
+        """Append picked files to Map layers as path-pointer records (never a copy).
+        Dedupes by resolved path; unsupported suffixes get a notification and are skipped."""
+        with reactive.isolate():
+            recs = [dict(r) for r in map_layers()]
+
+        def _pkey(p):
+            try:
+                return os.path.normcase(str(Path(p).resolve()))
+            except OSError:
+                return os.path.normcase(str(p))
+        seen = {_pkey(r["path"]) for r in recs}
+        added, bad = [], False
+        for p in paths:
+            if ml_mod.classify_path(p) is None:
+                bad = True
+                continue
+            k = _pkey(p)
+            if k in seen:
+                ui.notification_show(f"{Path(p).name} is already in Map layers.",
+                                     type="warning", duration=6)
+                continue
+            seen.add(k)
+            added.append(ml_mod.new_layer_record(p))
+        if bad:
+            ui.notification_show(pathpick.MSG_REF_KIND, type="warning", duration=8)
+        if added:
+            if not _node_checked("maplyr"):
+                _check_state["maplyr"] = True     # adding always shows itself (dem precedent)
+            map_layers.set(recs + added)
+
+    async def _relink_map_layer(uid: str, path: Path):
+        """Point an existing layer record at the file's new location (missing-file repair)."""
+        with reactive.isolate():
+            rec = next((r for r in map_layers() if r.get("id") == uid), None)
+        if rec is None:
+            return
+        kind = ml_mod.classify_path(path)
+        if kind is None:
+            ui.notification_show(pathpick.MSG_REF_KIND, type="warning", duration=8)
+            return
+        if kind != rec.get("kind"):
+            want = ("a raster file (.tif, .tiff, .vrt)" if rec.get("kind") == "raster"
+                    else "a vector file (.shp, .geojson, .json)")
+            ui.notification_show(f"This layer links {want}. Pick the same kind of file.",
+                                 type="warning", duration=8)
+            return
+        rec["path"] = str(path)                   # in place; the owner effect reloads it
+        _ml_cache.pop(uid, None)
+        with reactive.isolate():
+            map_layers_ver.set(map_layers_ver() + 1)
+            _ml_paint.set(_ml_paint() + 1)
+
+    async def _dispatch_picked_result(res: dict, fallback_purpose: str = ""):
+        """Route native/Tk/typed picker replies without ever sending comparison sources
+        through the normal project-open dispatcher."""
+        purpose = str(res.get("purpose") or fallback_purpose or "")
+        paths = [Path(str(path)) for path in (res.get("paths") or []) if str(path)]
+        raw_path = res.get("path")
+        if res.get("cancelled") or (not paths and not raw_path):
+            _pending_pick.pop("comparison_close_after_save", None)
+            if not comparison_mode_v():
+                _ensure_welcome()          # exactly the pre-comparison cancel contract
+            return
+        # Map-layer purposes MUST branch before the _on_project_path fallthrough below —
+        # that dispatcher would silently eat any purpose it doesn't recognize.
+        if purpose == "maplayer_add":
+            await _add_map_layers(paths or ([Path(str(raw_path))] if raw_path else []))
+            return
+        if purpose.startswith("maplayer_relink:"):
+            if raw_path:
+                await _relink_map_layer(purpose.partition(":")[2], Path(str(raw_path)))
+            return
+        if purpose == "dem_src_pick":
+            if raw_path:
+                _dem_src_picked(Path(str(raw_path)))
+            return
+        if purpose == "comparison_add":
+            await _comparison_add_paths(paths)
+            return
+        if purpose == "comparison_open":
+            await _comparison_open_path(Path(str(raw_path)))
+            return
+        if purpose in ("comparison_save", "comparison_save_as"):
+            close_after = bool(_pending_pick.pop("comparison_close_after_save", False))
+            await _comparison_save_to(Path(str(raw_path)), close_after=close_after)
+            return
+        if purpose == "comparison_export":
+            await _comparison_export_to(Path(str(raw_path)))
+            return
+        if purpose.startswith("comparison_relink:"):
+            member_id = purpose.partition(":")[2]
+            collection = comparison_collection_v()
+            if collection is None:
+                return
+            member = next((m for m in collection.members
+                           if str(m.member_id) == member_id), None)
+            if member is None:
+                return
+            try:
+                replacement = comparison_mod.relink_member(
+                    member, Path(str(raw_path)), collection_path=_comparison_path(),
+                    refresh=True)
+                members = [replacement if str(m.member_id) == member_id else m
+                           for m in collection.members]
+                _comparison_set(collection.model_copy(update={"members": members}))
+            except Exception as exc:
+                ui.notification_show(f"Couldn't relink that source: {exc}", type="error",
+                                     duration=9)
+            return
+        await _on_project_path(purpose, Path(str(raw_path)))
+
     @reactive.effect
     @reactive.event(input.nav_open)
     async def _open_dialog():
@@ -9538,12 +12204,24 @@ def server(input, output, session):
         _pm = project_meta.meta_from_state(st, fallback_name=fallback_name)
         if runmode.IS_DESKTOP and _ws["project_file"]:
             _pm["name"] = Path(_ws["project_file"]).stem
-        _set_project_meta(_pm["name"], _pm["created"], _pm["units"])
+        _set_project_meta(_pm["name"], _pm["created"], _pm["units"],
+                          project_id=_pm.get("project_id"), site_id=_pm.get("site_id"),
+                          mint_missing=True)
         # gradient boundary conditions: migrate legacy kept modes (4-corner, structured text)
         # onto the points model in place; a saved grad_pts list always wins over legacy text
         from hype_app import gradients as _grad_mod
         grad_pts.set(_grad_mod.migrate_kept_gradients(_kept, st.get("grad_pts")))
         grad_adding.set(None)
+        _ws_wells = wells_mod.normalize_wells(st.get("obs_wells"))   # older saves lack the keys
+        obs_wells.set(_ws_wells)
+        well_pairs.set(wells_mod.normalize_pairs(st.get("well_pairs"),
+                                                 {w["id"] for w in _ws_wells}))
+        wells_adding.set(False)
+        # Reference layers: pointers restore as-is; a MISSING file stays in the list (the
+        # owner effect marks the row "file is missing" and the warn button relinks it).
+        map_layers.set(ml_mod.normalize_map_layers(st.get("map_layers")))
+        with reactive.isolate():
+            map_layers_ver.set(map_layers_ver() + 1)
         # K-zones from pre-per-zone-K saves are bare geometry: give them uids + the save's
         # effective global Zone KH/KV pair (now in _kept) so nothing changes value.
         with reactive.isolate():
@@ -9555,6 +12233,9 @@ def server(input, output, session):
         dem_p = work_dir / "inputs" / "dem.tif"
         dem_path.set(str(dem_p) if dem_p.is_file() else None)
         dem_meta.set(st.get("dem_meta"))
+        # A missing source file never blocks the restored terrain: the working DEM is in
+        # the project; the pointer only drives the pane's warn card + re-import.
+        dem_src.set(dem.normalize_dem_source(st.get("dem_source")))
         cm = st.get("carve_meta")
         if cm and cm.get("path") and Path(cm["path"]).is_file():
             carve_meta.set(cm)
@@ -9588,6 +12269,14 @@ def server(input, output, session):
         # groundwater run + results (display prefs first — the builders read them)
         head_opacity_v.set(float(st.get("head_opacity") or 0.85))
         hd_contours_v.set(bool(st.get("head_contours", True)))
+        fp_line_show_v.set(bool(st.get("fp_line_show", True)))
+        fp_line_weight_v.set(float(st.get("fp_line_weight") or 1.0))
+        fp_line_opacity_v.set(float(st.get("fp_line_opacity") or 0.9))
+        if st.get("fp_line_mode") in ("class", "single"):
+            fp_line_mode_v.set(st["fp_line_mode"])
+        _flc = st.get("fp_line_color")
+        if isinstance(_flc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", _flc):
+            fp_line_color_v.set(_flc)
         # frozen run snapshot: prefer config/assessment_input.json, fall back to the state copy
         # (None for v1 projects — the legacy adapter).
         _snap_in = payload.get("assessment_input") or st.get("input_snapshot")
@@ -9689,6 +12378,8 @@ def server(input, output, session):
                 ui.notification_show(f"Project opened; the hyporheic-zone layers couldn't "
                                      f"be drawn: {e}", type="warning", duration=8)
         _stale_marks.set(frozenset(st.get("stale_marks") or ()))
+        # (Older saves carried a per-project comparison roster; standalone .hypecompare
+        # collections replaced it, so that state key is simply ignored here.)
 
         # Restore drops GMS arcs by design (one-way export) and Save As copies the folder
         # wholesale; heal the GMS export whenever usable groundwater artifacts arrived
@@ -9740,6 +12431,14 @@ def server(input, output, session):
             if b:
                 await session.send_custom_message("hype_fly", {"bounds": b})
         except Exception:  # noqa: BLE001
+            pass
+        # Every 3-D content send lives in a compute-time completion effect, so without
+        # this a restored project shows bare terrain in the 3-D view: no grid, no
+        # basemap drape, no classed paths, no volumes. Runs AFTER check_state is
+        # restored so the vis pushes reflect the saved checkboxes.
+        try:
+            await _rebuild_3d_scene()
+        except Exception:  # noqa: BLE001 — 3-D is a view of the results, never a gate
             pass
 
     # ---- Desktop project folders (runmode.IS_DESKTOP) ----------------------------------
@@ -9871,9 +12570,15 @@ def server(input, output, session):
             ui.div(
                 ui.div(ui.span("HYPE", class_="hype-welcome-mark"),
                        ui.div("Hyporheic Exchange Explorer", class_="hype-welcome-sub"),
+                       ui.div(APP_VERSION_LABEL, class_="hype-welcome-ver"),
                        class_="hype-welcome-brand"),
                 ui.div(_evt_btn("welcome_new", "New Project", "btn-primary"),
                        _evt_btn("welcome_open", "Open Project", "btn-outline-secondary"),
+                       # Comparisons are project-independent, so opening one must not
+                       # require opening a project first (desktop only: file access).
+                       *([_evt_btn("welcome_compare", "Open Comparison",
+                                   "btn-outline-secondary")]
+                         if runmode.IS_DESKTOP else []),
                        class_="hype-welcome-actions"),
                 *recent_block,
                 class_="hype-welcome"),
@@ -9928,7 +12633,8 @@ def server(input, output, session):
         ui.modal_remove()
         await _reset_session_state()       # no-op on a virgin session; makes the entry
         #                                    identical after the destructive-New confirm
-        _set_project_meta(name, datetime.now().isoformat(timespec="seconds"))
+        _set_project_meta(name, datetime.now().isoformat(timespec="seconds"),
+                          mint_missing=True)
         _select("reach")
         ui.notification_show(f"Created {name}", duration=5)
 
@@ -9953,6 +12659,57 @@ def server(input, output, session):
             await _pick_path("open_project", save=False)
         else:
             _show_open_modal()
+
+    @reactive.effect
+    @reactive.event(input.welcome_compare)
+    async def _welcome_compare():
+        if _busy_tasks():
+            ui.notification_show("A model task is still running. Wait for it to finish before "
+                                 "opening a comparison.", type="warning", duration=7)
+            return
+        await _pick_comparison("comparison_open", save=False)
+
+    @reactive.effect
+    @reactive.event(input.comparison_new_evt)
+    async def _comparison_new_from_reports():
+        # The Site Reports hub row and the tree-node launcher share this one entry point.
+        if not runmode.IS_DESKTOP:
+            return
+        await _comparison_start(add_current=True)
+
+    @reactive.effect
+    @reactive.event(input.comparison_open_evt)
+    async def _comparison_open_from_launcher():
+        if not runmode.IS_DESKTOP:
+            return
+        if _busy_tasks():
+            ui.notification_show("A model task is still running. Wait for it to finish before "
+                                 "opening a comparison.", type="warning", duration=7)
+            return
+        await _pick_comparison("comparison_open", save=False)
+
+    @reactive.effect
+    @reactive.event(input.comparison_recent_open)
+    async def _comparison_recent_open():
+        # Launcher-pane recent rows: value-encoded index into the snapshot taken at render.
+        msg = input.comparison_recent_open() or {}
+        try:
+            it = _cmp_recents["items"][int(msg.get("i"))]
+        except (TypeError, ValueError, IndexError):
+            return
+        p = Path(it["path"])
+        if not p.is_file():
+            ui.notification_show("That comparison file is no longer there.", type="warning",
+                                 duration=6)
+            recents.forget_comparison(p)
+            _cmp_recents["tick"] += 1
+            cmp_recents_ver.set(cmp_recents_ver() + 1)
+            return
+        if _busy_tasks():
+            ui.notification_show("A model task is still running. Wait for it to finish before "
+                                 "opening a comparison.", type="warning", duration=7)
+            return
+        await _comparison_open_path(p)
 
     @reactive.effect
     @reactive.event(input.welcome_recent)
@@ -10098,12 +12855,16 @@ def server(input, output, session):
         except Exception as e:  # noqa: BLE001 — child died / tk failed: never dead-end
             ui.notification_show(f"The file picker couldn't open ({e}). Type the path "
                                  "instead.", type="warning", duration=8)
-            _show_typed_pick_modal(purpose, save=purpose != "open_project")
+            if purpose.startswith("comparison_"):
+                _show_comparison_typed_pick_modal(purpose)
+            elif purpose.startswith("maplayer"):
+                _show_maplayer_typed_pick_modal(purpose)
+            elif purpose == "dem_src_pick":
+                _show_dem_typed_pick_modal(purpose)
+            else:
+                _show_typed_pick_modal(purpose, save=purpose not in pathpick.OPEN_PURPOSES)
             return
-        if res.get("cancelled") or not res.get("path"):
-            _ensure_welcome()              # exactly _desktop_picked's cancel contract
-            return
-        await _on_project_path(str(res.get("purpose") or purpose), Path(str(res["path"])))
+        await _dispatch_picked_result(res, purpose)
 
     async def _pick_path(purpose: str, *, save: bool, file_name: str | None = None):
         """Ask for a .hype path: native dialog via the shell bridge when present, else a
@@ -10139,6 +12900,127 @@ def server(input, output, session):
             return
         _show_typed_pick_modal(purpose, save=save)
 
+    async def _pick_map_layers(purpose: str):
+        """Ask for reference-layer file(s) (Map layers pane). DELIBERATELY no shell
+        branch: the shipped WinForms shell has no map-layer message type and silently
+        drops unknown commands (the pick would hang forever), so desktop uses the spawned
+        tk child — the native Win32 dialog on Windows — until a shell release adds one."""
+        if runmode.picker_mode() != "auto":
+            _show_maplayer_typed_pick_modal(purpose)
+            return
+        if _task_state(pick_task) == "running":
+            ui.notification_show("A file picker window is already open. Look for it "
+                                 "on your taskbar.", type="warning", duration=6)
+            return
+        relink = purpose.startswith("maplayer_relink:")
+        _pending_pick["purpose"] = purpose
+        _pick_flight["purpose"] = purpose
+        payload = {"mode": "open" if relink else "open_multiple", "kind": "maplayer",
+                   "purpose": purpose,
+                   "title": "Locate the layer file" if relink else "Add map layers",
+                   "initial_dir": _pick_initial_dir()}
+        ui.notification_show("Opening a file window...", duration=4, id="pick_opening")
+        _task_armed["pick"] = True
+        pick_task(payload)
+
+    def _show_maplayer_typed_pick_modal(purpose: str, *, value: str = "",
+                                        error: str | None = None):
+        """Typed-path fallback for Map layers (HYPE_PICKER=modal, or the tk child failed)."""
+        _pending_pick["purpose"] = purpose
+        body = [
+            ui.p("Type the full path of the raster (.tif, .tiff, .vrt) or vector "
+                 "(.shp, .geojson, .json) file to link."),
+            ui.input_text("ml_pick_path", None, width="100%", value=value,
+                          placeholder=r"D:\GIS\parcels.shp"),
+        ]
+        if error:
+            body.append(ui.div(error, class_="text-danger", style="font-size: 0.9em;"))
+        ui.modal_show(ui.modal(
+            *body,
+            footer=ui.TagList(
+                ui.input_action_button("ml_pick_cancel", "Cancel"),
+                ui.input_action_button("ml_pick_go", "OK", class_="btn-primary")),
+            title="Map layer file", easy_close=True))
+
+    @reactive.effect
+    def _ml_pick_cancel():
+        if _clicked_dynamic("ml_pick_cancel"):
+            ui.modal_remove()
+
+    @reactive.effect
+    async def _ml_pick_go():
+        if not _clicked_dynamic("ml_pick_go"):
+            return
+        purpose = str(_pending_pick.get("purpose") or "")
+        if not purpose.startswith("maplayer"):
+            return
+        raw = str(_safe("ml_pick_path", "") or "")
+        target, err = pathpick.interpret_reference_file(raw)
+        ui.modal_remove()
+        if err:
+            _show_maplayer_typed_pick_modal(purpose, value=raw, error=err)
+            return
+        await _dispatch_picked_result({"purpose": purpose, "path": str(target)})
+
+    async def _pick_dem_raster(purpose: str = "dem_src_pick"):
+        """Ask for the local DEM GeoTIFF (DEM pane, Terrain source = Local raster). Same
+        no-shell-branch posture as _pick_map_layers: the shipped WinForms shell silently
+        drops unknown message types, so desktop uses the spawned tk child until a shell
+        release adds a native message."""
+        if runmode.picker_mode() != "auto":
+            _show_dem_typed_pick_modal(purpose)
+            return
+        if _task_state(pick_task) == "running":
+            ui.notification_show("A file picker window is already open. Look for it "
+                                 "on your taskbar.", type="warning", duration=6)
+            return
+        _pending_pick["purpose"] = purpose
+        _pick_flight["purpose"] = purpose
+        payload = {"mode": "open", "kind": "demraster", "purpose": purpose,
+                   "title": "Choose DEM raster", "initial_dir": _pick_initial_dir()}
+        ui.notification_show("Opening a file window...", duration=4, id="pick_opening")
+        _task_armed["pick"] = True
+        pick_task(payload)
+
+    def _show_dem_typed_pick_modal(purpose: str = "dem_src_pick", *, value: str = "",
+                                   error: str | None = None):
+        """Typed-path fallback for the local DEM (HYPE_PICKER=modal, or the tk child
+        failed)."""
+        _pending_pick["purpose"] = purpose
+        body = [
+            ui.p("Type the full path of the DEM GeoTIFF (.tif or .tiff) to link."),
+            ui.input_text("dem_pick_path", None, width="100%", value=value,
+                          placeholder=r"D:\GIS\site_dem.tif"),
+        ]
+        if error:
+            body.append(ui.div(error, class_="text-danger", style="font-size: 0.9em;"))
+        ui.modal_show(ui.modal(
+            *body,
+            footer=ui.TagList(
+                ui.input_action_button("dem_pick_cancel", "Cancel"),
+                ui.input_action_button("dem_pick_go", "OK", class_="btn-primary")),
+            title="DEM raster file", easy_close=True))
+
+    @reactive.effect
+    def _dem_pick_cancel():
+        if _clicked_dynamic("dem_pick_cancel"):
+            ui.modal_remove()
+
+    @reactive.effect
+    def _dem_pick_go():
+        if not _clicked_dynamic("dem_pick_go"):
+            return
+        purpose = str(_pending_pick.get("purpose") or "")
+        if purpose != "dem_src_pick":
+            return
+        raw = str(_safe("dem_pick_path", "") or "")
+        target, err = pathpick.interpret_dem_file(raw)
+        ui.modal_remove()
+        if err:
+            _show_dem_typed_pick_modal(purpose, value=raw, error=err)
+            return
+        _dem_src_picked(target)
+
     @reactive.effect
     def _dev_pick_cancel():
         if _clicked_dynamic("dev_pick_cancel"):
@@ -10160,10 +13042,10 @@ def server(input, output, session):
                                                       known_stem=known_stem)
         ui.modal_remove()
         if err:
-            _show_typed_pick_modal(purpose, save=purpose != "open_project",
+            _show_typed_pick_modal(purpose, save=purpose not in pathpick.OPEN_PURPOSES,
                                    value=raw, error=err)
             return
-        if purpose != "open_project":
+        if purpose not in pathpick.OPEN_PURPOSES:
             # Typed-modal-only overwrite gate: native and tk dialogs confirm replacement
             # in the dialog itself. Picking the CURRENT main file via save_as is plain
             # Save (the dispatcher short-circuits) and must not scare the user.
@@ -10215,14 +13097,12 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.desktop_pick)
     async def _desktop_picked():
-        msg = input.desktop_pick() or {}
-        if msg.get("cancelled") or not msg.get("path"):
-            # Native dialog dismissed. Under the startup gate the welcome dialog is usually
-            # still on screen (a self-replace is harmless); the one exception it rescues is
-            # the import_target hop, whose flow removed the import modal before picking.
-            _ensure_welcome()
-            return
-        await _on_project_path(str(msg.get("purpose") or ""), Path(str(msg["path"])))
+        # Native dialog replies (single path, multi-path, or cancel) all route through the
+        # shared dispatcher: comparison purposes peel off there, everything else lands on
+        # _on_project_path exactly as before. On cancel under the startup gate the welcome
+        # dialog is usually still on screen (a self-replace is harmless); the exception it
+        # rescues is the import_target hop, whose flow removed the import modal first.
+        await _dispatch_picked_result(input.desktop_pick() or {})
 
     async def _on_project_path(purpose: str, p: Path):
         if not runmode.IS_DESKTOP:
@@ -10313,6 +13193,9 @@ def server(input, output, session):
             return
         _warn_path_advisories(folder)
         folder.mkdir(parents=True, exist_ok=True)
+        # Every project folder carries an aerials/ drop spot (EXPORT_DIRS contract:
+        # travels with Save As, never packed into archives).
+        (folder / "aerials").mkdir(exist_ok=True)
         if _ws["project_file"]:
             try:
                 _save_project_file()       # parting save of the project we're leaving
@@ -10321,7 +13204,7 @@ def server(input, output, session):
         await _reset_memory_state()
         _adopt_workspace(folder, main_file)
         _set_project_meta(main_file.stem,  # stamped once, at creation; the stem IS the name
-                          datetime.now().isoformat(timespec="seconds"))
+                          datetime.now().isoformat(timespec="seconds"), mint_missing=True)
         _save_project_file()               # the folder has its main file from minute one
         await _post_title()
         _select("reach")
@@ -10411,6 +13294,11 @@ def server(input, output, session):
     async def _open_in_place(main_file: Path, *, stamp: bool = False):
         payload = bundle.restore_in_place(main_file)   # parse/validate BEFORE any reset —
         #                                  a corrupt file must never cost the live session
+        source_state = payload.get("state") or {}
+        # Pre-identity projects mint their UUIDs during _rehydrate; persist them right away
+        # so a read-only comparison of this file sees stable identities from now on.
+        needs_identity_upgrade = not (source_state.get("project_id")
+                                      and source_state.get("site_id"))
         if _ws["project_file"] and _ws["project_file"] != str(main_file):
             try:
                 _save_project_file()                   # parting save of the old project
@@ -10419,7 +13307,7 @@ def server(input, output, session):
         await _reset_memory_state()
         _adopt_workspace(main_file.parent, main_file)
         await _rehydrate(payload)
-        if stamp:
+        if stamp or needs_identity_upgrade:
             _save_project_file()   # unmarked file opened in place by choice: stamp the marker
         await _post_title()
         ui.notification_show(f"Opened {main_file.name}", duration=5)
@@ -10472,6 +13360,7 @@ def server(input, output, session):
         src = _pending_import.pop("src")
         _warn_path_advisories(folder)
         folder.mkdir(parents=True, exist_ok=True)
+        (folder / "aerials").mkdir(exist_ok=True)
         ui.notification_show("Importing project…", duration=None, id="open_prog")
         try:
             # Extract into the NEW folder first — non-destructive to the current session.
@@ -10527,12 +13416,18 @@ def server(input, output, session):
             return
         _warn_path_advisories(folder)
         folder.mkdir(parents=True, exist_ok=True)
+        (folder / "aerials").mkdir(exist_ok=True)
         try:
             _save_project_file()           # parting save: the copy carries latest settings
         except Exception:  # noqa: BLE001
             pass
         with reactive.isolate():
-            payload = {"state": _project_state(), "vectors": _current_vectors(),
+            copied_state = _project_state()
+            # Save As is a distinct project lineage at the same physical site.
+            copied_state["project_id"] = project_meta.new_identity()
+            copied_state["site_id"] = (copied_state.get("site_id")
+                                       or project_meta.new_identity())
+            payload = {"state": copied_state, "vectors": _current_vectors(),
                        "params": params(), "run_config": _run_config(),
                        "assessment_input": input_snapshot(), "scoring_profile": None,
                        "extracted": 0, "restored": None}
@@ -10564,9 +13459,14 @@ def server(input, output, session):
     def _autosave_on_results():
         if not runmode.IS_DESKTOP:
             return
-        _ = (reach_feat(), dem_path(), carve_meta(), ras_result(), run_result(), hz_result(),
-             alt_result(), soil_snapshot(), flow_lookup(), results_model(), input_snapshot(),
-             wse_extent_feat())
+        _ = (reach_feat(), dem_path(), dem_src(), carve_meta(), ras_result(), run_result(),
+             hz_result(), alt_result(), soil_snapshot(), flow_lookup(), results_model(),
+             input_snapshot(), wse_extent_feat(), obs_wells(), well_pairs(), wells_ver(),
+             map_layers(), map_layers_ver())
+        # wells_ver: typed screen elevations / observed heads are FIELD DATA — they autosave
+        # like structural changes (unlike gradient typing, they exist nowhere else).
+        # map_layers_ver: opacity/color/visibility edits mutate records in place, so the
+        # ver counter is what makes them reach the save.
         if _ws["project_file"] is None or _autosave["restoring"]:
             return
         try:
@@ -10635,15 +13535,34 @@ def server(input, output, session):
                     ),
                     open=False, id="dem_disp_acc",
                 )]
-            return ui.TagList(
+            fetch_ctrls = [
                 ui.input_select("dem_res", "DEM resolution",
-                                {"auto": "Auto — finest (1 m where available)", "1": "1 m",
+                                {"auto": "Auto (finest available)", "1": "1 m",
                                  "3": "3 m", "5": "5 m", "10": "10 m"},
                                 selected=str(_keep("dem_res", "auto"))),
                 ui.div(ui.input_action_button(
                     "fetch_dem",
                     "Re-fetch terrain" if dem_path() is not None else "Fetch terrain",
                     class_="btn-primary"), class_="hype-actions"),
+            ]
+            if runmode.IS_DESKTOP:
+                with reactive.isolate():   # mode is read-only here; a subscribing read would
+                    mode0 = (dem_src() or {}).get("mode", "3dep")   # remount the radio mid-click
+                source_ctrls = [
+                    ui.div(ui.input_radio_buttons(
+                        "dem_src_mode", "Terrain source",
+                        {"3dep": "USGS 3DEP", "local": "Local raster"},
+                        selected=mode0, inline=True), class_="hype-srcpick"),
+                    # != 'local' keeps the 3DEP controls visible during the first-render tick
+                    # before the radio registers (an undefined input hides BOTH sections).
+                    ui.panel_conditional("input.dem_src_mode != 'local'", *fetch_ctrls),
+                    ui.panel_conditional("input.dem_src_mode == 'local'",
+                                         ui.output_ui("dem_local_src")),
+                ]
+            else:                          # cloud: the 3DEP download is the only source
+                source_ctrls = fetch_ctrls
+            return ui.TagList(
+                *source_ctrls,
                 ui.output_ui("busy"),
                 ui.output_ui("dem_status"),
                 *display_ctrls,
@@ -10782,9 +13701,8 @@ def server(input, output, session):
                        if _se and _se.get("up") is not None else "Upstream streambed: —")
             _dn_txt = (f"Downstream streambed: {_se['down']:.2f} m"
                        if _se and _se.get("down") is not None else "Downstream streambed: —")
+            _gcol = grid_color3d_v()      # un-isolated: a swatch click re-renders the ring
             return ui.TagList(
-                ui.div("Model grid — the live estimate below keeps the run in bounds.",
-                       class_="hype-instr"),
                 ui.input_numeric("cell_size", "Cell size (m)",
                                  value=_keep("cell_size", 10.0), min=1.0, step=1.0),
                 ui.div("Smaller cells make a finer grid.", class_="hype-help"),
@@ -10807,12 +13725,31 @@ def server(input, output, session):
                     ),
                     ui.accordion_panel(
                         "3D display",
-                        ui.input_checkbox("grid_wireframe",
-                                          "Wireframe grid — see zone volumes inside the cells",
+                        ui.input_checkbox("grid_wireframe", "Wireframe grid",
                                           value=bool(_keep("grid_wireframe", False))),
-                        ui.div("Large grids render decimated in 3D; zone volumes and flow "
-                               "paths stay full-resolution, so shell edges may not match "
-                               "preview blocks.", class_="hype-instr"),
+                        ui.input_slider("grid_opacity3d", "Grid line opacity",
+                                        min=0.05, max=1.0,
+                                        value=float(_keep("grid_opacity3d", 1.0)), step=0.05),
+                        ui.div(ui.span("Grid color", class_="hype-fpsel-lbl"),
+                               ui.tags.button(
+                                   "Default", type="button",
+                                   class_="hype-anim-stylebtn"
+                                   + (" active" if _gcol is None else ""),
+                                   title="Stock edges with the elevation-colored top",
+                                   onclick=("Shiny.setInputValue('grid_color3d_evt', "
+                                            "{c: 'default', n: Date.now()}, "
+                                            "{priority: 'event'})")),
+                               *[ui.tags.button(
+                                     type="button",
+                                     class_="hype-anim-swatch"
+                                     + (" active" if _gcol == c else ""),
+                                     style=f"background:{c};", title=nm,
+                                     onclick=("Shiny.setInputValue('grid_color3d_evt', "
+                                              f"{{c: '{c}', n: Date.now()}}, "
+                                              "{priority: 'event'})"))
+                                 for c, nm in (("#ffffff", "White"), ("#808080", "Gray"),
+                                               ("#d32f2f", "Red"), ("#2563eb", "Blue"))],
+                               class_="hype-fpsel-row"),
                     ),
                     open=False, id="mesh_adv_acc",
                 ),
@@ -10993,14 +13930,46 @@ def server(input, output, session):
             with reactive.isolate():       # persisted control state, re-read on each pane re-run
                 _aon = bool(fp_anim_on_v())
                 _asp = float(fp_anim_speed_v())
+                _lshow = bool(fp_line_show_v())
+                _lw = float(fp_line_weight_v())
+                _lop = float(fp_line_opacity_v())
+                _lcol = fp_line_color_v()
             _acol = fp_anim_color_v()      # un-isolated on purpose: a swatch or style click
             _asty = fp_anim_style_v()      # re-renders the pane so the active state follows
+            _lmode = fp_line_mode_v()      # un-isolated: the active mode button follows
             return ui.TagList(
-                ui.div("Flow paths by exchange class. Each class's tree checkbox shows/hides its "
-                       "paths and their entry (blue) / return (red) dots together. Click a path "
-                       "or dot for its properties, or drag a box to select several.",
-                       class_="hype-instr"),
+                ui.div("Click a path or dot for its properties, or drag a box to "
+                       "select several.", class_="hype-instr"),
                 _fpsel_buttons(),
+                ui.div("Path lines",
+                       _info_tip("Display styling for the flow path lines themselves. Hiding "
+                                 "the lines keeps the particle animation and click selection "
+                                 "working, so you can watch the particles alone."),
+                       class_="hype-props-title"),
+                ui.input_checkbox("fp_line_show", "Show path lines", value=_lshow),
+                ui.input_slider("fp_line_weight", "Line thickness (px)", min=0.5, max=8.0,
+                                value=_lw, step=0.5),
+                ui.input_slider("fp_line_opacity", "Line opacity", min=0.05, max=1.0,
+                                value=_lop, step=0.05),
+                ui.div(ui.span("Line color", class_="hype-fpsel-lbl"),
+                       *[ui.tags.button(
+                             lbl, type="button",
+                             class_="hype-anim-stylebtn" + (" active" if key == _lmode else ""),
+                             title=tip,
+                             onclick=("Shiny.setInputValue('fp_line_mode_evt', "
+                                      f"{{m: '{key}', n: Date.now()}}, {{priority: 'event'}})"))
+                         for key, lbl, tip in (
+                             ("class", "Class colors",
+                              "Each exchange class keeps its identity color"),
+                             ("single", "Single color",
+                              "All classes use the picked color"))],
+                       ui.tags.input(
+                           type="color", value=_lcol, class_="hype-ml-color",
+                           title="Line color (Single color mode)",
+                           disabled=(None if _lmode == "single" else "disabled"),
+                           onchange=("Shiny.setInputValue('fp_line_color_evt', "
+                                     "{c: this.value, n: Date.now()}, {priority: 'event'})")),
+                       class_="hype-fpsel-row"),
                 ui.div("Particle animation",
                        _info_tip("One particle travels each displayed flow path. Travel time is "
                                  "proportional to the path's residence time, so quick loops mean "
@@ -11032,6 +14001,86 @@ def server(input, output, session):
                        class_="hype-fpsel-row"),
                 ui.output_ui("hz_sel_props"),
             )
+
+    def _pane_wells():
+        """Observation wells: field data vs the Basecase groundwater solution. The pane is a
+        thin shell — the tables live in their own outputs so structural re-renders never
+        remount an input mid-keystroke (the gradient-table discipline)."""
+        return ui.TagList(
+            _base_only_note("Observation well sampling"),
+            ui.div("Place observation wells on the map to compare computed heads from the "
+                   "groundwater model with field measurements. The screen elevation picks "
+                   "the model layer that is sampled.", class_="hype-instr"),
+            ui.output_ui("wells_table"),
+            ui.output_ui("wells_pairs"),
+            ui.output_ui("wells_msgs"),
+        )
+
+    def _pane_maplyr():
+        """User reference layers (path links, never copies). Thin shell — the row list lives
+        in its own output; click a row (or its tree entry) for that layer's settings."""
+        return ui.TagList(
+            ui.div("Link raster or vector files from this computer as reference layers. "
+                   "The project stores links, not copies.",
+                   class_="hype-instr"),
+            ui.output_ui("maplyr_rows"),
+        )
+
+    def _pane_ml_layer(uid: str):
+        """Per-layer settings pane, opened by selecting the layer's tree row.
+
+        Reads the record list and _ml_paint like maplyr_rows — NEVER map_layers_ver,
+        which bumps on every slider drag and would remount the slider mid-drag. The
+        slider keeps its ml_op_<uid> id so _ml_op_mirror works unchanged."""
+        recs = map_layers()
+        _ml_paint()
+        rec = next((r for r in recs if r.get("id") == uid), None)
+        if rec is None:
+            return ui.div("This layer was removed.", class_="hype-instr hype-dim")
+        with reactive.isolate():
+            st = _ml_status.get(uid)
+            reason = _ml_err.get(uid)
+        body = [ui.div(
+            ui.span("Raster" if rec.get("kind") == "raster" else "Vector",
+                    class_="hype-ml-kind"),
+            ui.span(rec.get("path") or "", class_="hype-ml-path",
+                    title=rec.get("path") or ""),
+            class_="hype-ml-head")]
+        if st == "missing":
+            body.append(ui.div(
+                ui.span(class_="hype-st st-warn"),
+                ui.span("The linked file was not found.", class_="hype-ml-missingtxt"),
+                ui.tags.button(
+                    "Locate file...", type="button",
+                    class_="btn btn-sm btn-outline-secondary",
+                    onclick=("Shiny.setInputValue('ml_warn','" + uid
+                             + ":'+Date.now(),{priority:'event'})")),
+                class_="hype-ml-missing"))
+        elif st == "error":
+            body.append(ui.div(reason or "could not be displayed",
+                               class_="hype-ml-err", title=reason or ""))
+        if rec.get("kind") == "vector":
+            body.append(ui.div(
+                ui.span("Line color", class_="hype-ml-lbl"),
+                ui.tags.input(
+                    type="color", value=rec.get("color") or ml_mod.DEFAULT_COLOR,
+                    class_="hype-ml-color", title="Line color",
+                    onchange=("Shiny.setInputValue('ml_color_evt',{u:'" + uid
+                              + "',c:this.value,n:Date.now()},{priority:'event'})")),
+                class_="hype-ml-ctrl"))
+        body.append(ui.div(
+            ui.input_slider(f"ml_op_{uid}", "Opacity", min=0.0, max=1.0, step=0.05,
+                            value=float(rec.get("opacity", 0.8)), ticks=False,
+                            width="100%"),
+            class_="hype-ml-op"))
+        body.append(ui.div(
+            ui.tags.button(
+                "Remove layer", type="button", class_="btn btn-sm btn-outline-danger",
+                title="The file stays on disk.",
+                onclick=("Shiny.setInputValue('ml_rm','" + uid
+                         + ":'+Date.now(),{priority:'event'})")),
+            class_="hype-actions"))
+        return ui.TagList(*body)
 
     def _pane_results():
             parts = [
@@ -11823,6 +14872,8 @@ def server(input, output, session):
         "report.fn": ("open_report_fn", "screening", "Functional Screening Report",
                       "Published reaction rates applied to your flow paths, one section per "
                       "screening switched on."),
+        # Cross-Site Comparison is NOT a document here: it is the full-screen workspace
+        # (comparison.js overlay), launched from its own tree node and a bespoke hub row.
     }
 
     def _report_status(nid) -> tuple[bool, str]:
@@ -11841,7 +14892,12 @@ def server(input, output, session):
             n = sum(1 for k in fn_reg.SECTION_ORDER if _fn_included(k))
             if not n:
                 return False, "No screenings are switched on."
-            return True, f"Ready · {n} included module{'' if n == 1 else 's'}"
+            # WHY THE ENVELOPE IS NOT ON OFFER goes here rather than in a fourth pane block: the
+            # option only renders when it can be built, and an option that silently is not there
+            # is the same problem as a ticked box that silently does nothing.
+            _eok, _ewhy = _envelope_state()
+            tail = "" if _eok else f" · {_ewhy}"
+            return True, f"Ready · {n} included module{'' if n == 1 else 's'}{tail}"
         return True, "Ready"
 
     def _report_row(nid):
@@ -11866,7 +14922,8 @@ def server(input, output, session):
             ui.div("Choose an explicit report product. Completing the hydraulic analysis never "
                    "opens or generates a report automatically.", class_="hype-instr"),
             *([_report_busy()] if report_task.status() == "running" else []),
-            ui.div(*[_report_row(nid) for nid in REPORT_DOCS], class_="hype-legend"),
+            ui.div(*[_report_row(nid) for nid in REPORT_DOCS],
+                   _comparison_hub_row(), class_="hype-legend"),
             # ONLY HERE. The three document panes used to render this too, so the same five fields
             # appeared four times in one tree branch.
             _report_controls())
@@ -11891,6 +14948,28 @@ def server(input, output, session):
             parts = [p for p in (_base_only_note("This report"),) if p is not None]
             parts += [ui.div(blurb, class_="hype-instr"),
                       ui.div(status, class_="hype-props-note")]
+            # THE ONE REPORT-LEVEL OPTION, on this document only. It belongs here rather than in
+            # `_report_controls` (which the hub renders for all three) because it changes what
+            # THIS document says, and rather than in the four screening panes because it is one
+            # decision about the report, not four about the modules.
+            #
+            # Rendered only when a sweep can actually back it. `_envelope_on` re-checks the same
+            # gate at build time, so a tick saved against a sweep that has since been wiped or
+            # gone partial resolves to off instead of sitting checked and quietly ignored. The
+            # reason it cannot be offered rides the status line above, not a fourth block.
+            if doc == "screening" and ok:
+                _eok, _ewhy = _envelope_state()
+                if _eok:
+                    parts.append(ui.div(
+                        # THE LABEL NAMES WHAT THE REPORT CALLS IT. The document's rows read
+                        # "Across hydraulic alternatives (process inputs held)", so an option
+                        # offering an "envelope" sent the reader looking for a section that does
+                        # not exist under that name. The input id keeps the old word: it is
+                        # persisted in saved projects and carried by the versioned contract.
+                        ui.input_checkbox("report_fn_envelope",
+                                          "Include ranges across hydraulic alternatives",
+                                          value=bool(_keep("report_fn_envelope", False))),
+                        class_="hype-rep-opt"))
             if not ok:
                 parts.append(_next_hint("fn.scr", "Go to Screening estimates →")
                              if doc == "screening" and hz_result() is not None
@@ -11938,6 +15017,57 @@ def server(input, output, session):
                                "reach automatically.", class_="hype-instr")),
                     open=False, id="site_meta_acc"),
             )
+
+    # ---- Cross-Site Comparison (desktop only) ------------------------------------------
+    # The tree node is a LAUNCHER for the full-screen comparison workspace, not a manager:
+    # collections are standalone .hypecompare files read/written by comparison.py, so the
+    # pane only offers New / Open / recent collections. Cloud hides the node (no filesystem
+    # access to other projects' folders) and this pane degrades to a note if reached anyway.
+    _cmp_recents: dict = {"items": [], "tick": 0}   # launcher snapshot (onclick idx -> entry)
+    cmp_recents_ver = reactive.value(0)
+
+    def _comparison_hub_row():
+        """The Site Reports hub row for the workspace (deliberately not a REPORT_DOCS entry:
+        it opens an interactive overlay, not a built document)."""
+        desktop = runmode.IS_DESKTOP
+        status = ("Compare saved hydraulic results from 2 to 10 project files."
+                  if desktop else "Available in HYPE Desktop.")
+        return ui.div(
+            ui.div(ui.div("Cross-Site Comparison", class_="hype-rep-title"),
+                   ui.div(status, class_="hype-rep-status"), class_="hype-rep-text"),
+            _evt_btn("comparison_new_evt", "Compare projects…",
+                     "btn-sm btn-outline-secondary", disabled=not desktop),
+            class_="hype-leg-row hype-rep-row")
+
+    def _pane_report_cmp():
+        """The Cross-Site Comparison launcher (the PANE_FOR_NODE override for report.cmp)."""
+        if not runmode.IS_DESKTOP:
+            return ui.TagList(ui.div(
+                "Cross-site comparison is available in HYPE Desktop, where saved projects "
+                "on this computer can be read side by side.", class_="hype-instr"))
+        cmp_recents_ver()                       # re-render after open/save/forget
+        items = recents.load_comparisons()[:8]
+        _cmp_recents["items"] = items
+        rows = [
+            ui.div(
+                ui.div(ui.div(it["name"], class_="hype-welcome-name"),
+                       ui.div(str(Path(it["path"]).parent), class_="hype-welcome-dir"),
+                       class_="hype-rep-text"),
+                class_="hype-welcome-row",
+                onclick=(f"Shiny.setInputValue('comparison_recent_open', "
+                         f"{{i: {i}, n: Date.now()}}, {{priority: 'event'}})"))
+            for i, it in enumerate(items)]
+        return ui.TagList(
+            ui.div("Compare this site's hydraulic signature with other saved HYPE projects "
+                   "in a full-screen workspace. Comparisons save as their own files and "
+                   "never modify the source projects.", class_="hype-instr"),
+            ui.div(_evt_btn("comparison_new_evt", "New comparison", "btn-primary"),
+                   _evt_btn("comparison_open_evt", "Open comparison…",
+                            "btn-outline-secondary"),
+                   class_="hype-actions"),
+            *([ui.div("Recent comparisons", class_="hype-props-note"),
+               ui.div(*rows, class_="hype-welcome-list")] if rows else []),
+        )
 
     def _pane_chanmod():
             running = carve_task.status() == "running"
@@ -12437,6 +15567,7 @@ def server(input, output, session):
         "sw.wse": _pane_sw_raster("wse"), "sw.depth": _pane_sw_raster("depth"),
         "gw": _pane_gw, "gw.k": _pane_k,
         "gw.mesh": _pane_mesh, "gw.run": _pane_run, "gw.alt": _pane_alt,
+        "gw.wells": _pane_wells,
         "gw.res": _pane_results, "gw.res.head": _pane_head, "gw.res.paths": _pane_paths,
         "gw.res.hz": _pane_hz, "gw.res.hz.vols": _pane_vols,
         "gw.res.paths.hyp": _pane_hz_paths("hyporheic"),
@@ -12458,6 +15589,10 @@ def server(input, output, session):
            for nid in (fn_reg.FUNCTIONS[k].node_id,) if nid in FN_GROUP_NODES},
         "report": _pane_report_group,
         **{nid: _pane_report_doc(nid) for nid in REPORT_DOCS},
+        # OVERRIDES the expansion above (later duplicate keys win in a dict literal): the
+        # comparison node is a MANAGER pane, not a blurb-status-button document pane.
+        "report.cmp": _pane_report_cmp,
+        "maplyr": _pane_maplyr,
         "base": _pane_basemaps, "base.imagery": _pane_basemaps, "base.topo": _pane_basemaps,
         "base.hydro": _pane_basemaps,
     }
@@ -12488,6 +15623,8 @@ def server(input, output, session):
                  "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.mesh": (lambda: _domain_build() is not None,
                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
+        "gw.wells": (lambda: _domain_build() is not None,
+                     "Generate the four boundaries first.", "bnd", "Go to Boundaries →"),
         "gw.res": (lambda: run_result() is not None,
                    "Run the groundwater model first.", "gw", "Go to Groundwater Modeling →"),
         "gw.res.head": (lambda: run_result() is not None,
@@ -12768,15 +15905,69 @@ def server(input, output, session):
             return None
         m = dem_meta() or {}
         res, src = m.get("resolution_m"), m.get("source", "USGS 3DEP")
-        tag = f"{res} m ({src})" if res else src
+        verb = "imported" if src == "Local raster" else "fetched"
+        tag = f"{res:g} m ({src})" if res else src
         try:
             s = dem.dem_summary(dem_path())
             return ui.p(ui.span(class_="hype-st st-done"),
-                        f"Terrain fetched — {tag} · {s['width']} × {s['height']} px · "
+                        f"Terrain {verb} · {tag} · {s['width']} × {s['height']} px · "
                         f"{s['min']:.1f}–{s['max']:.1f} m", class_="hype-chk ok")
         except Exception:  # noqa: BLE001
-            return ui.p(ui.span(class_="hype-st st-done"), f"Terrain fetched — {tag}",
+            return ui.p(ui.span(class_="hype-st st-done"), f"Terrain {verb} · {tag}",
                         class_="hype-chk ok")
+
+    @render.ui
+    def dem_local_src():
+        """The Local-raster section of the DEM pane: source file card + actions. One compact
+        card per state (none picked / linked / changed on disk / missing), nonce buttons only
+        (this container re-renders on every dem_src change)."""
+        _ = sel_node()      # re-probe the filesystem on every pane visit: render output is
+        #                     cached, so without this a source renamed mid-session keeps
+        #                     showing its last card until dem_src itself changes
+        rec = dem_src() or {}
+        p = rec.get("path")
+        hint = ui.div("The project stores a link to the source file and imports a working "
+                      "copy sized to the reach. Elevations must be in meters.",
+                      class_="hype-instr")
+        if not p:
+            return ui.TagList(
+                ui.div(ui.div("No raster selected.", class_="hype-dem-none"),
+                       class_="hype-dem-src"),
+                ui.div(_evt_btn("dem_choose_evt", "Choose raster...", "btn-primary"),
+                       class_="hype-actions"),
+                hint)
+        pp = Path(p)
+        name = ui.div(pp.name, class_="hype-dem-name", title=str(pp))
+        folder = ui.div(str(pp.parent), class_="hype-dem-dir", title=str(pp.parent))
+        if not pp.is_file():
+            return ui.TagList(
+                ui.div(name, folder,
+                       ui.div(ui.span(class_="hype-st st-warn"),
+                              "The linked file was not found. The imported terrain is "
+                              "still in the project.", class_="hype-dem-note"),
+                       class_="hype-dem-src warn"),
+                ui.div(_evt_btn("dem_choose_evt", "Locate the file...", "btn-primary"),
+                       class_="hype-actions"),
+                hint)
+        rows = [name, folder]
+        try:
+            changed = (rec.get("src_mtime") is not None
+                       and abs(pp.stat().st_mtime - float(rec["src_mtime"])) > 1e-6)
+        except (OSError, TypeError, ValueError):
+            changed = False
+        if changed:
+            rows.append(ui.div(ui.span(class_="hype-st st-warn"),
+                               "The source file has changed since it was imported.",
+                               class_="hype-dem-note"))
+        return ui.TagList(
+            ui.div(*rows, class_="hype-dem-src"),
+            ui.div(_evt_btn("dem_import_evt",
+                            "Re-import terrain" if dem_path() is not None
+                            else "Import terrain", "btn-primary"),
+                   _evt_btn("dem_choose_evt", "Choose a different raster...",
+                            "btn-sm btn-outline-secondary"),
+                   class_="hype-actions"),
+            hint)
 
     @render.ui
     def dem_legend():
@@ -12947,16 +16138,8 @@ def server(input, output, session):
                     class_="hype-chk")
         f = g.get("decimation", 1)
         note = "" if f == 1 else f" · shown at 1/{f} resolution"
-        extras = []
-        if g.get("boundaries"):
-            extras.append("boundary lines labeled")
-        if g.get("basemap") or g.get("basemapTopo"):
-            extras.append("basemap drape on top (Basemaps picks USGS Imagery or Topo; "
-                          "opacity slider in the 3D toolbar)")
-        tail = (" · " + ", ".join(extras)) if extras else ""
         return ui.p(ui.span(class_="hype-st st-done"),
-                    f"{g.get('nActiveFull', 0):,} active cells{note} — drag to orbit, "
-                    f"middle/right-drag to pan, slider to slice{tail}.", class_="hype-chk ok")
+                    f"{g.get('nActiveFull', 0):,} active cells{note}.", class_="hype-chk ok")
 
     @render.ui
     def mesh3d_style():
@@ -13194,8 +16377,17 @@ def server(input, output, session):
             slot = bnd_slot()
             sv = _slot_value(slot) if slot else None
             crosshair = bool(slot) and (sv is None or sv() is None)
-        elif step == STEP_MESH:                     # gw hub — crosshair while placing a grad point
-            crosshair = grad_adding() is not None
+        elif step == STEP_MESH:                     # gw hub — crosshair while placing a grad
+            crosshair = grad_adding() is not None or wells_adding()   # point or a well
+            if crosshair:
+                # The armed click is a MAP click, but with results displayed the domain is
+                # carpeted with DivIcon labels (contour values, head pills, exchange dots)
+                # and interactive vector fills that swallow it — the marker pane sits above
+                # every vector overlay (the STEP_RESULTS routing lesson above). While armed,
+                # nothing else needs to be clickable, so let everything pass through.
+                css += (".hype-map-wrap .leaflet-marker-icon{pointer-events:none !important;}"
+                        ".hype-map-wrap path.leaflet-interactive"
+                        "{pointer-events:none !important;}")
         else:                                       # STEP_K — crosshair while adding a K-zone
             crosshair = kz_adding()
         if crosshair:

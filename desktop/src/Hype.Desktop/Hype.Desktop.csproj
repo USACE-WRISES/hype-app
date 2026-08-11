@@ -7,8 +7,8 @@
     <AssemblyName>HypeDesktop</AssemblyName>
     <RootNamespace>Hype.Desktop</RootNamespace>
     <Product>HYPE Desktop</Product>
-    <Company>gtmenichino</Company>
-    <Version>0.1.0</Version>
+    <Company>USACE-WRISES</Company>
+    <Version>1.0.0</Version>
     <!-- English-only: drops the cs/de/es/... satellite resource folders from publish output. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <ApplicationIcon>..\..\resources\icon.ico</ApplicationIcon>

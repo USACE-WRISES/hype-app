@@ -1,7 +1,10 @@
-"""Fetch a USGS 3DEP DEM covering the drawn domain and save it as a GeoTIFF.
+"""Acquire the working DEM (`inputs/dem.tif`): USGS 3DEP download or local-GeoTIFF import.
 
 3DEP DEMs are hydro-flattened, so by default this same DEM serves as BOTH the terrain
 and the water-surface elevation in run_hyporheic (the caller may override WSE later).
+A local import (`import_local_dem`) writes the SAME working file over the SAME reach-buffer
+AOI, so every downstream consumer (carve, delineation, RAS terrain, GW grid, hillshade) is
+source-agnostic; the project keeps only a pointer to the source file.
 """
 from __future__ import annotations
 
@@ -14,6 +17,12 @@ from shapely.geometry import box
 BUFFER_FRAC = 0.12
 _RES_PRIORITY = (1, 3, 5, 10, 30)     # finest-first; 3DEP metres (1/3/5 m are lidar-only)
 _MAX_PIXELS = 7_000_000               # stay under py3dep's ~8 M dynamic-service cap
+
+DEM_SUFFIXES = frozenset({".tif", ".tiff"})   # local DEM import is GeoTIFF-only
+
+
+class DemImportError(RuntimeError):
+    """A local-DEM import failure whose message is written for the user (shown verbatim)."""
 
 
 def _candidate_resolutions(aoi_bounds, requested) -> list:
@@ -117,6 +126,163 @@ def fetch_dem(domain_gdf_4326, out_path, resolution="auto", buffer_frac: float =
                 errors.append((res, "imageserver: " + str(e)[:120]))
         continue
     raise RuntimeError(f"3DEP DEM fetch failed at all candidate resolutions: {errors}")
+
+
+def normalize_dem_source(raw) -> dict:
+    """Restore hygiene for the persisted terrain-source record. Unknown modes fall back to
+    the 3DEP download; path/mtime coerce to str/float or None. A missing source file is NOT
+    dropped here: missing is a display state (warn card + relink), never a reason to lose
+    the pointer."""
+    rec = raw if isinstance(raw, dict) else {}
+    mode = "local" if rec.get("mode") == "local" else "3dep"
+    path = rec.get("path")
+    path = str(path) if path else None
+    try:
+        mtime = float(rec["src_mtime"]) if rec.get("src_mtime") is not None else None
+    except (TypeError, ValueError):
+        mtime = None
+    return {"mode": mode, "path": path, "src_mtime": mtime}
+
+
+def _pixel_res_m(transform, crs, lat0: float) -> float:
+    """Mean pixel size of (transform, crs) in metres. Geographic CRSes convert via the
+    AOI-centre latitude; projected CRSes in non-metre units convert via the CRS factor."""
+    import math
+
+    dx, dy = abs(float(transform.a)), abs(float(transform.e))
+    if getattr(crs, "is_geographic", False):
+        mx = dx * 111320.0 * max(math.cos(math.radians(lat0)), 1e-6)
+        my = dy * 110540.0
+        return (mx + my) / 2.0
+    try:
+        factor = float(crs.linear_units_factor[1])
+    except Exception:  # noqa: BLE001 — unknown linear unit: assume metres
+        factor = 1.0
+    return (dx + dy) / 2.0 * factor
+
+
+def import_local_dem(src_path, domain_gdf_4326, out_path, *, reach_feat_4326=None,
+                     buffer_frac: float = BUFFER_FRAC, max_pixels: int = _MAX_PIXELS) -> dict:
+    """Import a user GeoTIFF as the working DEM: clip it to the same reach-buffer AOI the
+    3DEP fetch uses and write `out_path` as float32 / nodata -9999 in the SOURCE grid + CRS
+    (verbatim pixel copy, no resampling; decimated only past `max_pixels`). Clipping here is
+    what keeps the GW grid sane: the engine sizes the MODFLOW grid from the whole raster's
+    bounds, so an unclipped county-wide DEM would explode the cell count. Validation failures
+    raise DemImportError with a user-facing message; `reach_feat_4326` (a GeoJSON Feature)
+    additionally requires elevation data along the centerline, which otherwise surfaces as
+    NaN offsets deep inside boundary delineation. Returns ``{"path", "resolution_m",
+    "source": "Local raster", "src_name", "note"}`` (`note` is a non-fatal coverage or
+    decimation warning, else None)."""
+    import math
+
+    import numpy as np
+    import rasterio
+    from rasterio import windows
+    from rasterio.warp import transform_bounds
+
+    src_path = Path(src_path)
+    if not src_path.is_file():
+        raise DemImportError("The raster file was not found.")
+
+    minx, miny, maxx, maxy = (float(v) for v in domain_gdf_4326.total_bounds)
+    dx, dy = (maxx - minx) * buffer_frac, (maxy - miny) * buffer_frac
+    aoi4326 = (minx - dx, miny - dy, maxx + dx, maxy + dy)
+    lat0 = (miny + maxy) / 2.0
+
+    try:
+        src_ds = rasterio.open(src_path)
+    except Exception as e:  # noqa: BLE001
+        raise DemImportError(f"Couldn't read the raster: {e}") from e
+    with src_ds as src:
+        if src.crs is None:
+            raise DemImportError("The raster has no projection information. Assign a "
+                                 "coordinate system and try again.")
+        if src.count != 1:
+            raise DemImportError(f"The raster has {src.count} bands. The DEM must be a "
+                                 "single band elevation raster.")
+        try:
+            aoi_src = transform_bounds("EPSG:4326", src.crs, *aoi4326, densify_pts=21)
+        except Exception as e:  # noqa: BLE001
+            raise DemImportError("Couldn't relate the raster's coordinate system to the "
+                                 f"reach location: {e}") from e
+
+        win = windows.from_bounds(*aoi_src, transform=src.transform)
+        # floor the offsets + ceil the far edge = smallest whole-pixel window COVERING the
+        # AOI (rasterio 1.5 dropped round_lengths(op="ceil"), which rounds to nearest now).
+        col0, row0 = math.floor(win.col_off), math.floor(win.row_off)
+        win = windows.Window(col0, row0,
+                             math.ceil(win.col_off + win.width) - col0,
+                             math.ceil(win.row_off + win.height) - row0)
+        try:
+            win = windows.intersection(win, windows.Window(0, 0, src.width, src.height))
+        except Exception as e:  # rasterio WindowError: disjoint
+            raise DemImportError("The raster does not cover the reach area.") from e
+        w, h = int(win.width), int(win.height)
+        if w < 1 or h < 1:
+            raise DemImportError("The raster does not cover the reach area.")
+
+        # The centerline must sit on real data, or delineation dies far less legibly later.
+        if reach_feat_4326 is not None:
+            from pyproj import Transformer
+            from shapely.geometry import shape as _shape
+            line = _shape(reach_feat_4326["geometry"])
+            pts = [line.interpolate(t, normalized=True) for t in np.linspace(0.0, 1.0, 50)]
+            tr = Transformer.from_crs("EPSG:4326", src.crs.to_wkt(), always_xy=True)
+            xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
+            inb = []
+            for x, y in zip(xs, ys):
+                r, c = src.index(x, y)
+                if 0 <= r < src.height and 0 <= c < src.width:
+                    inb.append((x, y))
+            nd = src.nodata
+            good = sum(1 for v in (src.sample(inb) if inb else ())
+                       if np.isfinite(float(v[0])) and (nd is None or float(v[0]) != nd))
+            if good < 0.9 * len(pts):
+                raise DemImportError("The raster has no elevation data along the reach "
+                                     "centerline.")
+
+        # Verbatim-grid read; integer-stride decimation only past the pixel budget.
+        out_w, out_h, decimated = w, h, False
+        if w * h > max_pixels:
+            stride = math.ceil(math.sqrt((w * h) / max_pixels))
+            out_w, out_h = math.ceil(w / stride), math.ceil(h / stride)
+            decimated = True
+        arr = src.read(1, window=win, out_shape=(out_h, out_w), masked=True)
+        eff = src.window_transform(win) * rasterio.Affine.scale(w / out_w, h / out_h)
+        data = np.ma.filled(arr.astype("float32"), np.float32(-9999.0))
+        data = np.where(np.isfinite(data), data, np.float32(-9999.0)).astype("float32")
+        if not (data != -9999.0).any():
+            raise DemImportError("The raster has no valid elevation pixels over the "
+                                 "reach area.")
+
+        # Partial AOI coverage is legal (their DEM may simply be smaller) but worth a note.
+        # windows.bounds can hand back swapped y edges on a south-up raster: normalize both
+        # rectangles to (min, max) pairs before comparing.
+        wb = windows.bounds(win, src.transform)
+        tol = 2.0 * max(abs(src.transform.a), abs(src.transform.e))
+        partial = (min(wb[0], wb[2]) > min(aoi_src[0], aoi_src[2]) + tol
+                   or min(wb[1], wb[3]) > min(aoi_src[1], aoi_src[3]) + tol
+                   or max(wb[0], wb[2]) < max(aoi_src[0], aoi_src[2]) - tol
+                   or max(wb[1], wb[3]) < max(aoi_src[1], aoi_src[3]) - tol)
+        res_m = round(_pixel_res_m(eff, src.crs, lat0), 2)
+        out_crs = src.crs
+
+    notes = []
+    if partial:
+        notes.append("The raster covers only part of the recommended terrain extent. "
+                     "Boundary generation may be limited near the edges.")
+    if decimated:
+        notes.append(f"The raster was reduced to about {res_m:g} m for the working copy "
+                     "to stay within the processing budget.")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", driver="GTiff", height=out_h, width=out_w, count=1,
+                       dtype="float32", crs=out_crs, transform=eff, nodata=-9999.0,
+                       compress="deflate") as dst:
+        dst.write(data, 1)
+    return {"path": str(out_path), "resolution_m": res_m, "source": "Local raster",
+            "src_name": src_path.name, "note": " ".join(notes) or None}
 
 
 def clip_dem_to_polygon(dem_path, polygon_gdf, out_path, nodata: float = -9999.0):

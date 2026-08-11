@@ -227,12 +227,18 @@ def primary_ranges(manifest: HydraulicAlternativesManifest,
 
 def partial_note(manifest: HydraulicAlternativesManifest) -> str | None:
     """The partial-range label when any planned scenario did not complete. Counts include the
-    Basecase (it is always a completed member of the envelope)."""
+    Basecase (it is always a completed member of the envelope).
+
+    NAMES WHAT DID NOT RUN. "5 of 9 runs" tells a reader the range is incomplete but not which
+    part of the design is missing, and a range whose absent half was the low-K end means something
+    different from one missing a gradient variant."""
     total = len(manifest.scenarios) + 1
     done = len(manifest.completed()) + 1
     if done == total:
         return None
-    return f"Partial scenario range: {done} of {total} runs"
+    missing = [s.label for s in manifest.scenarios if s.status != AltStatus.completed]
+    tail = f" Not completed: {', '.join(missing)}." if missing else ""
+    return f"Partial scenario range: {done} of {total} configured runs completed.{tail}"
 
 
 __all__ = [
