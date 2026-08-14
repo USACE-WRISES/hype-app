@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.0.4 (2026-08-14)
+- The update banner now waits for both update checks before it appears, so updating can no longer split into two steps when the app and the desktop shell update together.
+
 ## v1.0.3 (2026-08-14)
 - Updating is now one clear step: a single banner covers both the app and the desktop shell, with one download, one restart, and buttons that say what they do (Update and restart, Download and restart, Install update).
 

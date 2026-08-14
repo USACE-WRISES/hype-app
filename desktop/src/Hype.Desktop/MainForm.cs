@@ -90,11 +90,7 @@ internal sealed class MainForm : Form
         Controls.Add(_banner);
 
         _updateTimer = new System.Windows.Forms.Timer { Interval = (int)TimeSpan.FromHours(4).TotalMilliseconds };
-        _updateTimer.Tick += (_, _) =>
-        {
-            _ = BackgroundUpdateCheckAsync();
-            _ = BackgroundShellUpdateCheckAsync();
-        };
+        _updateTimer.Tick += (_, _) => _ = RunUpdateChecksAsync();
 
         Load += async (_, _) => await InitializeWebViewAsync();
         FormClosing += OnClosing;
@@ -471,8 +467,7 @@ internal sealed class MainForm : Form
 
             await StartAppAsync();
 
-            _ = BackgroundUpdateCheckAsync();
-            _ = BackgroundShellUpdateCheckAsync();
+            _ = RunUpdateChecksAsync();
             _updateTimer.Start();
         }
         catch (ShellException ex) when (_services.PayloadManager is not null)
@@ -683,6 +678,17 @@ internal sealed class MainForm : Form
 
     // ── Routine update checks (app already usable) ─────────────────────────
 
+    private async Task RunUpdateChecksAsync()
+    {
+        // Both checks settle BEFORE the banner first renders: the payload check (one JSON
+        // GET) reliably beats the shell check (a GitHub releases enumeration), and a banner
+        // rendered from half the state invites a fast click on "Install update" seconds
+        // before the combined one-restart banner could form — the two-step dance again.
+        // Each check swallows its own failures, so WhenAll always completes.
+        await Task.WhenAll(BackgroundUpdateCheckAsync(), BackgroundShellUpdateCheckAsync());
+        RunOnUi(RenderUpdateBanner);
+    }
+
     private async Task BackgroundUpdateCheckAsync()
     {
         if (_services.PayloadManager is not { } manager || _services.ManifestUrl is not { } manifestUrl || _payloadBusy)
@@ -710,7 +716,6 @@ internal sealed class MainForm : Form
                     _pendingShellTooOld = false;
                     break;
             }
-            RunOnUi(RenderUpdateBanner);
         }
         catch (Exception ex) when (ex is ShellException or HttpRequestException or IOException or TaskCanceledException)
         {
@@ -782,7 +787,6 @@ internal sealed class MainForm : Form
         {
             _pendingShellVersion = version;
         }
-        RunOnUi(RenderUpdateBanner);
     }
 
     /// <summary>
