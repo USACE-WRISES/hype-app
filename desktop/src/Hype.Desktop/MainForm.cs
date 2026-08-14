@@ -39,6 +39,9 @@ internal sealed class MainForm : Form
     private AppDescriptor? _app;
     private int? _port;
     private (LatestManifest Manifest, UpdatePlan Plan)? _pendingUpdate;
+    private string? _pendingShellVersion;   // pending shell update (null = current/unknown)
+    private bool _pendingShellTooOld;       // manifest demands a newer shell before the payload
+    private bool _updateBusy;               // an update action is running: banner writes freeze
     private bool _payloadBusy;
     private bool _shutdownComplete;
     private bool _shuttingDown;
@@ -500,21 +503,25 @@ internal sealed class MainForm : Form
     /// page also carries a script tag for it, but a stale cached page (webview-data profile)
     /// would silently lose the bridge — and with it the native file dialogs. The script's own
     /// __hypeBridgeLoaded flag makes the duplicate arrival a no-op. Single source of truth:
-    /// the app's file, read from the resolved payload.
+    /// the app's file, read from the resolved payload — re-registered after an in-place
+    /// payload update so the NEW payload's bridge rides every later document.
     /// </summary>
-    private bool _bridgeInjected;
+    private string? _bridgeScriptId;
 
     private async Task RegisterBridgeInjectionAsync(string bridgePath)
     {
-        if (_bridgeInjected || _webView.CoreWebView2 is not { } core)
+        if (_webView.CoreWebView2 is not { } core)
         {
             return;
         }
         try
         {
             var source = await File.ReadAllTextAsync(bridgePath);
-            await core.AddScriptToExecuteOnDocumentCreatedAsync(source);
-            _bridgeInjected = true;
+            if (_bridgeScriptId is { } previous)
+            {
+                core.RemoveScriptToExecuteOnDocumentCreated(previous);
+            }
+            _bridgeScriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(source);
             _services.ShellLog.WriteLine("[shell] desktop bridge injection registered");
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FileNotFoundException or DirectoryNotFoundException)
@@ -686,24 +693,35 @@ internal sealed class MainForm : Form
         {
             using var source = _services.SourceFactory();
             var result = await Task.Run(() => manager.CheckAsync(source, manifestUrl, CancellationToken.None));
-            if (result is CheckResult.UpdateAvailable update)
+            switch (result)
             {
-                _pendingUpdate = (update.Manifest, update.Plan);
-                var mb = Math.Max(1, update.Plan.DownloadBytes / 1_000_000);
-                RunOnUi(() => ShowBanner($"A HYPE update is ready ({mb} MB).", "Install & restart app",
-                    ApplyPendingUpdateAsync));
+                case CheckResult.UpdateAvailable update:
+                    _pendingUpdate = (update.Manifest, update.Plan);
+                    _pendingShellTooOld = false;
+                    break;
+                case CheckResult.ShellTooOld tooOld:
+                    _pendingUpdate = null;
+                    _pendingShellTooOld = true;
+                    _services.ShellLog.WriteLine(
+                        $"[shell] app update needs shell {tooOld.RequiredShellVersion} first");
+                    break;
+                case CheckResult.UpToDate:
+                    _pendingUpdate = null;
+                    _pendingShellTooOld = false;
+                    break;
             }
+            RunOnUi(RenderUpdateBanner);
         }
         catch (Exception ex) when (ex is ShellException or HttpRequestException or IOException or TaskCanceledException)
         {
-            // Offline or blocked — routine checks fail silently; no banner appears.
+            // Offline or blocked — routine checks fail silently; known pending state stands.
             _services.ShellLog.WriteLine($"[shell] update check failed quietly: {ex.Message}");
         }
     }
 
     private async Task ApplyPendingUpdateAsync()
     {
-        if (_services.PayloadManager is not { } manager || _payloadBusy)
+        if (_services.PayloadManager is not { } manager || _payloadBusy || _updateBusy)
         {
             return;
         }
@@ -713,6 +731,7 @@ internal sealed class MainForm : Form
             return;
         }
         _payloadBusy = true;
+        _updateBusy = true;
         HideBanner();
         manager.Progress += OnPayloadProgress;
         try
@@ -731,7 +750,13 @@ internal sealed class MainForm : Form
             _pendingUpdate = null;
             _payloadBusy = false;
             // The supervisor re-resolves the payload on every start, so the fresh app tree is
-            // picked up by simply launching again.
+            // picked up by simply launching again — but the injected bridge script must be
+            // re-registered from the NEW payload or the old copy rides every later document.
+            if (_app is { } app)
+            {
+                var fresh = _services.Locator.Resolve();
+                await RegisterBridgeInjectionAsync(Path.Combine(fresh.AppsRoot, app.Dir, "www", "desktop_bridge.js"));
+            }
             await InitializeAppAsync();
         }
         catch (ShellException ex)
@@ -742,30 +767,70 @@ internal sealed class MainForm : Form
         {
             manager.Progress -= OnPayloadProgress;
             _payloadBusy = false;
+            _updateBusy = false;
+            // A pending shell update surfaces NOW instead of at the next 4-hour tick.
+            RunOnUi(RenderUpdateBanner);
         }
     }
 
     private async Task BackgroundShellUpdateCheckAsync()
     {
+        // null means current OR check failure — either way a previously KNOWN pending
+        // version stands (clicking a stale one fails soft with a retryable banner).
         var version = await _shellUpdater.CheckAsync();
         if (version is not null)
         {
-            RunOnUi(() => ShowBanner($"A new HYPE Desktop ({version}) is ready.", "Restart & update",
-                ApplyShellUpdateAsync));
+            _pendingShellVersion = version;
         }
+        RunOnUi(RenderUpdateBanner);
+    }
+
+    /// <summary>
+    /// The ONLY writer of the update banner. Both check streams land here, so the banner is
+    /// always composed from the FULL pending state (UpdatePlanner) instead of last-writer-wins,
+    /// and an in-flight update's progress text is never overwritten by a late check.
+    /// </summary>
+    private void RenderUpdateBanner()
+    {
+        if (_updateBusy)
+        {
+            return;
+        }
+        long? mb = _pendingUpdate is { } pending
+            ? Math.Max(1, pending.Plan.DownloadBytes / 1_000_000)
+            : null;
+        var banner = UpdatePlanner.Compose(mb, _pendingShellVersion, _pendingShellTooOld);
+        if (banner is null)
+        {
+            HideBanner();
+            return;
+        }
+        var action = banner.Kind switch
+        {
+            UpdateKind.Payload => (Func<Task>)ApplyPendingUpdateAsync,
+            UpdateKind.Shell => ApplyShellUpdateAsync,
+            _ => ApplyCombinedUpdateAsync,
+        };
+        ShowBanner(banner.Text, banner.Button, action);
     }
 
     private async Task ApplyShellUpdateAsync()
     {
-        if (_payloadBusy)
+        if (_payloadBusy || _updateBusy)
         {
             return;
         }
         _payloadBusy = true;
+        _updateBusy = true;
         try
         {
             _bannerInstall.Enabled = false;
-            _bannerText.Text = "Downloading the HYPE Desktop update…";
+            _bannerLater.Enabled = false;      // the restart happens regardless once started
+            _bannerText.Text = "Downloading the desktop update…";
+
+            // The app page is about to lose its server: give the window honest content.
+            NavigateToLauncher();
+            Post(new { type = "setup", message = "Downloading the desktop update…", percent = -1, detail = "" });
 
             // Stop the app server cleanly before Velopack restarts the process (the job object
             // would otherwise hard-kill it mid-session).
@@ -776,15 +841,75 @@ internal sealed class MainForm : Form
             }
 
             await _shellUpdater.DownloadAndRestartAsync(percent => RunOnUi(() =>
-                _bannerText.Text = $"Downloading the HYPE Desktop update… {percent}%"));
+                _bannerText.Text = $"Downloading the desktop update… {percent}%"));
             // Not reached on success: the process restarts into the new version.
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
             _services.ShellLog.WriteLine($"[shell-update] apply failed: {ex.Message}");
             _bannerInstall.Enabled = true;
-            _bannerText.Text = $"Shell update failed: {ex.Message}";
+            _bannerLater.Enabled = true;
+            _bannerText.Text = $"The desktop update failed: {ex.Message}";
             _payloadBusy = false;
+            _updateBusy = false;
+            await InitializeAppAsync();        // the server was stopped: bring the app back
+        }
+    }
+
+    private async Task ApplyCombinedUpdateAsync()
+    {
+        // One click, one restart: install the app payload (no interim relaunch), then chain
+        // straight into the shell download + restart. The restarted shell resolves the
+        // committed payload, so the session comes back fully updated in a single restart.
+        if (_services.PayloadManager is not { } manager || _payloadBusy || _updateBusy)
+        {
+            return;
+        }
+        if (_pendingUpdate is not { } pending)
+        {
+            await ApplyShellUpdateAsync();     // nothing pending for the app: plain shell flow
+            return;
+        }
+        _payloadBusy = true;
+        _updateBusy = true;
+        manager.Progress += OnPayloadProgress;
+        try
+        {
+            _bannerInstall.Enabled = false;
+            _bannerLater.Enabled = false;
+            _bannerText.Text = "Installing the app update…";
+            NavigateToLauncher();
+            Post(new { type = "setup", message = "Installing the app update…", percent = -1, detail = "" });
+            _port = null;
+            if (_supervisor is { } supervisor)
+            {
+                await supervisor.StopAllAsync();
+            }
+
+            using (var source = _services.SourceFactory())
+            {
+                await Task.Run(() => manager.ApplyAsync(source, pending.Manifest, pending.Plan, CancellationToken.None));
+            }
+            _pendingUpdate = null;
+
+            Post(new { type = "setup", message = "Downloading the desktop update…", percent = -1, detail = "" });
+            await _shellUpdater.DownloadAndRestartAsync(percent => RunOnUi(() =>
+                _bannerText.Text = $"Downloading the desktop update… {percent}%"));
+            // Not reached on success.
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            _services.ShellLog.WriteLine($"[update] combined update failed: {ex.Message}");
+            _bannerInstall.Enabled = true;
+            _bannerLater.Enabled = true;
+            _bannerText.Text = $"The update failed: {ex.Message}";
+            _payloadBusy = false;
+            _updateBusy = false;
+            await InitializeAppAsync();        // relaunch whatever payload is committed
+        }
+        finally
+        {
+            manager.Progress -= OnPayloadProgress;
         }
     }
 

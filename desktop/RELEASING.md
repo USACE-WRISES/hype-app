@@ -22,9 +22,9 @@ git push origin main
 That's it. The `desktop-payload` workflow (paths-filtered to `app.py`, `hype_app/`, `hypetool/`,
 `www/`, `CHANGELOG.md`, `requirements.txt`, `desktop/payload|scripts/`) builds a fresh apps zip from the tracked
 tree (`git archive`), publishes the prerelease, and refreshes `desktop-current`. ~8 minutes
-later every installed desktop's next update check shows the native banner — "A HYPE update is
-ready (3 MB). Install & restart app". The same push is what you deploy to Connect Cloud from,
-so web and desktop stay the same code by construction.
+later every installed desktop's next update check shows the native banner — "A HYPE app update
+is ready (3 MB). It installs in this window." with an **Install update** button. The same push
+is what you deploy to Connect Cloud from, so web and desktop stay the same code by construction.
 
 The env component (python-build-standalone + wheels + `tools\` solver runtimes) is rebuilt only
 when `desktop/payload/{env.lock,pbs.lock,prune.txt,tools.lock}` change — ENV_VERSION is a
@@ -50,7 +50,12 @@ minor (x.Y.0) for a headline capability or a project-format change; major for re
 `desktop-shell.yml` runs the unit tests, publishes self-contained win-x64, packs with Velopack
 (delta against the previous release), uploads a **normal** release with its body filled from
 the tag's CHANGELOG.md section, and stamps the new installer URLs onto `desktop-current`'s
-manifest. Installed shells offer "Restart & update".
+manifest. Because the payload also updated, installed shells show ONE combined banner ("A HYPE
+update is ready: the app (N MB) and the desktop shell (x.y.z).") whose **Update and restart**
+button installs the app payload and chains the shell download into a single restart; a
+shell-only release shows "A new version of HYPE Desktop (x.y.z) is ready to download." with
+**Download and restart** (`Hype.Desktop.Core/UpdatePlanner.cs` composes the banner from the
+combined pending state — never two banners in sequence).
 
 ## Tool runtimes (HEC-RAS / MODFLOW) update
 

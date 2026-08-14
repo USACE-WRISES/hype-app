@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.0.3 (2026-08-14)
+- Updating is now one clear step: a single banner covers both the app and the desktop shell, with one download, one restart, and buttons that say what they do (Update and restart, Download and restart, Install update).
+
 ## v1.0.2 (2026-08-14)
 - Portable installs now clean up the leftover "HYPE Desktop.exe" launcher from the original download, and the portable download ships one standard launcher name (HypeDesktop.exe).
 
