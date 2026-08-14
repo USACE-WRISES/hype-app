@@ -102,5 +102,10 @@ satisfied by `env.lock` (floors, not exact pins — see `desktop/scripts/check_l
 - If a payload release was accidentally published as a normal release, edit it to prerelease
   immediately (`gh release edit <tag> --prerelease`) — otherwise `releases/latest` stops being
   an installer and shell self-update breaks.
+- The portable zip's launcher is `HypeDesktop.exe` (the pack id), normalized by the shell
+  workflow — vpk 1.2.0 itself writes a title-named `HYPE Desktop.exe` into the zip while the
+  updater refreshes the id-named launcher, which left a stale duplicate after a portable
+  install's first update. Portable installs extracted from a pre-v1.0.1-fix zip may still
+  carry the stale `HYPE Desktop.exe`; it is safe to delete.
 - Offline/air-gapped install: download the shell installer + both payload zips +
   `latest-desktop.json` to a folder, then use "Install from file…" on the setup screen.

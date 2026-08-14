@@ -49,7 +49,9 @@ jobs:
           -o desktop/publish
 
       - name: Install Velopack CLI
-        run: dotnet tool install --global vpk
+        # Pinned: packaging behavior (launcher naming, package layout) must not drift
+        # between releases just because CI ran on a different day.
+        run: dotnet tool install --global vpk --version 1.2.0
 
       - name: Download previous release (enables delta packages)
         continue-on-error: true   # first release has nothing to delta against
@@ -68,6 +70,35 @@ jobs:
             --packTitle 'HYPE Desktop' `
             --packAuthors 'USACE-WRISES' `
             --icon desktop/resources/icon.ico
+
+      - name: Normalize the portable launcher name
+        shell: pwsh
+        run: |
+          # vpk 1.2.0 names the launcher INSIDE the portable zip after the pack title
+          # ("HYPE Desktop.exe") while Setup installs and the updater both write the
+          # id-named "HypeDesktop.exe" - so a portable install's first update left a
+          # stale duplicate launcher behind instead of overwriting. Rename the zip
+          # entry to the id name so extraction and updates agree on ONE file.
+          $zip = Get-ChildItem -Recurse -Filter 'HypeDesktop-win-Portable.zip' | Select-Object -First 1
+          if (-not $zip) { Write-Host '::error::portable zip not found'; exit 1 }
+          Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+          $a = [System.IO.Compression.ZipFile]::Open($zip.FullName, 'Update')
+          try {
+            $old = $a.Entries | Where-Object { $_.FullName -eq 'HYPE Desktop.exe' }
+            $new = $a.Entries | Where-Object { $_.FullName -eq 'HypeDesktop.exe' }
+            if (-not $old) {
+              Write-Host 'portable launcher already id-named - nothing to normalize'
+            } elseif ($new) {
+              $old.Delete()
+              Write-Host 'dropped the redundant title-named launcher'
+            } else {
+              $dst = $a.CreateEntry('HypeDesktop.exe', 'Optimal')
+              $s = $old.Open(); $d = $dst.Open()
+              $s.CopyTo($d); $d.Dispose(); $s.Dispose()
+              $old.Delete()
+              Write-Host 'renamed portable launcher: HYPE Desktop.exe -> HypeDesktop.exe'
+            }
+          } finally { $a.Dispose() }
 
       - name: Upload release (installer, portable, deltas, RELEASES feed)
         run: >
