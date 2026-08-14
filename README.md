@@ -18,6 +18,8 @@ Per-user install, no admin rights; requires the Microsoft WebView2 Runtime (ship
 Edge on Windows 10/11). First launch downloads the modeling runtime (~450 MB, resumable,
 sha256-verified). After that the app keeps itself current: app updates ship on every push
 to `main`, and shell updates arrive with each `v*` release (see `desktop/RELEASING.md`).
+What changed in each version: [CHANGELOG.md](CHANGELOG.md), also shown in the app by
+clicking the version number.
 
 ## What it does
 

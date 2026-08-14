@@ -128,6 +128,8 @@ SOILS_SEL_STYLE = {"color": "#1f6feb", "weight": 2, "opacity": 1.0,    # soils m
 SOILS_HOVER = {"weight": 2.5, "fillOpacity": 0.35}                     # soils modal: click affordance
 NHD_STYLE = {"color": "#00c2ff", "weight": 3.5, "opacity": 0.95}     # clickable NHD flowlines (bold)
 NHD_MIN_ZOOM = 16   # flowlines fetch/draw only at this zoom or deeper — wider views stay clean
+MAP_HOME_CENTER = (39.5, -98.35)   # the national (CONUS) view: first launch + New project
+MAP_HOME_ZOOM = 4
 REACH_STYLE = {"color": "#ff2d95", "weight": 5, "opacity": 0.95}     # the analysis reach (magenta — pops on USGS topo, distinct from cyan NHD)
 CAP_STYLE = {"color": "#333333", "weight": 2, "opacity": 0.9, "dashArray": "6 5", "fill": False}
 USGS_WATERSHED_STYLE = {"color": "#0f766e", "weight": 2, "opacity": 0.9,
@@ -151,8 +153,10 @@ MODFLOW_UNAVAILABLE_MSG = (
     "MODFLOW 6 / MODPATH 7 not found — expected mf6 and mp7 in the bundled bin/win "
     "(Windows) or bin/linux folder, or set HYPE_MODFLOW_BIN to a folder containing them.")
 
-APP_VERSION = "1.0.0"          # single source of truth: About dialog, header chip, welcome splash,
-                               # run_config.json, the project-file manifest, and report footers
+APP_VERSION = "1.0.1"          # single source of truth: About dialog, header chip, welcome splash,
+                               # run_config.json, the project-file manifest, and report footers.
+                               # Bump TOGETHER with desktop/src/Hype.Desktop/Hype.Desktop.csproj
+                               # <Version> and a matching CHANGELOG.md section (test-pinned).
 APP_VERSION_LABEL = f"v{APP_VERSION}"   # user-visible spelling (header chip + welcome splash)
 
 
@@ -171,6 +175,18 @@ def _desktop_build_line() -> str:
     if not apps:
         return ""
     return f"\n\nDesktop build {apps}" + (f" (runtime {env})" if env else "")
+
+
+def _changelog_md() -> str:
+    """What's new dialog body. CHANGELOG.md sits next to app.py in a dev checkout AND in an
+    installed apps payload (build-apps-payload.ps1 ships it in the git-archive pathspec).
+    Best-effort: a missing or unreadable file collapses the dialog to the version line."""
+    try:
+        text = (Path(__file__).resolve().parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    # The modal supplies its own title; the file's H1 would just repeat it.
+    return re.sub(r"^# .*\n+", "", text, count=1)
 
 # pyplot state is process-global and report_task renders its ~10 figures on a worker thread,
 # so concurrent sessions' report builds must serialize. Event-loop pyplot users (xsect profile,
@@ -205,6 +221,18 @@ FLOW_UP_STYLE = {"color": "#1e40af", "weight": 0.5, "opacity": 0.8,
 # selection orange) and it pops on both USGS basemaps.
 FP_ANIM_COLORS = ("#ff2bd6", "#00e5ff", "#ffffff", "#b4ff39", "#000000", "#ff2b2b")
 FP_ANIM_COLOR_NAMES = ("Magenta", "Cyan", "White", "Lime", "Black", "Red")
+# Particle color modes: "solid" paints every particle the picked swatch color; the two
+# rainbow modes map residence time onto a turbo scale (log axis, blue quick to red slow,
+# legend drawn by the client/renderer). "total" fixes each particle at its path's total
+# residence-time color; "elapsed" shifts the color as the particle ages in transit, so
+# it lands on its total-time color exactly as it exits.
+FP_ANIM_MODES = ("solid", "total", "elapsed")
+# Line color modes share the SAME turbo scale: "class" keeps the identity palette,
+# "single" one picked color, "total" one residence-time color per path, "elapsed" a
+# gradient along each path (3-D and captures; the 2-D map shows each line's total-time
+# color — Leaflet cannot gradient a polyline at this path count).
+FP_LINE_MODES = ("class", "total", "elapsed")
+FP_LINE_RAINBOW = ("total", "elapsed")
 HZ_TOTAL = 7
 HZ_STEPS = {0: "Preparing…", 1: "Loading the flow solution", 2: "Seeding particles",
             3: "Tracking forward (endpoints)", 4: "Tracking backward (endpoints)",
@@ -279,8 +307,12 @@ app_ui = ui.page_fillable(
             ui.div(ui.span("HYPE", ui.tags.small("Hyporheic Exchange Explorer"),
                            class_="hype-brand"),
                    ui.output_ui("project_badge", inline=True),
+                   # The version number IS the changelog door: clicking it opens the
+                   # What's new dialog (same from the welcome splash and the About footer).
                    ui.span(APP_VERSION_LABEL, class_="hype-version-chip",
-                           title=f"HYPE {APP_VERSION}"),
+                           title="What's new in HYPE",
+                           onclick="Shiny.setInputValue('whatsnew_evt', "
+                                   "Date.now() + Math.random(), {priority: 'event'})"),
                    class_="hype-header-left"),
             # 2D/3D canvas toggle — plain buttons, delegated via www/tree.js (data-view),
             # active states synced from the hype_tree payload's `view` field. Middle grid
@@ -584,14 +616,14 @@ def server(input, output, session):
     fp_anim_speed_v = reactive.value(3.0)   # slider 0.5..10; median path loops in 36/v seconds
     fp_anim_color_v = reactive.value(FP_ANIM_COLORS[0])
     fp_anim_style_v = reactive.value("comet")   # "comet" (fading tail) or "dots"
+    fp_anim_mode_v = reactive.value("solid")    # FP_ANIM_MODES: swatch color or a rainbow
     # flow-path LINE styling (display prefs; persisted in project saves like head_opacity).
     # Show=False styles the lines to opacity 0 instead of unmounting them, so the animator
     # keeps its geometry and particles stay visible over an invisible network.
     fp_line_show_v = reactive.value(True)
     fp_line_weight_v = reactive.value(1.0)
     fp_line_opacity_v = reactive.value(0.9)
-    fp_line_mode_v = reactive.value("class")    # "class" (identity palette) or "single"
-    fp_line_color_v = reactive.value("#0d9488")
+    fp_line_mode_v = reactive.value("class")    # one of FP_LINE_MODES
     # Layer visibility lives in the TREE checkboxes (server-side — ipyleaflet's LayersControl
     # dies under the run-completion layer burst, a client race in jupyter-leaflet 0.20).
     _layer_shadow: dict = {}                # hidden layers parked here so toggles can restore them
@@ -2024,7 +2056,7 @@ def server(input, output, session):
             # hype-ref (340), both under the default overlayPane (400) where every
             # app-generated overlay stays. CONSTRUCTOR-ONLY: mutating Map.panes later makes
             # the jupyter-leaflet client re-render the entire map.
-            m = Map(center=(39.5, -98.35), zoom=4, scroll_wheel_zoom=True,
+            m = Map(center=MAP_HOME_CENTER, zoom=MAP_HOME_ZOOM, scroll_wheel_zoom=True,
                     zoom_control=False, max_zoom=19, layout=Layout(height="100%"),
                     panes={ml_mod.PANE_TERRAIN: {"zIndex": 320},
                            ml_mod.PANE_REF: {"zIndex": 340, "pointerEvents": "none"}})
@@ -2077,14 +2109,27 @@ def server(input, output, session):
         def _view():
             return reactive_read(_MAP, "zoom"), reactive_read(_MAP, "center")
 
+    def _map_home():
+        # Back to the national view — the New-project tails ONLY (Open flies to the
+        # site itself, and a national jump first would churn layers mid-flight).
+        # Direct trait writes are the geocode precedent; flyToBounds cannot express
+        # "zoom out to 4 over CONUS" cleanly.
+        if not _HAS_MAP:
+            return
+        _MAP.center = MAP_HOME_CENTER
+        _MAP.zoom = MAP_HOME_ZOOM
+
     # ---- DEM acquire (3DEP download or local-raster import) ----
     @reactive.extended_task
     async def dem_task(payload: dict) -> dict:
         def _work():
             g = geometry.single_feature_gdf(payload["aoi"])
             if payload.get("mode") == "local":
+                # Desktop-only path (the local-DEM radio is desktop-gated): no pixel
+                # budget, the imported raster is clipped verbatim at full resolution.
                 info = dem.import_local_dem(payload["src"], g, payload["out"],
-                                            reach_feat_4326=payload.get("reach"))
+                                            reach_feat_4326=payload.get("reach"),
+                                            max_pixels=None)
             else:
                 info = dem.fetch_dem(g, payload["out"], resolution=payload["resolution"])
             return {**info, "mode": payload.get("mode", "3dep"),
@@ -2262,19 +2307,17 @@ def server(input, output, session):
         with reactive.isolate():
             dem_gen.set(dem_gen() + 1)     # fetch completed → terrain→boundaries chain marker
             # Manual draws can run downhill→uphill (auto NHD traces are upstream-first by
-            # construction) — flip a backwards line NOW, in the same flush, so the boundary
-            # auto-chain always consumes the corrected reach.
+            # construction) — correct a backwards line NOW, in the same flush, so the
+            # boundary auto-chain always consumes the corrected reach. The NHD flow
+            # direction (_manual_dir_check → dir_task) is the authority; the terrain check
+            # runs only when NHD said undecidable. A lookup still in flight defers the
+            # decision to _dir_done, which sees the DEM present and finishes the job
+            # (recommitting via reach_gen, because this flush's chain consumed the
+            # uncorrected line).
             if delineate_mode() == "manual" and reach_feat() is not None:
-                try:
-                    fixed, was_flipped = delineate.orient_reach_downstream(
-                        reach_feat(), res["path"])
-                except Exception:  # noqa: BLE001
-                    fixed, was_flipped = None, False
-                if was_flipped and fixed is not None:
-                    reach_feat.set(fixed)
-                    _decor_show("Reach", fixed, REACH_STYLE)
-                    ui.notification_show("Centerline direction corrected to upstream → "
-                                         "downstream (from the terrain).", duration=6)
+                if (_reach_dir["sig"] == _dir_sig(reach_feat())
+                        and _reach_dir["verdict"] is None):
+                    _dem_orient_reach(res["path"])
         dem_meta.set({"resolution_m": res.get("resolution_m"), "source": res.get("source"),
                       "src_name": res.get("src_name")})
         dem_stretch_v.set(None)            # a fresh DEM starts at the full-raster stretch
@@ -2653,7 +2696,9 @@ def server(input, output, session):
         eps = _reach_endpoints(rf)
         if eps is None:
             return
-        sig = tuple((round(e["lat"], 7), round(e["lon"], 7)) for e in eps)
+        # Direction-insensitive sig: the DA lookup is orientation-proof (both endpoints go
+        # in symmetrically), so a direction flip of the same line must not re-query.
+        sig = tuple(sorted((round(e["lat"], 7), round(e["lon"], 7)) for e in eps))
         if _da_snap["sig"] == sig:
             return                      # this exact line already tried (no retry loop)
         _da_snap["sig"] = sig
@@ -2688,9 +2733,13 @@ def server(input, output, session):
             return
         eps = _reach_endpoints(rf)
         q = res.get("q") or []
-        if eps is None or len(q) != 2 or any(
-                abs(e["lat"] - p["lat"]) > 1e-7 or abs(e["lon"] - p["lon"]) > 1e-7
-                for e, p in zip(eps, q)):
+
+        # Direction-insensitive compare: a direction flip mid-lookup must not discard the
+        # result (the DA is orientation-proof by construction).
+        def _sym(pair):
+            return tuple(sorted((round(p["lat"], 7), round(p["lon"], 7)) for p in pair))
+
+        if eps is None or len(q) != 2 or _sym(eps) != _sym(q):
             print("[da] snap result is for an older line — ignored", flush=True)
             return                      # the line changed while we were snapping — stale
         best = res.get("best")
@@ -2708,6 +2757,130 @@ def server(input, output, session):
               f"the line)", flush=True)
         ui.notification_show(f"Drainage area set from NHD: {val:g} km² ({nm}). Adjust it "
                              f"if needed.", duration=6)
+
+    # ---- manual-mode direction: the NHD flow direction is the authority ----
+    # A manual draw can run either way regardless of the pane's instruction. The old
+    # terrain-only check compared mean end elevations against a 5 cm threshold, which on a
+    # low-gradient meander is decided by lidar water-surface noise and bank pixels under the
+    # hand-drawn line — the reversed-horseshoe bug. Now NHD decides first (the same
+    # authority Auto mode is built on) and the hardened terrain check is the fallback for
+    # unmapped streams.
+    _reach_dir = {"sig": None, "verdict": "pending"}  # verdict: pending | ok | reversed | None
+
+    def _dir_sig(rf):
+        """Directional endpoints signature of a reach Feature (order matters), or None."""
+        eps = _reach_endpoints(rf)
+        if eps is None:
+            return None
+        return tuple((round(e["lat"], 7), round(e["lon"], 7)) for e in eps)
+
+    def _dem_orient_reach(dem_p, *, bump_gen: bool = False) -> None:
+        """Terrain fallback for the direction check (call under isolate): flip the manual
+        centerline when the DEM says it was drawn decisively uphill. bump_gen recommits the
+        corrected line to the auto-chain — needed only when the flip lands AFTER the chain
+        already consumed the uncorrected draw (the deferred _dir_done path)."""
+        rf = reach_feat()
+        if rf is None:
+            return
+        try:
+            fixed, was_flipped = delineate.orient_reach_downstream(rf, dem_p)
+        except Exception:  # noqa: BLE001
+            fixed, was_flipped = None, False
+        if not was_flipped or fixed is None:
+            return
+        _reach_dir["sig"] = _dir_sig(fixed)
+        _reach_dir["verdict"] = "ok"    # settled — the corrected line never re-checks
+        reach_feat.set(fixed)
+        if bump_gen:
+            reach_gen.set(reach_gen() + 1)
+        _decor_show("Reach", fixed, REACH_STYLE)
+        ui.notification_show("Centerline direction corrected to upstream → "
+                             "downstream (from the terrain).", duration=6)
+
+    @reactive.effect
+    def _manual_dir_check():
+        # Subscribing reads: re-fires on draw/edit/restore commits and mode flips. One
+        # lookup per drawn geometry (sig guard); a flip pre-stores the corrected line's sig
+        # as settled, so corrections never re-check (and never loop). Restores pre-seed the
+        # sig, so an opened project is never re-oriented.
+        if delineate_mode() != "manual":
+            return
+        rf = reach_feat()
+        if rf is None:
+            return
+        sig = _dir_sig(rf)
+        if sig is None or _reach_dir["sig"] == sig:
+            return
+        _reach_dir["sig"] = sig
+        _reach_dir["verdict"] = "pending"
+        dir_task(*_reach_endpoints(rf))
+
+    @reactive.extended_task
+    async def dir_task(p1: dict, p2: dict) -> dict:
+        # Echo the query for the stale guard (the da_task pattern).
+        def _work():
+            v = hydro.reach_flow_direction(p1, p2, _flow.get("gdf"), max_ft=_DA_SNAP_MAX_FT)
+            return {"dir": v, "q": [p1, p2]}
+        return await anyio.to_thread.run_sync(_work)
+
+    @reactive.effect
+    def _dir_done():
+        if dir_task.status() in ("initial", "running", "cancelled"):
+            return
+        failed = dir_task.status() == "error"
+        res = None
+        if failed:
+            try:
+                dir_task.result()
+            except Exception:  # noqa: BLE001
+                pass
+            print("[dir] NHD direction lookup failed — the terrain decides", flush=True)
+        else:
+            try:
+                res = dir_task.result()
+            except Exception:  # noqa: BLE001
+                return
+        with reactive.isolate():        # the done-handler re-fire lesson: status is the only dep
+            rf = reach_feat()
+            mode = delineate_mode()
+            dem_p = dem_path()
+        if mode != "manual" or rf is None:
+            return
+        verdict = None                  # a service failure means NHD can't decide
+        if not failed:
+            eps = _reach_endpoints(rf)
+            q = res.get("q") or []
+            if eps is None or len(q) != 2 or any(
+                    abs(e["lat"] - p["lat"]) > 1e-7 or abs(e["lon"] - p["lon"]) > 1e-7
+                    for e, p in zip(eps, q)):
+                print("[dir] direction result is for an older line — ignored", flush=True)
+                return
+            verdict = res.get("dir")
+        _reach_dir["verdict"] = verdict
+        if verdict == "reversed":
+            flipped = delineate.reversed_feature(rf)
+            if flipped is None:
+                return
+            _reach_dir["sig"] = _dir_sig(flipped)
+            _reach_dir["verdict"] = "ok"   # settled — the corrected line never re-checks
+            with reactive.isolate():
+                reach_feat.set(flipped)
+                if dem_p is not None:      # the chain consumed the old line — recommit
+                    reach_gen.set(reach_gen() + 1)
+            _decor_show("Reach", flipped, REACH_STYLE)
+            ui.notification_show("Centerline direction corrected to upstream → downstream "
+                                 "(from the NHD flow direction).", duration=6)
+            print("[dir] flipped to match the NHD flow direction", flush=True)
+            return
+        if verdict == "ok":
+            print("[dir] draw direction matches the NHD flow", flush=True)
+            return
+        # NHD couldn't decide — the terrain fallback decides: right now if the DEM beat
+        # this lookup, otherwise in _dem_done at terrain completion.
+        print("[dir] NHD could not decide the flow direction", flush=True)
+        if dem_p is not None:
+            with reactive.isolate():
+                _dem_orient_reach(dem_p, bump_gen=True)
 
     @reactive.extended_task
     async def delineate_task(reach, dem_p, da, lat, lon, x_mult, want_wse) -> dict:
@@ -2974,8 +3147,8 @@ def server(input, output, session):
             ui.notification_show("Need the four boundaries and terrain first.",
                                  type="warning", duration=5)
             return
-        est = grid_estimate()                 # same red band that blocks Run — refuse up front
-        if est and estimate.band(est["n_cells"]) == "red":
+        est = grid_estimate()   # same red band that blocks Run — cloud refuses, desktop proceeds
+        if not runmode.IS_DESKTOP and est and estimate.band(est["n_cells"]) == "red":
             ui.notification_show(estimate.band_message(est), type="error", duration=10)
             return
         stage.set("Building the 3D mesh…")
@@ -3196,6 +3369,7 @@ def server(input, output, session):
                  "cell_size", "gw_mod_depth", "z",
                  "grid_wireframe", "grid_opacity3d",
                  "carve_bw", "carve_depth", "carve_slope", "hz_ppc", "hz_sample",
+                 "hz_iface_ppc",
                  "fn_do", "fn_no3", "fn_o2_rate", "fn_do_thresh", "fn_do_gate",
                  "fn_denit_rate", "fn_tau",
                  # One "Include in report" per calculator, one endpoint picker, one stream
@@ -5446,7 +5620,8 @@ def server(input, output, session):
                 "hard_cap_particles": (10**9 if runmode.IS_DESKTOP else HZ_MAX_PARTICLES),
                 "classes_for_volume": list(HZ_CLASSES),
             }
-            for opt in ("max_time_days", "saturated_clip", "min_sat_frac"):
+            for opt in ("max_time_days", "saturated_clip", "min_sat_frac",
+                        "iface_particles_per_cell"):
                 if knobs.get(opt) is not None:
                     hz_kw[opt] = knobs[opt]
             from hype_app.contracts import GRADIENT_METHOD_VERSION, RESULTS_SCHEMA_VERSION
@@ -6990,16 +7165,18 @@ def server(input, output, session):
 
     @reactive.effect
     def _ras_mesh_sync():
-        # Owns the "RAS mesh" overlay (Surface step only). Rasterized PNG, not vector —
-        # thousands of face edges as SVG paths make Leaflet unusably slow. Also re-asserts
-        # after a run completes (ras_result read) — the completion flush is exactly when the
-        # client historically lost this layer.
+        # Owns the "RAS mesh" overlay. Rasterized PNG, not vector — thousands of face edges
+        # as SVG paths make Leaflet unusably slow. Checkbox-driven via the "2D mesh" tree
+        # row (the _hidden_keys park machinery), shown on ANY step once a preview exists —
+        # a restored project lands on its saved step, so a Surface-step-only gate would hide
+        # the rebuilt mesh. Also re-asserts after a run completes (ras_result read) — the
+        # completion flush is exactly when the client historically lost this layer.
         if not _HAS_MAP:
             return
         prev = ras_mesh_prev()
         ras_result()                               # re-run on run completion (see docstring)
         ov = (prev or {}).get("overlay")
-        show = current_step() == STEP_SURFACE and prev and not prev.get("too_big") and ov
+        show = prev and not prev.get("too_big") and ov
         try:
             _upsert_image("RAS mesh", ov if show else None, 0.9)
         except Exception as e:  # noqa: BLE001 — a bad overlay degrades to "no overlay",
@@ -7688,7 +7865,8 @@ def server(input, output, session):
                 "up": build["up"], "down": build["down"],
                 "params": {
                     "particles_per_cell": ppc,
-                    "sample_per_class": int(_safe("hz_sample", 300)),
+                    "sample_per_class": int(_safe("hz_sample", 500)),
+                    "iface_particles_per_cell": int(_safe("hz_iface_ppc", 4)),
                     "porosity": float(_safe("porosity", 0.3)),
                     "modflow_bin_dir": runner.modflow_bin_dir(),
                     "hard_cap_particles": (10**9 if runmode.IS_DESKTOP else HZ_MAX_PARTICLES),
@@ -7848,6 +8026,12 @@ def server(input, output, session):
             # everything above went into _layer_shadow (creation park) — reveal the checked
             # keys once the burst + 3-D churn settle; the reveal schedules its own verify.
             _schedule_hz_reveal()
+        # Fresh layers carry class/single styling only: a persisted rainbow line mode
+        # needs its per-feature bake (and the 3-D scalars) re-applied over them.
+        with reactive.isolate():
+            _lm = fp_line_mode_v()
+        if _lm in FP_LINE_RAINBOW:
+            await _apply_fp_line_style()
         # heal any client leftovers of keys the server considers gone (parked/nulled) —
         # never live trait-hidden widgets (a sweep would strip their views' layers)
         await _sweep_hz([k for k in _hidden_keys
@@ -8014,7 +8198,12 @@ def server(input, output, session):
                 with reactive.isolate():
                     _lw3 = max(1.0, float(fp_line_weight_v()) * 1.5)
                 p3 = (scene.flowpaths_payload(sub, crs_s, origin, z0,
-                                              key=f"hz3d_paths_{cls}", color=_lst["color"],
+                                              key=f"hz3d_paths_{cls}",
+                                              # rainbow modes carry no layer color —
+                                              # the class color seeds the depth ramp
+                                              # until the style push recolors it
+                                              color=(_lst.get("color")
+                                                     or HZ_COLORS.get(cls, "#0d9488")),
                                               width=_lw3, opacity=_lst["opacity"])
                       if sub is not None and len(sub) else None)
                 await _send_3d(p3)
@@ -8028,6 +8217,13 @@ def server(input, output, session):
                         color=HZ_COLORS[cls], opacity=0.35))
             except Exception:  # noqa: BLE001
                 pass
+        # A rainbow line mode must survive a scene rebuild: the freshly built line
+        # layers carry only their seed color, so re-push the style (lmode + trng)
+        # once the geometry messages are out. No 2-D re-bake — data is untouched.
+        with reactive.isolate():
+            _lm3 = fp_line_mode_v()
+        if _lm3 in FP_LINE_RAINBOW:
+            await _send_fp_line_3d()
 
     async def _rebuild_3d_scene():
         """Re-send the whole 3-D scene from current state. Every content send lives in
@@ -8405,8 +8601,13 @@ def server(input, output, session):
             speed = float(fp_anim_speed_v())
             color = fp_anim_color_v()
             style = fp_anim_style_v()
+            mode = fp_anim_mode_v()
+            lmode = fp_line_mode_v()
+            lw = float(fp_line_weight_v())
+            lop = float(fp_line_opacity_v()) if fp_line_show_v() else 0.0
         await session.send_custom_message("hype_fp_anim", {
-            "on": on, "speed": max(speed, 0.1), "color": color, "style": style})
+            "on": on, "speed": max(speed, 0.1), "color": color, "style": style,
+            "mode": mode, "lmode": lmode, "lw": lw, "lop": lop})
 
     @reactive.effect
     @reactive.event(input.fp_anim_on, ignore_init=True)
@@ -8433,9 +8634,12 @@ def server(input, output, session):
     async def _fp_anim_color():                # input first exists at the first click, so
         # ignore_init would eat that click (bit us live 2026-07-25)
         c = (input.fp_anim_color_evt() or {}).get("c")
-        if c not in FP_ANIM_COLORS or c == fp_anim_color_v():
+        if c not in FP_ANIM_COLORS:
+            return
+        if c == fp_anim_color_v() and fp_anim_mode_v() == "solid":
             return
         fp_anim_color_v.set(c)     # the pane reads this un-isolated → the active ring moves
+        fp_anim_mode_v.set("solid")   # picking a swatch is an implicit return to solid
         await _send_fp_anim()
 
     @reactive.effect
@@ -8448,6 +8652,15 @@ def server(input, output, session):
         await _send_fp_anim()
 
     @reactive.effect
+    @reactive.event(input.fp_anim_mode_evt)   # nonce event input: no ignore_init (see above)
+    async def _fp_anim_mode():
+        m = (input.fp_anim_mode_evt() or {}).get("m")
+        if m not in FP_ANIM_MODES or m == fp_anim_mode_v():
+            return
+        fp_anim_mode_v.set(m)      # un-isolated pane read → the active button swaps
+        await _send_fp_anim()
+
+    @reactive.effect
     async def _fp_anim_repush():
         # A page reload keeps the server-side "on" but starts a silent client; the tree's
         # ready ping (fires on every (re)connect) re-arms the animator. Value reads are
@@ -8456,7 +8669,8 @@ def server(input, output, session):
             return
         with reactive.isolate():
             on = bool(fp_anim_on_v())
-        if on:
+            lmode = fp_line_mode_v()
+        if on or lmode in FP_LINE_RAINBOW:   # rainbow lines need the canvas legend too
             await _send_fp_anim()
 
     # ---- flow-path LINE styling (lines are the four hz_paths_* GeoJSON layers) ----
@@ -8469,12 +8683,13 @@ def server(input, output, session):
             weight = float(fp_line_weight_v())
             opacity = float(fp_line_opacity_v())
             mode = fp_line_mode_v()
-            color = fp_line_color_v()
         st = dict(HZ_PATH_STYLE[cls])
         st["weight"] = weight
         st["opacity"] = (opacity if show else 0.0)
-        if mode == "single":
-            st["color"] = color
+        if mode in FP_LINE_RAINBOW:
+            # ipyleaflet merges the layer style OVER per-feature properties.style per
+            # key, so the baked residence-time colors only show when no color is here.
+            st.pop("color", None)
         return st
 
     def _fp_hover_style() -> dict:
@@ -8482,14 +8697,75 @@ def server(input, output, session):
         with reactive.isolate():
             return dict(PATH_HOVER) if fp_line_show_v() else {}
 
-    async def _apply_fp_line_style():
+    def _fp_time_range():
+        """Rainbow scale range over the DISPLAYED population: total_time_d of every
+        path in a visible class (the same set the client animator sees, so all the
+        legends agree). None when nothing is displayed. Reads are isolated — shared
+        helpers must never gift dependencies to their callers."""
+        with reactive.isolate():
+            g = hz_gdf()
+        if g is None or "total_time_d" not in getattr(g, "columns", ()):
+            return None
+        vis = [cls for cls in HZ_CLASSES
+               if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[cls]}")]
+        if not vis:
+            return None
+        tds = [float(t) for t in g[g["hz_class"].isin(vis)]["total_time_d"].tolist()
+               if t and float(t) > 0]
+        return video_mod.time_range_days(tds) if tds else None
+
+    def _bake_fp_line_colors(rng) -> None:
+        """Per-feature residence-time colors baked INTO the layer data (live + parked
+        shadow, so clones and reveals keep them). Leaving a rainbow mode needs no
+        un-bake: the layer style's color merges back over these. Elapsed bakes the
+        total-time color per line as the under-stroke and zoom-animation fallback;
+        the animation canvas paints the true along-path gradient over it
+        (path_anim.js buildLineCache), as do the 3-D view and the captures."""
+        if rng is None:
+            return
+        for cls in HZ_CLASSES:
+            key = f"hz_paths_{cls}"
+            for obj in (_layers.get(key), _layer_shadow.get(key)):
+                if obj is None or not getattr(obj, "data", None):
+                    continue
+                try:
+                    data = dict(obj.data)
+                    feats = list(data.get("features") or [])
+                    tds = [float((f.get("properties") or {}).get("total_time_d")
+                                 or 0.0) for f in feats]
+                    cols = video_mod.time_hex_colors(tds, rng)
+                    out = []
+                    for f, c in zip(feats, cols):
+                        f = dict(f)
+                        props = dict(f.get("properties") or {})
+                        pst = dict(props.get("style") or {})
+                        pst["color"] = c
+                        props["style"] = pst
+                        f["properties"] = props
+                        out.append(f)
+                    data["features"] = out
+                    obj.data = data
+                except Exception:  # noqa: BLE001 — a dying widget must not kill the batch
+                    pass
+
+    _fp_rng_applied = {"rng": None}    # last rng _apply_fp_line_style baked (rescale guard)
+
+    async def _apply_fp_line_style(bake: bool = True):
         # Live restyle of the four class layers (and their parked shadows, so a later
         # clone carries the style) without any widget churn — the _sync_map_layers idiom.
+        # Rainbow modes additionally bake per-feature colors into the data; ORDER is
+        # load-bearing: the color-less layer style must land BEFORE the data re-add,
+        # because Leaflet's setStyle MERGES (a removed key never unsets — the rendered
+        # color only changes at addData time, against the then-current layer style).
+        # bake=False for weight/opacity/show tweaks: the data is already baked, and a
+        # re-bake per slider tick would be pure client churn.
         hover = _fp_hover_style()
         with reactive.isolate():
             weight = float(fp_line_weight_v())
             show = bool(fp_line_show_v())
             opacity = float(fp_line_opacity_v()) if show else 0.0
+            lmode = fp_line_mode_v()
+        rng = _fp_time_range() if lmode in FP_LINE_RAINBOW else None
         for cls in HZ_CLASSES:
             key = f"hz_paths_{cls}"
             st = _fp_line_style(cls)
@@ -8501,12 +8777,35 @@ def server(input, output, session):
                     obj.hover_style = hover
                 except Exception:  # noqa: BLE001 — a dying widget must not kill the batch
                     pass
-            # 3-D parity rides the same state: a light style message per class actor, no
-            # geometry re-send. mesh3d ignores keys it has not built yet.
+        if bake and rng is not None:
+            _bake_fp_line_colors(rng)
+        _fp_rng_applied["rng"] = rng
+        # 3-D parity rides the same state: a light style message per class actor, no
+        # geometry re-send (rainbow scalars rebuild client-side from the retained
+        # per-path times + trng). mesh3d ignores keys it has not built yet.
+        await _send_fp_line_3d(rng)
+
+    async def _send_fp_line_3d(rng=None):
+        """The per-class hype3d_style push (color/width/opacity + line color-by mode).
+        Split out so a 3-D scene rebuild can re-assert the line coloring without
+        re-baking the 2-D layer data."""
+        with reactive.isolate():
+            weight = float(fp_line_weight_v())
+            show = bool(fp_line_show_v())
+            opacity = float(fp_line_opacity_v()) if show else 0.0
+            lmode = fp_line_mode_v()
+        if rng is None and lmode in FP_LINE_RAINBOW:
+            rng = _fp_time_range()
+        for cls in HZ_CLASSES:
+            st = _fp_line_style(cls)
             try:
-                await session.send_custom_message("hype3d_style", {
-                    "key": f"hz3d_paths_{cls}", "color": st["color"],
-                    "width": max(1.0, weight * 1.5), "opacity": opacity})
+                msg = {"key": f"hz3d_paths_{cls}",
+                       "color": st.get("color") or HZ_COLORS.get(cls, "#0d9488"),
+                       "width": max(1.0, weight * 1.5), "opacity": opacity,
+                       "lmode": lmode}
+                if rng is not None and lmode in FP_LINE_RAINBOW:
+                    msg["trng"] = [float(rng[0]), float(rng[1])]
+                await session.send_custom_message("hype3d_style", msg)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -8517,7 +8816,9 @@ def server(input, output, session):
         if v == fp_line_show_v():
             return
         fp_line_show_v.set(v)
-        await _apply_fp_line_style()
+        await _apply_fp_line_style(bake=False)
+        if fp_line_mode_v() == "elapsed":   # the 2-D gradient canvas tracks the stroke style
+            await _send_fp_anim()
 
     @reactive.effect
     @reactive.event(input.fp_line_weight, ignore_init=True)
@@ -8526,7 +8827,9 @@ def server(input, output, session):
         if v == fp_line_weight_v():
             return
         fp_line_weight_v.set(v)
-        await _apply_fp_line_style()
+        await _apply_fp_line_style(bake=False)
+        if fp_line_mode_v() == "elapsed":   # the 2-D gradient canvas tracks the stroke style
+            await _send_fp_anim()
 
     @reactive.effect
     @reactive.event(input.fp_line_opacity, ignore_init=True)
@@ -8535,26 +8838,34 @@ def server(input, output, session):
         if v == fp_line_opacity_v():
             return
         fp_line_opacity_v.set(v)
-        await _apply_fp_line_style()
+        await _apply_fp_line_style(bake=False)
+        if fp_line_mode_v() == "elapsed":   # the 2-D gradient canvas tracks the stroke style
+            await _send_fp_anim()
 
     @reactive.effect
     @reactive.event(input.fp_line_mode_evt)    # nonce event input: no ignore_init (the
     async def _fp_line_mode():                 # input first exists at the first click)
         m = (input.fp_line_mode_evt() or {}).get("m")
-        if m not in ("class", "single") or m == fp_line_mode_v():
+        if m not in FP_LINE_MODES or m == fp_line_mode_v():
             return
         fp_line_mode_v.set(m)      # un-isolated pane read moves the active button
         await _apply_fp_line_style()
+        await _send_fp_anim()      # the 2-D canvas legend follows the line mode too
 
     @reactive.effect
-    @reactive.event(input.fp_line_color_evt)   # nonce event input: no ignore_init
-    async def _fp_line_color():
-        c = (input.fp_line_color_evt() or {}).get("c")
-        if not isinstance(c, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", c) \
-                or c == fp_line_color_v():
+    async def _fp_rainbow_rescale():
+        # The rainbow scale spans the DISPLAYED population, so class checkbox toggles
+        # re-stretch it: re-bake the line colors and re-push the 3-D scalars — but only
+        # when the range actually moved (the bake is the one churny operation here).
+        _vis_state()
+        with reactive.isolate():
+            lmode = fp_line_mode_v()
+        if lmode not in FP_LINE_RAINBOW:
             return
-        fp_line_color_v.set(c)
+        if _fp_time_range() == _fp_rng_applied["rng"]:
+            return
         await _apply_fp_line_style()
+
 
     # ---- flow-path animation video export (rendered by hype_app/video.py) ----
     _video_build_id = reactive.value(0)
@@ -8734,10 +9045,9 @@ def server(input, output, session):
             return False
         with reactive.isolate():
             line = {"show": bool(fp_line_show_v()), "weight": float(fp_line_weight_v()),
-                    "opacity": float(fp_line_opacity_v()), "mode": fp_line_mode_v(),
-                    "color": fp_line_color_v()}
+                    "opacity": float(fp_line_opacity_v()), "mode": fp_line_mode_v()}
             anim = {"speed": float(fp_anim_speed_v()), "style": fp_anim_style_v(),
-                    "color": fp_anim_color_v()}
+                    "color": fp_anim_color_v(), "mode": fp_anim_mode_v()}
         try:
             width_px = int(w_override or b.get("w") or 1280)
         except Exception:  # noqa: BLE001
@@ -9013,7 +9323,13 @@ def server(input, output, session):
                    if _eff_checked(f"gw.res.paths.{ui_tree.HZ_CLASS_SUFFIX[cls]}")]
         with reactive.isolate():
             anim = {"on": bool(fp_anim_on_v()), "speed": float(fp_anim_speed_v()),
-                    "style": fp_anim_style_v(), "color": fp_anim_color_v()}
+                    "style": fp_anim_style_v(), "color": fp_anim_color_v(),
+                    "mode": fp_anim_mode_v()}
+            # The line dict rides for the rainbow modes: an elapsed gradient re-draws
+            # over the scene's baked (total) colors, and a line-only rainbow still
+            # gets its legend.
+            line = {"show": bool(fp_line_show_v()), "weight": float(fp_line_weight_v()),
+                    "opacity": float(fp_line_opacity_v()), "mode": fp_line_mode_v()}
         try:
             width_px = int(w_override or b.get("w") or 1280)
         except Exception:  # noqa: BLE001
@@ -9026,6 +9342,7 @@ def server(input, output, session):
             "basemap": basemap,
             "visible_classes": visible,
             "anim": anim,
+            "line": line,
             "class_colors": dict(HZ_COLORS),
             "scene": _gather_map_scene(),
             "width_px": width_px,
@@ -10626,13 +10943,15 @@ def server(input, output, session):
     async def _clear_reach_all():
         # One reset for BOTH reach modes — picks/linework, boundaries, K-zones, the DEM, and
         # every downstream result (all of it is sized from the reach, so it all goes together).
-        for t in (dem_task, snap_task, reach_task, da_task, delineate_task, wse_task,
-                  carve_task, scene_terrain_task):
+        for t in (dem_task, snap_task, reach_task, da_task, dir_task, delineate_task,
+                  wse_task, carve_task, scene_terrain_task):
             try:                        # reach-step producers: their done-handlers are all
                 t.cancel()              # cancel-silent, so nothing resurrects mid-clear
             except Exception:  # noqa: BLE001
                 pass
         _da_snap["sig"] = None          # a redrawn identical line prefills afresh
+        _reach_dir["sig"] = None        # ... and re-checks its direction
+        _reach_dir["verdict"] = "pending"
         _clear_auto_picks()
         await _cascade_clear("bnd", include_self=True)   # boundaries + sw/gw/hz + report + GMS
         kzone_feats.set([]); bnd_slot.set(None)
@@ -10784,7 +11103,12 @@ def server(input, output, session):
         dem_path.set(None); dem_meta.set(None)
         dem_src.set(dem.normalize_dem_source(None))   # back to the 3DEP default
         dem_stretch_v.set(None); dem_lohi_v.set(None); _dem_shade_sig.clear()
+        dem_hs_v.set(8.0); dem_opacity_v.set(0.8)     # declaration defaults
+        origin_override.set(None)          # user-set Model Origin is per-project
+        proj_crs.set(None)                 # re-derived from the next project's reach
         _drop_gw_artifacts()               # run result + head/grid/WSE layers + the grid preview
+        head_layer_v.set(1); head_opacity_v.set(0.85); hd_contours_v.set(True)
+        grid_opacity3d_v.set(1.0); grid_color3d_v.set(None)
         _set_project_meta(None, None)      # create/open re-establish it (or the gate re-arms)
         stage.set("")
         log_lines.clear(); log_tick.set(0); step_v.set(0)
@@ -10796,19 +11120,34 @@ def server(input, output, session):
         soil_source.set(None); soil_sel_units.set(frozenset()); soil_fetch_err.set(None)
         soil_inspect.set(None)
         results_model.set(None); report_paths.set(None); _report_shown_for.set(None)
+        _report_stamp.set(None)
         fp_anim_on_v.set(False); fp_anim_speed_v.set(3.0)
         fp_anim_color_v.set(FP_ANIM_COLORS[0]); fp_anim_style_v.set("comet")
+        fp_anim_mode_v.set("solid")
+        fp_line_show_v.set(True); fp_line_weight_v.set(1.0)
+        fp_line_opacity_v.set(0.9); fp_line_mode_v.set("class")
+        _fp_rng_applied["rng"] = None
         await _send_fp_anim()              # park the client animator with the dying layers
+        _video_cancel.set()                # cooperative stop for an in-flight video build
+        _video_result.set(None)
+        _video_prog.update(stage="", i=0, n=0, t0=0.0)
         _probe_cache.clear(); _probe_cur.clear(); _probe_sig.clear()
         await _send_probe(None)            # drop the client's hover grid too
         alt_result.set(None); alt_view.set(None)
         alt_log_lines.clear(); alt_scen_recs.clear(); alt_log_tick.set(0)
         _alt_stats_cache.clear(); _alt_payload.clear()
         _drop_ras_artifacts(); ras_log_lines.clear(); ras_log_tick.set(0)
+        _ras_inputs_sig["sig"] = None
+        ras_opacity_v.set(0.7)             # declaration default
         wse_mode_v.set("model")
         _wse_used.clear()
         pick_pts.set([]); reach_feat.set(None); auto_meta.set(None); last_click.set(None)
+        delineate_mode.set("auto"); reach_edit.set(False); kz_adding.set(False)
         reach_gen.set(0); dem_gen.set(0)
+        _da_snap["sig"] = None          # the next project's draw prefills + direction-checks
+        _reach_dir["sig"] = None; _reach_dir["verdict"] = "pending"
+        _flow["gdf"] = None; _flow.pop("bbox", None)   # NHD snap cache is per-site; a stale
+        nhd_status.set("")              # bbox would even suppress the refetch at the same view
         dc = _draw_ctl.get("dc")
         if dc is not None:
             try:
@@ -10819,18 +11158,28 @@ def server(input, output, session):
             _set_layer(k, None)
         _hidden_keys.clear()               # a new run starts with every layer checkbox checked
         _layer_shadow.clear()
+        _clear_mirror_layers()             # decor identity guards must forget the old project
+        _mirror_features_as_layers()       # …and the empty data push wipes any painted decor
         _check_state.clear()               # …including the group toggles (back to defaults)
         _apply_check_effective("base")     # re-sync tile traits (user may have been on Topo)
         _map_ui.pop("dem_bounds", None)
         carve_active.set(False)
         carve_meta.set(None)
         _stale_marks.set(frozenset())
+        comparison_mode_v.set(False)       # an open comparison overlay closes with the session
+        comparison_collection_v.set(None); comparison_file_v.set(None)
+        comparison_dirty_v.set(False); comparison_selected_member_v.set(None)
+        comparison_inspections_v.set({})   # _sync_comparison_client reacts and hides the client
         _scene.clear()                     # 3-D frame re-anchors on the next DEM
         await session.send_custom_message("hype3d_clear", {})
         _wire_state.set(False)             # hype3d_clear resets S.wireframe client-side
-        _kept.pop("grid_wireframe", None)
-        ui.update_checkbox("grid_wireframe", value=False)
+        _kept.clear()                      # typed inputs are project state: address, DA, site
+        #                                    metadata, K values, every knob — panes re-read
+        #                                    _keep() defaults when they rebuild
+        ui.update_checkbox("grid_wireframe", value=False)   # not pane-mounted: explicit update
         view_mode_v.set("2d")
+        await session.send_custom_message(  # a fresh project starts with the groups collapsed
+            "hype_tree_collapse", {"groups": list(ui_tree.GROUP_IDS)})
         _bump_vis()
 
     async def _reset_session_state():
@@ -10869,6 +11218,7 @@ def server(input, output, session):
             return
         ui.modal_remove()
         await _reset_session_state()
+        _map_home()                        # the wiped session starts at the national view
         # The reset cleared the project name, so the session is logically gated again:
         # go straight to the name dialog (its Cancel lands on the welcome).
         _show_new_project_dialog()
@@ -10925,7 +11275,19 @@ def server(input, output, session):
                 "the hyporheic zone.\n\n"
                 "Terrain & streams: USGS 3DEP and NHD. Engines: HEC-RAS 2025 (2D surface), "
                 "MODFLOW 6 + MODPATH 7 (groundwater and particle tracking)."),
-            title="About", easy_close=True))
+            title="About", easy_close=True,
+            footer=ui.TagList(
+                ui.input_action_button("about_whatsnew", "What's new",
+                                       class_="btn-outline-secondary"),
+                ui.modal_button("Close", class_="btn-primary"))))
+
+    @reactive.effect
+    def _about_whatsnew():
+        # `_clicked_dynamic`, not `@reactive.event`: About is rebuilt on every show, so the
+        # button's counter resets to 0 each time and an event binding would miss the second
+        # click. The dialogs swap (Shiny shows one modal at a time).
+        if _clicked_dynamic("about_whatsnew"):
+            _show_whatsnew()
 
     # ---- downloads ----
     # "Save" captures the session into one .hype archive (a zip organized by pipeline stage —
@@ -11024,7 +11386,6 @@ def server(input, output, session):
                 "head_contours": hd_contours_v(),
                 "fp_line_show": fp_line_show_v(), "fp_line_weight": fp_line_weight_v(),
                 "fp_line_opacity": fp_line_opacity_v(), "fp_line_mode": fp_line_mode_v(),
-                "fp_line_color": fp_line_color_v(),
                 "hz_result": _tokenize_paths(hz_result()),
                 "wse_used": _tokenize_paths(_wse_used.get("path")),
                 "stale_marks": sorted(_stale_marks()),
@@ -12175,6 +12536,11 @@ def server(input, output, session):
 
         # geometry + provenance
         reach = vec.get("reach")
+        if reach is not None:
+            # An opened project's direction is settled — pre-seed so only fresh draws and
+            # edits re-run the NHD/terrain direction check (the restore pre-seed pattern).
+            _reach_dir["sig"] = _dir_sig(reach)
+            _reach_dir["verdict"] = "ok"
         reach_feat.set(reach)
         auto_meta.set(st.get("auto_meta"))
         if st.get("delineate_mode") in ("auto", "manual"):
@@ -12263,6 +12629,28 @@ def server(input, output, session):
         if rr and rr.get("depth_tif") and Path(rr["depth_tif"]).is_file():
             _show_ras_overlays(rr)
             ras_result.set(rr)
+            # The 2D mesh preview is session-only by design (never saved) — rebuild it from
+            # the run's own geometry file so the tree's checked "2D mesh" row has something
+            # to show on a reopened project. No mesher rerun: h5 read + rasterize, off-loop;
+            # the task lands AFTER the restore flush (outside the bursty-add drop window)
+            # and failure is log-only via the _mesh_preview_done auto path. cell_size_m -1.0
+            # is a sentinel no real size matches, so the next run's auto-mesh rebuilds.
+            _gh5 = Path(rr.get("project_dir") or "") / "Geometries" / "Geometry.h5"
+            _crs = f"EPSG:{rr['epsg']}" if rr.get("epsg") else None
+            if _crs is None:
+                try:
+                    import rasterio
+                    with rasterio.open(rr["depth_tif"]) as _src:
+                        _crs = _src.crs.to_wkt() if _src.crs else None
+                except Exception:  # noqa: BLE001
+                    _crs = None
+            if _gh5.is_file() and _crs:
+                try:
+                    _mesh_auto["on"] = True
+                    mesh_prev_task({"from_h5": str(_gh5), "crs": _crs,
+                                    "cell_size_m": -1.0})
+                except Exception:  # noqa: BLE001 — the mesh is a nicety; restore stands
+                    _mesh_auto["on"] = False
         if st.get("wse_used"):
             _wse_used["path"] = st["wse_used"]
 
@@ -12272,11 +12660,14 @@ def server(input, output, session):
         fp_line_show_v.set(bool(st.get("fp_line_show", True)))
         fp_line_weight_v.set(float(st.get("fp_line_weight") or 1.0))
         fp_line_opacity_v.set(float(st.get("fp_line_opacity") or 0.9))
-        if st.get("fp_line_mode") in ("class", "single"):
-            fp_line_mode_v.set(st["fp_line_mode"])
-        _flc = st.get("fp_line_color")
-        if isinstance(_flc, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", _flc):
-            fp_line_color_v.set(_flc)
+        _flm = st.get("fp_line_mode")
+        if _flm in ("solid", "single"):
+            # Retired vocabulary ("single" from v1.0.0 saves, "solid" from the short-lived
+            # custom-color mode): custom line colors are gone, so both mean the class
+            # identity colors. Any saved fp_line_color is simply ignored.
+            _flm = "class"
+        if _flm in FP_LINE_MODES:
+            fp_line_mode_v.set(_flm)
         # frozen run snapshot: prefer config/assessment_input.json, fall back to the state copy
         # (None for v1 projects — the legacy adapter).
         _snap_in = payload.get("assessment_input") or st.get("input_snapshot")
@@ -12570,7 +12961,10 @@ def server(input, output, session):
             ui.div(
                 ui.div(ui.span("HYPE", class_="hype-welcome-mark"),
                        ui.div("Hyporheic Exchange Explorer", class_="hype-welcome-sub"),
-                       ui.div(APP_VERSION_LABEL, class_="hype-welcome-ver"),
+                       ui.div(APP_VERSION_LABEL, class_="hype-welcome-ver",
+                              title="What's new in HYPE",
+                              onclick="Shiny.setInputValue('whatsnew_evt', "
+                                      "Date.now() + Math.random(), {priority: 'event'})"),
                        class_="hype-welcome-brand"),
                 ui.div(_evt_btn("welcome_new", "New Project", "btn-primary"),
                        _evt_btn("welcome_open", "Open Project", "btn-outline-secondary"),
@@ -12597,6 +12991,35 @@ def server(input, output, session):
         # so its counter resets to 0 each time and an event binding would miss the second click.
         if _clicked_dynamic("welcome_cancel"):
             ui.modal_remove()
+
+    # ---- What's new: the changelog behind every version number -------------------------
+    # Opened by clicking the version wherever it appears (header chip, welcome splash,
+    # About footer). Shiny shows one modal at a time, so raising this from the welcome
+    # splash REPLACES the startup gate; Close funnels back through _ensure_welcome exactly
+    # like the project dialogs' cancels, and easy_close stays off while gated so
+    # Esc/backdrop can't leave a project-less session dialog-less.
+    def _show_whatsnew():
+        notes = _changelog_md()
+        body = (ui.div(ui.markdown(notes), class_="hype-whatsnew") if notes
+                else ui.p(f"HYPE {APP_VERSION_LABEL}"))
+        ui.modal_show(ui.modal(
+            body,
+            title="What's new",
+            footer=ui.input_action_button("whatsnew_close", "Close",
+                                          class_="btn-primary"),
+            easy_close=not _gated()))
+
+    @reactive.effect
+    @reactive.event(input.whatsnew_evt)   # nonce input, so never ignore_init
+    def _whatsnew_open():
+        _show_whatsnew()
+
+    @reactive.effect
+    def _whatsnew_close():
+        # `_clicked_dynamic` again: the Close button is rebuilt on every modal show.
+        if _clicked_dynamic("whatsnew_close"):
+            ui.modal_remove()
+            _ensure_welcome()
 
     def _show_new_project_dialog():
         """Cloud New Project: a name is all a browser session needs (there is no folder).
@@ -12633,6 +13056,7 @@ def server(input, output, session):
         ui.modal_remove()
         await _reset_session_state()       # no-op on a virgin session; makes the entry
         #                                    identical after the destructive-New confirm
+        _map_home()                        # a blank project starts at the national view
         _set_project_meta(name, datetime.now().isoformat(timespec="seconds"),
                           mint_missing=True)
         _select("reach")
@@ -13202,6 +13626,7 @@ def server(input, output, session):
             except Exception:  # noqa: BLE001
                 pass
         await _reset_memory_state()
+        _map_home()                        # a blank project starts at the national view
         _adopt_workspace(folder, main_file)
         _set_project_meta(main_file.stem,  # stamped once, at creation; the stem IS the name
                           datetime.now().isoformat(timespec="seconds"), mint_missing=True)
@@ -13869,6 +14294,19 @@ def server(input, output, session):
                               "next run."),
                     class_="hype-field-inline"),
             ]
+            if runmode.IS_DESKTOP:
+                # Streambed flux-pass release density (engine default 4). Desktop only:
+                # raising it refines the residence-time distribution behind the screening
+                # numbers; cloud keeps the fixed engine value.
+                parts.append(ui.div(
+                    ui.input_numeric("hz_iface_ppc", "Flux particles per cell",
+                                     value=int(_safe("hz_iface_ppc", 4)), min=1, step=1),
+                    _info_tip("How many particles are released per streambed inflow cell "
+                              "for the flux pass that produces exchange flows and "
+                              "residence times. The default of 4 matches all existing "
+                              "runs; higher values refine the residence-time "
+                              "distribution and take longer. Applies on the next run."),
+                    class_="hype-field-inline"))
             if hz_task.status() == "running":
                 parts.append(ui.div("Calculations running; progress is on the ",
                                     ui.tags.b("Hyporheic Zone"), " node.",
@@ -13933,9 +14371,9 @@ def server(input, output, session):
                 _lshow = bool(fp_line_show_v())
                 _lw = float(fp_line_weight_v())
                 _lop = float(fp_line_opacity_v())
-                _lcol = fp_line_color_v()
             _acol = fp_anim_color_v()      # un-isolated on purpose: a swatch or style click
             _asty = fp_anim_style_v()      # re-renders the pane so the active state follows
+            _amode = fp_anim_mode_v()      # un-isolated: the active color-by button follows
             _lmode = fp_line_mode_v()      # un-isolated: the active mode button follows
             return ui.TagList(
                 ui.div("Click a path or dot for its properties, or drag a box to "
@@ -13944,14 +14382,17 @@ def server(input, output, session):
                 ui.div("Path lines",
                        _info_tip("Display styling for the flow path lines themselves. Hiding "
                                  "the lines keeps the particle animation and click selection "
-                                 "working, so you can watch the particles alone."),
+                                 "working, so you can watch the particles alone. The rainbow "
+                                 "color modes map residence time onto a log scale stretched "
+                                 "between the fastest and slowest displayed paths; the legend "
+                                 "below shows the values."),
                        class_="hype-props-title"),
                 ui.input_checkbox("fp_line_show", "Show path lines", value=_lshow),
                 ui.input_slider("fp_line_weight", "Line thickness (px)", min=0.5, max=8.0,
                                 value=_lw, step=0.5),
                 ui.input_slider("fp_line_opacity", "Line opacity", min=0.05, max=1.0,
                                 value=_lop, step=0.05),
-                ui.div(ui.span("Line color", class_="hype-fpsel-lbl"),
+                ui.div(ui.span("Color by", class_="hype-fpsel-lbl"),
                        *[ui.tags.button(
                              lbl, type="button",
                              class_="hype-anim-stylebtn" + (" active" if key == _lmode else ""),
@@ -13959,16 +14400,14 @@ def server(input, output, session):
                              onclick=("Shiny.setInputValue('fp_line_mode_evt', "
                                       f"{{m: '{key}', n: Date.now()}}, {{priority: 'event'}})"))
                          for key, lbl, tip in (
-                             ("class", "Class colors",
+                             ("class", "Class",
                               "Each exchange class keeps its identity color"),
-                             ("single", "Single color",
-                              "All classes use the picked color"))],
-                       ui.tags.input(
-                           type="color", value=_lcol, class_="hype-ml-color",
-                           title="Line color (Single color mode)",
-                           disabled=(None if _lmode == "single" else "disabled"),
-                           onchange=("Shiny.setInputValue('fp_line_color_evt', "
-                                     "{c: this.value, n: Date.now()}, {priority: 'event'})")),
+                             ("total", "Total time",
+                              "Rainbow by each path's total residence time: blue is "
+                              "quick, red is slow. One fixed color per line."),
+                             ("elapsed", "Elapsed",
+                              "Rainbow along each path from blue at its start toward "
+                              "its total time color at its end"))],
                        class_="hype-fpsel-row"),
                 ui.div("Particle animation",
                        _info_tip("One particle travels each displayed flow path. Travel time is "
@@ -13990,15 +14429,39 @@ def server(input, output, session):
                               "Short fading tail; tail length shows each particle's speed"),
                              ("dots", "Dots", "One small dot per path"))],
                        class_="hype-fpsel-row"),
+                ui.div(ui.span("Color by", class_="hype-fpsel-lbl"),
+                       *[ui.tags.button(
+                             lbl, type="button",
+                             class_="hype-anim-stylebtn" + (" active" if key == _amode
+                                                            else ""),
+                             title=tip,
+                             onclick=("Shiny.setInputValue('fp_anim_mode_evt', "
+                                      f"{{m: '{key}', n: Date.now()}}, "
+                                      "{priority: 'event'})"))
+                         for key, lbl, tip in (
+                             ("solid", "Solid",
+                              "Every particle uses the picked color"),
+                             ("total", "Total time",
+                              "Rainbow by each path's total residence time: blue is "
+                              "quick, red is slow. One fixed color per particle."),
+                             ("elapsed", "Elapsed time",
+                              "Rainbow by time in transit: each particle starts blue "
+                              "and shifts toward red as it ages along its path."))],
+                       class_="hype-fpsel-row"),
                 ui.div(ui.span("Particle color", class_="hype-fpsel-lbl"),
                        *[ui.tags.button(
                              type="button",
-                             class_="hype-anim-swatch" + (" active" if c == _acol else ""),
-                             style=f"background:{c};", title=n,
+                             class_=("hype-anim-swatch"
+                                     + (" active" if c == _acol else "")
+                                     + ("" if _amode == "solid" else " dim")),
+                             style=f"background:{c};",
+                             title=(n if _amode == "solid"
+                                    else f"{n} (switches back to Solid)"),
                              onclick=("Shiny.setInputValue('fp_anim_color_evt', "
                                       f"{{c: '{c}', n: Date.now()}}, {{priority: 'event'}})"))
                          for c, n in zip(FP_ANIM_COLORS, FP_ANIM_COLOR_NAMES)],
                        class_="hype-fpsel-row"),
+                ui.output_ui("fp_time_legend"),
                 ui.output_ui("hz_sel_props"),
             )
 
@@ -16051,6 +16514,13 @@ def server(input, output, session):
                                           class_="btn-primary",
                                           disabled=meshing or blocked), class_="hype-actions"),
         ]
+        prev_mesh = ras_mesh_prev()
+        if prev_mesh and prev_mesh.get("too_big"):
+            # The overlay cap (MESH_PREVIEW_MAX_FACES) is a display-quality limit; without
+            # this line a too-big mesh reads as "checked but silently missing" on the map.
+            parts.append(ui.div(
+                f"Mesh has {prev_mesh.get('n_faces', 0):,} faces, too many to draw as a "
+                "map overlay; the model itself is unaffected.", class_="hype-instr"))
         if blocked:
             parts = [
                 ui.div("A boundary line crosses the stream centerline. Fix it in the "
@@ -16190,6 +16660,35 @@ def server(input, output, session):
         if m.get("resolution_m"):
             txt = f"{txt}\nDEM: {m['resolution_m']} m ({m.get('source', 'USGS 3DEP')})"
         return ui.tags.pre(txt, class_="hype-log")
+
+    @render.ui
+    def fp_time_legend():
+        # In-pane rainbow legend, shown while lines or particles color by residence
+        # time. One bar serves both (they share the scale); the _vis_state read makes
+        # class checkbox toggles re-stretch the range live.
+        _vis_state()
+        lmode = fp_line_mode_v()
+        amode = fp_anim_mode_v()
+        line_on = lmode in FP_LINE_RAINBOW
+        anim_on = amode in ("total", "elapsed") and fp_anim_on_v()
+        if not (line_on or anim_on):
+            return None
+        rng = _fp_time_range()
+        if rng is None:
+            return None
+        label = video_mod.legend_label(amode if anim_on else None,
+                                       lmode if line_on else None)
+        stops = video_mod.turbo_css_stops()
+        grad = ("linear-gradient(90deg,"
+                + ",".join(f"{c} {i * 100 // 12}%" for i, c in enumerate(stops)) + ")")
+        parts = [ui.div(label, class_="hype-pane-legend-title"),
+                 ui.div(class_="bar", style=f"background:{grad}"),
+                 ui.div(ui.span(video_mod.fmt_days(rng[0])),
+                        ui.span(video_mod.fmt_days(rng[1])), class_="ticks")]
+        if line_on and anim_on and lmode != amode:
+            parts.append(ui.div(f"Lines: {lmode} time. Particles: {amode} time.",
+                                class_="hype-pane-legend-sub"))
+        return ui.div(*parts, class_="hype-pane-legend")
 
     @render.ui
     def hz_status():

@@ -78,9 +78,10 @@ Linux container check (mirrors Connect Cloud; ~python:3.12-slim, no apt packages
 | Var                   | Default | Meaning |
 |-----------------------|---------|---------|
 | `HYPE_RAS_BIN`        | unset   | Dev override: folder of (or path to) ras.exe; bypasses the bundle |
-| `HYPE_RAS_GREEN_CELLS`| 20000   | UI estimate turns amber above this |
-| `HYPE_RAS_MAX_CELLS`  | 120000  | Hard cap — run refuses to solve above this (post-mesh check) |
-| `HYPE_RAS_TIMEOUT_S`  | 1800    | Wall-clock kill for any single CLI step |
+| `HYPE_RAS_GREEN_CELLS`| 4000    | UI estimate turns amber above this |
+| `HYPE_RAS_MAX_CELLS`  | 60000   | Hard cap — run refuses to solve above this (post-mesh check). Advisory-only in Desktop Run |
+| `HYPE_RAS_TIMEOUT_S`  | 1800    | Wall-clock kill for any single CLI step (cloud default). Desktop Run has no deadline unless this is set |
+| `HYPE_RAS_STALL_MIN`  | 30      | Liveness watchdog (both modes): kill a step after this many minutes with NO solver stdout and NO file writes under the project. Any activity resets it; <=0 disables |
 
 Timing reference: 887 cells / 6 h window / 10 s steps ≈ 21 s solve in a Linux container;
 scale expectations roughly linearly with cell count × timestep count before tuning the caps.

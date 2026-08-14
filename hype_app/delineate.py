@@ -675,16 +675,39 @@ def min_elevation_along_line(feat_4326, dem_path, *, n: int = 200) -> Optional[f
     return float(np.min(vals))
 
 
+def reversed_feature(feat: dict) -> Optional[dict]:
+    """The same LineString Feature with its coordinate order reversed (properties copied),
+    or None when the geometry cannot be read or has fewer than two vertices."""
+    try:
+        coords = list(feat["geometry"]["coordinates"])
+    except Exception:  # noqa: BLE001
+        return None
+    if len(coords) < 2:
+        return None
+    return {"type": "Feature",
+            "properties": dict(feat.get("properties") or {}),
+            "geometry": {"type": "LineString",
+                         "coordinates": [list(c) for c in reversed(coords)]}}
+
+
 def orient_reach_downstream(feat_4326, dem_path, *, frac: float = 0.1,
-                            n: int = 40) -> tuple[dict, bool]:
+                            n: int = 40, margin: float = 0.30) -> tuple[dict, bool]:
     """Return (feature, flipped) with the reach LineString running upstream → downstream.
 
     The whole pipeline assumes upstream-first: `_normal` puts the RIGHT bank at `ro >= 0` of
     downstream travel, so a backwards line silently swaps the Left/Right floodplain. Auto NHD
-    traces are upstream-first by construction; a MANUAL draw can run either way — so compare
-    the mean DEM elevation over the first vs last `frac` of the line and reverse the
-    coordinates when it was drawn uphill. On any sampling problem the feature is returned
-    unchanged (never block the pipeline on this check).
+    traces are upstream-first by construction, and a manual draw on a mapped stream takes its
+    direction from the NHD flow direction (hydro.reach_flow_direction) — this terrain check
+    is the FALLBACK for reaches NHD cannot decide. Compare the 25th-percentile DEM elevation
+    over the first vs last `frac` of the line (the channel is the low tail of each window;
+    bank pixels under a hand-drawn line only contaminate upward, which is what sank the old
+    mean) and reverse the coordinates only when the start reads LOWER by more than `margin`
+    metres: lidar water surfaces carry decimetre-scale noise and hydro-flattening steps, and
+    on a low-gradient meander the true drop across the reach is smaller than that noise, so a
+    sub-margin difference is not a direction signal. Flat or ambiguous keeps the line as
+    drawn — the pane instructs upstream-first, and a wrong flip is worse than no flip. On any
+    sampling problem the feature is returned unchanged (never block the pipeline on this
+    check).
     """
     import numpy as np
     import rasterio
@@ -693,33 +716,32 @@ def orient_reach_downstream(feat_4326, dem_path, *, frac: float = 0.1,
 
     try:
         line = shape(feat_4326["geometry"])
-        coords = list(feat_4326["geometry"]["coordinates"])
     except Exception:  # noqa: BLE001
         return feat_4326, False
-    if line.is_empty or line.length == 0 or len(coords) < 2:
+    if line.is_empty or line.length == 0:
         return feat_4326, False
 
-    def _mean_elev(src, tr, fracs):
+    def _low_elev(src, tr, fracs):
         pts = [line.interpolate(float(f), normalized=True) for f in fracs]
         xs, ys = tr.transform([p.x for p in pts], [p.y for p in pts])
         vals = np.array([v[0] for v in src.sample(np.column_stack([xs, ys]))], dtype="float64")
         if src.nodata is not None:
             vals = np.where(vals == src.nodata, np.nan, vals)
+        vals = np.where(vals <= -1000.0, np.nan, vals)   # undeclared sentinels (-9999 uploads)
         vals = vals[np.isfinite(vals)]
-        return float(np.mean(vals)) if vals.size else None
+        return float(np.percentile(vals, 25)) if vals.size else None
 
     try:
         with rasterio.open(dem_path) as src:
             tr = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
             k = max(2, int(n))
-            head = _mean_elev(src, tr, np.linspace(0.0, frac, k))
-            tail = _mean_elev(src, tr, np.linspace(1.0 - frac, 1.0, k))
+            head = _low_elev(src, tr, np.linspace(0.0, frac, k))
+            tail = _low_elev(src, tr, np.linspace(1.0 - frac, 1.0, k))
     except Exception:  # noqa: BLE001
         return feat_4326, False
-    if head is None or tail is None or head >= tail - 0.05:
-        return feat_4326, False        # already downhill (or flat/ambiguous) — keep as drawn
-    flipped = {"type": "Feature",
-               "properties": dict(feat_4326.get("properties") or {}),
-               "geometry": {"type": "LineString",
-                            "coordinates": [list(c) for c in reversed(coords)]}}
+    if head is None or tail is None or head >= tail - float(margin):
+        return feat_4326, False        # downhill, flat, or ambiguous — keep as drawn
+    flipped = reversed_feature(feat_4326)
+    if flipped is None:
+        return feat_4326, False
     return flipped, True

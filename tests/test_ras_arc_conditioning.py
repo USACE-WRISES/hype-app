@@ -45,3 +45,47 @@ def test_chain_spacing_is_cumulative_from_last_kept():
     diffs = np.diff(out[:, 0])
     assert (diffs[:-1] >= 5.0).all()
     assert out[0].tolist() == [0.0, 0.0] and out[-1].tolist() == [30.0, 0.0]
+
+
+# --------------------------------------------------------- conceptual control point
+# The mesher's control point must lie INSIDE the 2D area: on a horseshoe reach the mean
+# of the four corner nodes falls outside the U and `ras mesh` prints "Failed to build
+# conceptual mesh." yet exits 0 (live failure: CH00518, 180-degree bend).
+
+def _topology(up, left, right, down):
+    """nodes + arc ring exactly as write_geometry_topology builds them."""
+    up, left = np.asarray(up, float), np.asarray(left, float)
+    right, down = np.asarray(right, float), np.asarray(down, float)
+    nodes = np.vstack([up[-1], up[0], down[0], down[-1]])
+    arcs = [up[::-1], left, down, right[::-1]]
+    return nodes, arcs
+
+
+def test_control_point_rectangle_keeps_the_corner_mean():
+    from hype_app.ras_h5 import conceptual_control_point
+
+    nodes, arcs = _topology(up=[[0, 10], [10, 10]], left=[[0, 10], [0, 0]],
+                            right=[[10, 10], [10, 0]], down=[[0, 0], [10, 0]])
+    cp = conceptual_control_point(nodes, arcs)
+    assert cp.shape == (1, 2)
+    assert np.allclose(cp, np.mean(nodes, axis=0, keepdims=True))
+
+
+def test_control_point_horseshoe_moves_inside_the_domain():
+    from shapely.geometry import Point, Polygon
+
+    from hype_app.ras_h5 import conceptual_control_point
+
+    # U shape: both flow ends at the top, outer boundary wraps the square, inner
+    # boundary carves the notch. Corner mean = (5, 10), on the open top edge: outside.
+    nodes, arcs = _topology(
+        up=[[0, 10], [2, 10]],
+        left=[[0, 10], [0, 0], [10, 0], [10, 10]],       # outer bank
+        right=[[2, 10], [2, 2], [8, 2], [8, 10]],        # inner bank
+        down=[[10, 10], [8, 10]])
+    poly = Polygon(np.vstack(arcs))
+    assert poly.is_valid
+    mean = np.mean(nodes, axis=0)
+    assert not poly.contains(Point(mean))                # the failing configuration
+    cp = conceptual_control_point(nodes, arcs)
+    assert poly.contains(Point(cp[0]))                   # the fix: interior point

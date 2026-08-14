@@ -21,6 +21,7 @@ on:
       - 'hype_app/**'
       - 'hypetool/**'
       - 'www/**'
+      - 'CHANGELOG.md'
       - 'requirements.txt'
       - 'desktop/payload/**'
       - 'desktop/scripts/**'

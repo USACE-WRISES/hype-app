@@ -37,5 +37,5 @@ def cloud_limits() -> list[tuple[str, str]]:
         ("Surface-water mesh", f"up to {sw_cap:,} cells"),
         ("Groundwater grid", f"up to {estimate.AMBER_MAX:,} cells"),
         ("Particle tracking", f"up to {hz_particle_cap():,} particles"),
-        ("Zone display points", "300 per class (max 1,000)"),
+        ("Zone display points", "500 per class (max 1,000)"),
     ]

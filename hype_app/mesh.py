@@ -65,12 +65,17 @@ BOUNDARY_STYLE = {                     # matches the app's 2-D map colors (app.p
 }
 
 
-def preview_cell_cap() -> int:
-    """FULL-grid cell cap for the 3-D preview build. The engine discretization allocates
-    per-layer float64 arrays for the whole (buffered) bbox, so an over-fine cell size can
-    OOM the app process — refuse anything the run itself would refuse (same red band)."""
-    from . import estimate
-    return int(os.environ.get("HYPE_MESH_PREVIEW_MAX_CELLS", estimate.AMBER_MAX))
+def preview_cell_cap() -> int | None:
+    """FULL-grid cell cap for the 3-D preview build; None = no cap. Cloud refuses anything
+    the run itself would refuse (same red band) because the engine discretization allocates
+    per-layer float64 arrays for the whole (buffered) bbox. Desktop Run has no cap — the
+    run gates are advisory there and the preview builds in a spawned child, so memory is
+    the limit. An explicit HYPE_MESH_PREVIEW_MAX_CELLS wins in both modes."""
+    from . import estimate, runmode
+    env = os.environ.get("HYPE_MESH_PREVIEW_MAX_CELLS")
+    if env:
+        return int(env)
+    return None if runmode.IS_DESKTOP else int(estimate.AMBER_MAX)
 
 
 def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
@@ -108,7 +113,7 @@ def build_grid_geometry(domain_feat, dem_path, crs, cell_size, depth, z, *,
         # the process; no point burning a core on a grid the run itself would refuse)
         nlay_est = max(1, math.ceil(float(depth) / float(z)))
         cap = preview_cell_cap()
-        if gncol * gnrow * nlay_est > cap:
+        if cap is not None and gncol * gnrow * nlay_est > cap:
             need = float(cell_size) * math.sqrt(gncol * gnrow * nlay_est / cap)
             raise ValueError(
                 f"Grid would be {gncol}×{gnrow}×{nlay_est} = {gncol * gnrow * nlay_est:,} cells — "

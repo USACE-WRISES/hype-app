@@ -20,7 +20,7 @@ git push origin main
 ```
 
 That's it. The `desktop-payload` workflow (paths-filtered to `app.py`, `hype_app/`, `hypetool/`,
-`www/`, `requirements.txt`, `desktop/payload|scripts/`) builds a fresh apps zip from the tracked
+`www/`, `CHANGELOG.md`, `requirements.txt`, `desktop/payload|scripts/`) builds a fresh apps zip from the tracked
 tree (`git archive`), publishes the prerelease, and refreshes `desktop-current`. ~8 minutes
 later every installed desktop's next update check shows the native banner — "A HYPE update is
 ready (3 MB). Install & restart app". The same push is what you deploy to Connect Cloud from,
@@ -32,16 +32,25 @@ content hash over those four files — and always passes the **relocation smoke 
 tree, import the heavy stack, boot the real app against the relocated tools) before publishing.
 Never build with `-SkipSmoke` for anything that ships.
 
-## Shell release
+## Versioned release (vX.Y.Z)
 
-```
-# bump <Version> in desktop/src/Hype.Desktop/Hype.Desktop.csproj (assembly metadata)
-git tag v0.2.0 && git push origin v0.2.0
-```
+One user-facing number covers app and shell: `APP_VERSION` in `app.py` = csproj `<Version>` =
+the tag. Patch (x.y.Z) for routine updates (fixes, speedups, small/experimental features);
+minor (x.Y.0) for a headline capability or a project-format change; major for reworks.
+
+1. Add the release's `## vX.Y.Z (YYYY-MM-DD)` section to `CHANGELOG.md` — it ships inside the
+   apps payload and feeds the in-app What's new dialog (`tests/test_changelog.py` pins the
+   app.py/csproj/changelog lockstep).
+2. Bump `APP_VERSION` in `app.py` and `<Version>` in
+   `desktop/src/Hype.Desktop/Hype.Desktop.csproj` together.
+3. `git push origin main` and **wait for `desktop-payload` to finish** (both workflows write
+   `latest-desktop.json`).
+4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
 `desktop-shell.yml` runs the unit tests, publishes self-contained win-x64, packs with Velopack
-(delta against the previous release), uploads a **normal** release, and stamps the new
-installer URLs onto `desktop-current`'s manifest. Installed shells offer "Restart & update".
+(delta against the previous release), uploads a **normal** release with its body filled from
+the tag's CHANGELOG.md section, and stamps the new installer URLs onto `desktop-current`'s
+manifest. Installed shells offer "Restart & update".
 
 ## Tool runtimes (HEC-RAS / MODFLOW) update
 

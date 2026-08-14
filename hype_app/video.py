@@ -34,6 +34,154 @@ MIN_LOOP_MS = 800.0
 # path_anim.js comet strokes: (alpha, width scale) innermost first, then the head.
 COMET_STROKES = ((0.12, 1.0), (0.20, 1.4), (0.30, 1.9))
 
+# Rainbow color-by modes (anim payload key "mode"; "solid" or absent = classic swatch
+# color). Both map residence time onto matplotlib's turbo scale over a log axis, the
+# exact mapping the client draws live, so exports match the view color for color.
+RAINBOW_MODES = ("total", "elapsed")
+
+
+def _time_range(particles) -> tuple[float, float]:
+    """Rainbow scale range: min/max residence time (days) across the displayed
+    population. A degenerate one-value range spreads half a decade each way so the
+    scale and its legend still read (path_anim.js retime())."""
+    tds = [p["td"] for p in particles if p.get("td", 0) > 0]
+    lo = min(tds) if tds else 1.0
+    hi = max(tds) if tds else 1.0
+    if lo <= 0:
+        lo = 0.001
+    if hi <= lo:
+        hi = lo * 10.0 ** 0.5
+        lo = lo / 10.0 ** 0.5
+    return lo, hi
+
+
+def _time_norm(days, rng):
+    """log10 mapping of residence days onto [0, 1] over rng, clamped: identical to the
+    client's tIdx/tNorm. Values at or below the floor stay at the coolest color, so an
+    elapsed-mode particle converges on its total-time color exactly as it exits."""
+    import numpy as np
+
+    lo, hi = rng
+    d = np.maximum(np.asarray(days, dtype=float), 1e-12)
+    span = math.log10(hi) - math.log10(lo)
+    f = (np.log10(d) - math.log10(lo)) / (span or 1.0)
+    return np.clip(f, 0.0, 1.0)
+
+
+def _particle_colors(particles, mode, rng, t_ms: float):
+    """(n, 3) RGB turbo colors for every particle at clip time t_ms. "total" is
+    time-invariant (each particle wears its path's total residence-time color);
+    "elapsed" ages with the loop: fraction of the loop times the path's own td."""
+    import numpy as np
+    from matplotlib import colormaps
+
+    td = np.asarray([p["td"] for p in particles], dtype=float)
+    if mode == "total":
+        days = td
+    else:
+        fr = np.asarray([((t_ms / p["dur"]) + p["phase"]) % 1.0 for p in particles])
+        days = fr * td
+    return colormaps["turbo"](_time_norm(days, rng))[:, :3]
+
+
+def _fmt_days(v: float) -> str:
+    # %g drops trailing zeros, matching the client's String(Math.round(v*10)/10)
+    if v >= 100:
+        return str(int(round(v)))
+    if v >= 10:
+        return f"{round(v * 10) / 10:g}"
+    return f"{round(v * 100) / 100:g}"
+
+
+# ---- shared color authority for the line rainbow + pane legend (app.py imports these;
+# ---- one turbo + log mapping everywhere so lines, particles, and legends agree)
+
+def time_range_days(days) -> tuple[float, float]:
+    """`_time_range` over plain day values (the pane legend and line-bake path)."""
+    return _time_range([{"td": float(d)} for d in days])
+
+
+def time_hex_colors(days, rng) -> list[str]:
+    """Per-path turbo hex colors ('#rrggbb') for residence times over rng - the
+    server-side bake behind the 2D line rainbow (per-feature properties.style)."""
+    from matplotlib import colormaps
+    from matplotlib.colors import to_hex
+
+    cols = colormaps["turbo"](_time_norm(days, rng))
+    return [to_hex(tuple(c[:3])) for c in cols]
+
+
+_TURBO_STOPS: list[str] | None = None
+
+
+def turbo_css_stops() -> list[str]:
+    """13 turbo hex stops for CSS linear-gradient legend bars (the client legends
+    build their gradients from 13 stops too)."""
+    global _TURBO_STOPS
+    if _TURBO_STOPS is None:
+        from matplotlib import colormaps
+        from matplotlib.colors import to_hex
+
+        _TURBO_STOPS = [to_hex(tuple(colormaps["turbo"](i / 12.0)[:3]))
+                        for i in range(13)]
+    return list(_TURBO_STOPS)
+
+
+def fmt_days(v: float) -> str:
+    """Public spelling of _fmt_days for the pane legend."""
+    return _fmt_days(v)
+
+
+def legend_label(anim_mode, line_mode) -> str:
+    """Shared legend-title rule: one rainbow meaning active -> its specific title;
+    lines and particles active with DIFFERENT meanings -> the generic title (they
+    share one scale, so one bar serves both)."""
+    kinds = {m for m in (anim_mode, line_mode) if m in RAINBOW_MODES}
+    if kinds == {"total"}:
+        return "Total residence time (days)"
+    if kinds == {"elapsed"}:
+        return "Elapsed residence time (days)"
+    return "Residence time (days)"
+
+
+def _draw_time_legend(ax, rng, label, view_px):
+    """Residence-time legend for the rainbow modes: a turbo bar bottom-left with the
+    range endpoints and any interior decades in days, mirroring the client's canvas
+    legend. view_px = the UNSCALED (width, height) of the view, so the panel keeps
+    the client's fixed pixel footprint on any aspect (axes-fraction sizing ballooned
+    on tall views). Returns the inset axes so the video loop can redraw it over the
+    moving particles (the client draws its legend last for the same reason)."""
+    import numpy as np
+    from matplotlib.patches import Rectangle
+
+    lo, hi = rng
+    vw, vh = view_px
+    ax.add_patch(Rectangle((10.0 / vw, 8.0 / vh), 210.0 / vw, 52.0 / vh,
+                           transform=ax.transAxes,
+                           facecolor="white", alpha=0.82, edgecolor="none",
+                           zorder=2.5))
+    cax = ax.inset_axes([20.0 / vw, 26.0 / vh, 190.0 / vw, 10.0 / vh])
+    cax.imshow(np.linspace(0, 1, 256)[None, :], aspect="auto", cmap="turbo",
+               extent=[0, 1, 0, 1])
+    cax.set_yticks([])
+    l0, l1 = math.log10(lo), math.log10(hi)
+    span = (l1 - l0) or 1.0
+    pos, labels = [0.0], [_fmt_days(lo)]
+    for d in range(int(math.ceil(l0 + 1e-9)), int(math.floor(l1 - 1e-9)) + 1):
+        f = (d - l0) / span
+        if f > 0.13 and f < 0.87:          # decade labels crowding an endpoint drop out
+            pos.append(f)
+            labels.append(_fmt_days(10.0 ** d))
+    pos.append(1.0)
+    labels.append(_fmt_days(hi))
+    cax.set_xticks(pos)
+    cax.set_xticklabels(labels, fontsize=5.5, color="#1a2733")
+    cax.tick_params(length=2, pad=1, colors="#1a2733")
+    for s in cax.spines.values():
+        s.set_visible(False)
+    cax.set_title(label, fontsize=6.5, loc="left", pad=2.5, color="#1a2733")
+    return cax
+
 
 def resolve_ffmpeg(log=print) -> str | None:
     """The encoder, if any: imageio-ffmpeg's bundled binary, HYPE_FFMPEG, PATH."""
@@ -221,9 +369,81 @@ def _draw_vector_layer(ax, to3857, lyr, zorder):
                                          alpha=o, zorder=zorder))
 
 
-def _draw_scene(ax, to3857, scene):
+def _draw_elapsed_lines(ax, to3857, feats, lstyle, zorder, rng):
+    """Elapsed line mode: a per-segment turbo gradient along each path, cool at the
+    entry and arriving at the path's total-time color at its exit. Elapsed at a
+    vertex = total_time_d times the cumulative-arc fraction, the same constant-
+    arc-speed physics the particle animation moves by."""
+    import numpy as np
+    from matplotlib import colormaps
+    from matplotlib.collections import LineCollection
+
+    weight = float((lstyle or {}).get("weight", 2.0))
+    opacity = float((lstyle or {}).get("opacity", 0.9))
+    if opacity <= 0 or weight <= 0:
+        return
+    segs, days = [], []
+    for feat in feats:
+        geom = feat.get("geometry") or {}
+        if geom.get("type") != "LineString":
+            continue
+        td = float((feat.get("properties") or {}).get("total_time_d") or 0.0)
+        xy = to3857(np.asarray(geom["coordinates"], dtype=float)[:, :2])
+        if td <= 0 or len(xy) < 2:
+            continue
+        d = np.hypot(*np.diff(xy, axis=0).T)
+        cum = np.concatenate([[0.0], np.cumsum(d)])
+        total = cum[-1] or 1.0
+        mid = (cum[:-1] + cum[1:]) / (2.0 * total)     # segment midpoint arc fraction
+        segs.extend(np.stack([xy[:-1], xy[1:]], axis=1))
+        days.append(td * mid)
+    if not segs:
+        return
+    cols = colormaps["turbo"](_time_norm(np.concatenate(days), rng))[:, :3]
+    ax.add_collection(LineCollection(segs, colors=cols, linewidths=weight * 0.72,
+                                     alpha=opacity, capstyle="round", zorder=zorder))
+
+
+def _legacy_rainbow_lines(ax, paths_gdf, visible, line_mode, rng, lw, lop):
+    """Rainbow lines for the no-scene fallback: whole-path total-time colors, or
+    per-segment elapsed gradients (same physics as _draw_elapsed_lines), straight
+    from the projected gdf."""
+    import numpy as np
+    from matplotlib import colormaps
+    from matplotlib.collections import LineCollection
+
+    segs, days = [], []
+    sub = paths_gdf[paths_gdf["hz_class"].isin(visible)]
+    for geom, td in zip(sub.geometry, sub["total_time_d"]):
+        if geom is None or geom.geom_type != "LineString":
+            continue
+        td = float(td or 0.0)
+        xy = np.asarray(geom.coords)[:, :2]
+        if td <= 0 or len(xy) < 2:
+            continue
+        if line_mode == "total":
+            segs.append(xy)
+            days.append(np.asarray([td]))
+        else:
+            d = np.hypot(*np.diff(xy, axis=0).T)
+            cum = np.concatenate([[0.0], np.cumsum(d)])
+            total = cum[-1] or 1.0
+            mid = (cum[:-1] + cum[1:]) / (2.0 * total)
+            segs.extend(np.stack([xy[:-1], xy[1:]], axis=1))
+            days.append(td * mid)
+    if not segs:
+        return
+    cols = colormaps["turbo"](_time_norm(np.concatenate(days), rng))[:, :3]
+    ax.add_collection(LineCollection(segs, colors=cols, linewidths=lw,
+                                     alpha=lop, capstyle="round", zorder=2))
+
+
+def _draw_scene(ax, to3857, scene, line_mode=None, line_rng=None):
     """The frozen map scene (already ordered by the gather: pane buckets, then
-    fills, lines, paths, points) under a rising zorder. Labels ride on top."""
+    fills, lines, paths, points) under a rising zorder. Labels ride on top.
+    line_mode/line_rng: when the line rainbow is "elapsed", hz_paths_* vector items
+    draw as per-segment gradients instead of their baked per-feature (total) colors
+    — the captured widget data carries only one color per path."""
     import matplotlib.patheffects as pe
 
     z = 1.0
@@ -239,6 +459,14 @@ def _draw_scene(ax, to3857, scene):
             except Exception:  # noqa: BLE001 — one bad overlay must not kill the build
                 continue
         elif kind == "vector":
+            key = item.get("key") or ""
+            if (line_mode == "elapsed" and line_rng
+                    and key.startswith("hz_paths_")
+                    and not key.startswith("hz_paths_sel")):
+                _draw_elapsed_lines(ax, to3857,
+                                    ((item.get("data") or {}).get("features") or []),
+                                    item.get("style") or {}, z, line_rng)
+                continue
             _draw_vector_layer(ax, to3857, item, z)
     for lab in scene.get("labels") or []:
         z += 0.01
@@ -346,6 +574,14 @@ def build_flowpath_video(payload: dict, out_path, log=print, progress=None,
     if not particles:
         raise ValueError("no visible flow paths in the selected classes")
 
+    mode = anim.get("mode") or "solid"
+    rainbow = mode in RAINBOW_MODES
+    line_mode = line.get("mode") or "class"
+    line_rainbow = bool(line.get("show", True)) and line_mode in RAINBOW_MODES
+    # One scale for particles AND lines (same displayed population, so the shared
+    # legend is honest for both).
+    trng = _time_range(particles) if (rainbow or line_rainbow) else None
+
     dpi = 100.0
     fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
     canvas = FigureCanvasAgg(fig)
@@ -373,38 +609,49 @@ def build_flowpath_video(payload: dict, out_path, log=print, progress=None,
             xs, ys = tr4326.transform(arr[:, 0], arr[:, 1])
             return np.column_stack([xs, ys])
 
-        _draw_scene(ax, to3857, scene)
+        _draw_scene(ax, to3857, scene,
+                    line_mode=line_mode if line_rainbow else None, line_rng=trng)
     elif line.get("show", True):
         # legacy fallback (no scene snapshot supplied): flow path lines only
         lw = float(line.get("weight") or 2.0)
         lop = float(line.get("opacity") or 0.9)
-        mode = line.get("mode") or "class"
-        for cls in visible:
-            sub = paths_gdf[paths_gdf["hz_class"] == cls]
-            if not len(sub):
-                continue
-            segs = [np.asarray(g.coords)[:, :2] for g in sub.geometry
-                    if g is not None and g.geom_type == "LineString"]
-            color = (line.get("color") or "#0d9488") if mode == "single" \
-                else class_colors.get(cls, "#0d9488")
-            ax.add_collection(LineCollection(segs, colors=color, linewidths=lw,
-                                             alpha=lop, zorder=2))
+        if line_rainbow:
+            _legacy_rainbow_lines(ax, paths_gdf, visible, line_mode, trng, lw, lop)
+        else:
+            for cls in visible:
+                sub = paths_gdf[paths_gdf["hz_class"] == cls]
+                if not len(sub):
+                    continue
+                segs = [np.asarray(g.coords)[:, :2] for g in sub.geometry
+                        if g is not None and g.geom_type == "LineString"]
+                color = class_colors.get(cls, "#0d9488")
+                ax.add_collection(LineCollection(segs, colors=color, linewidths=lw,
+                                                 alpha=lop, zorder=2))
     ax.text(0.995, 0.005, "Basemap: USGS The National Map", transform=ax.transAxes,
             ha="right", va="bottom", fontsize=6, color="#333",
             bbox={"facecolor": "white", "alpha": 0.6, "pad": 1, "edgecolor": "none"})
+
+    legend_cax = (_draw_time_legend(
+        ax, trng, legend_label(mode, line_mode if line_rainbow else None),
+        (width_px, height_px))
+        if (rainbow or line_rainbow) else None)
 
     canvas.draw()
     background = canvas.copy_from_bbox(fig.bbox)
 
     style = anim.get("style") or "comet"
     pcolor = anim.get("color") or "#ff2bd6"
-    core = "#000000" if pcolor.lower() == "#ffffff" else "#ffffff"
+    core = "#ffffff" if rainbow \
+        else ("#000000" if pcolor.lower() == "#ffffff" else "#ffffff")
 
     # Batched dynamic artists: a handful of collection/marker draws per frame
     # instead of ~5 draw_artist calls PER PARTICLE (2,500 at 500 particles,
     # ~1 s/frame measured live; the per-artist overhead dominated, not the ink).
     from matplotlib.collections import LineCollection as _LC
 
+    # In the rainbow modes heads/glow/dots become scatter PathCollections (Line2D
+    # markers are single-color); tails stay LineCollections with per-segment colors.
+    # Still batched: the same handful of draw calls per frame either way.
     if style == "comet":
         tier_cols = [
             _LC([], colors=pcolor, alpha=a, linewidths=w * 1.4,
@@ -412,28 +659,39 @@ def build_flowpath_video(payload: dict, out_path, log=print, progress=None,
             for k, (a, w) in enumerate(COMET_STROKES)]
         for c in tier_cols:
             ax.add_collection(c)
-        heads_art = Line2D([], [], marker="o", markersize=3.4, color=pcolor,
-                           markeredgecolor="none", linestyle="none", zorder=6)
+        if rainbow:
+            heads_art = ax.scatter([], [], s=3.4 ** 2, edgecolors="none", zorder=6)
+        else:
+            heads_art = Line2D([], [], marker="o", markersize=3.4, color=pcolor,
+                               markeredgecolor="none", linestyle="none", zorder=6)
+            ax.add_line(heads_art)
         cores_art = Line2D([], [], marker="o", markersize=1.4, color=core,
                            markeredgecolor="none", linestyle="none", zorder=7)
-        ax.add_line(heads_art)
         ax.add_line(cores_art)
         dyn = (*tier_cols, heads_art, cores_art)
     else:
-        glow_art = Line2D([], [], marker="o", markersize=6.0, color=pcolor,
-                          alpha=0.35, markeredgecolor="none", linestyle="none",
-                          zorder=5)
-        dot_art = Line2D([], [], marker="o", markersize=3.2, color=pcolor,
-                         markeredgecolor=core, markeredgewidth=0.5,
-                         linestyle="none", zorder=6)
-        ax.add_line(glow_art)
-        ax.add_line(dot_art)
+        if rainbow:
+            glow_art = ax.scatter([], [], s=6.0 ** 2, alpha=0.35, edgecolors="none",
+                                  zorder=5)
+            dot_art = ax.scatter([], [], s=3.2 ** 2, edgecolors=core, linewidths=0.5,
+                                 zorder=6)
+        else:
+            glow_art = Line2D([], [], marker="o", markersize=6.0, color=pcolor,
+                              alpha=0.35, markeredgecolor="none", linestyle="none",
+                              zorder=5)
+            dot_art = Line2D([], [], marker="o", markersize=3.2, color=pcolor,
+                             markeredgecolor=core, markeredgewidth=0.5,
+                             linestyle="none", zorder=6)
+            ax.add_line(glow_art)
+            ax.add_line(dot_art)
         dyn = (glow_art, dot_art)
 
     def render_frame(t_ms: float):
         canvas.restore_region(background)
+        cols = _particle_colors(particles, mode, trng, t_ms) if rainbow else None
         heads = np.empty((len(particles), 2))
         tiers = ([], [], []) if style == "comet" else None
+        tcols = ([], [], []) if (style == "comet" and rainbow) else None
         for j, p in enumerate(particles):
             fr = ((t_ms / p["dur"]) + p["phase"]) % 1.0
             heads[j] = _points_at(p, [fr])[0]
@@ -447,16 +705,32 @@ def build_flowpath_video(payload: dict, out_path, log=print, progress=None,
                     pts = _tail_points(p, fr, span * (1.0 - k / 3.0))
                     if pts is not None:
                         tiers[k].append(pts)
+                        if tcols is not None:
+                            tcols[k].append(cols[j])
         if style == "comet":
             for k in range(3):
                 tier_cols[k].set_segments(tiers[k])
-            heads_art.set_data(heads[:, 0], heads[:, 1])
+                if tcols is not None:
+                    tier_cols[k].set_color(tcols[k])
+            if rainbow:
+                heads_art.set_offsets(heads)
+                heads_art.set_facecolors(cols)
+            else:
+                heads_art.set_data(heads[:, 0], heads[:, 1])
             cores_art.set_data(heads[:, 0], heads[:, 1])
         else:
-            glow_art.set_data(heads[:, 0], heads[:, 1])
-            dot_art.set_data(heads[:, 0], heads[:, 1])
+            if rainbow:
+                glow_art.set_offsets(heads)
+                glow_art.set_facecolors(cols)
+                dot_art.set_offsets(heads)
+                dot_art.set_facecolors(cols)
+            else:
+                glow_art.set_data(heads[:, 0], heads[:, 1])
+                dot_art.set_data(heads[:, 0], heads[:, 1])
         for a in dyn:
             ax.draw_artist(a)
+        if legend_cax is not None:
+            fig.draw_artist(legend_cax)   # the legend reads over passing particles
         canvas.blit(fig.bbox)
         buf = np.asarray(canvas.buffer_rgba())
         return buf[:, :, :3].copy()
@@ -593,10 +867,28 @@ def build_flowpath_still(payload: dict, out_path, log=print) -> dict:
         xs, ys = tr4326.transform(arr[:, 0], arr[:, 1])
         return np.column_stack([xs, ys])
 
+    line = payload.get("line") or {}
+    line_mode = line.get("mode") or "class"
+    line_rainbow = bool(line.get("show", True)) and line_mode in RAINBOW_MODES
+    line_rng = None
+    if line_rainbow:
+        try:
+            _pg = hz_results.class_paths_gdf(payload["hz_dir"])
+            _vis = set(payload.get("visible_classes") or [])
+            _tds = [float(t) for t in
+                    _pg[_pg["hz_class"].isin(_vis)]["total_time_d"].tolist()
+                    if t and float(t) > 0]
+            line_rng = time_range_days(_tds) if _tds else None
+        except Exception:  # noqa: BLE001 — lines fall back to their baked colors
+            line_rng = None
+
     scene = payload.get("scene")
     if scene:
-        _draw_scene(ax, to3857, scene)
+        _draw_scene(ax, to3857, scene,
+                    line_mode=line_mode if line_rainbow else None,
+                    line_rng=line_rng)
 
+    still_rainbow = None                 # (trng, anim mode) when particles drew rainbow
     anim = payload.get("anim") or {}
     if anim.get("on"):
         try:
@@ -609,11 +901,17 @@ def build_flowpath_still(payload: dict, out_path, log=print) -> dict:
             particles = []
         if particles:
             pcolor = anim.get("color") or "#ff2bd6"
-            core = "#000000" if pcolor.lower() == "#ffffff" else "#ffffff"
+            mode = anim.get("mode") or "solid"
+            rainbow = mode in RAINBOW_MODES
+            trng = _time_range(particles) if rainbow else None
+            # t=0 of the loop (the client's frame zero) for positions AND elapsed colors
+            cols = _particle_colors(particles, mode, trng, 0.0) if rainbow else None
+            core = "#ffffff" if rainbow \
+                else ("#000000" if pcolor.lower() == "#ffffff" else "#ffffff")
             style = anim.get("style") or "comet"
             heads = []
-            for p in particles:
-                fr = p["phase"]          # t=0 of the loop, the client's frame zero
+            for j, p in enumerate(particles):
+                fr = p["phase"]
                 heads.append(_points_at(p, [fr])[0])
                 if style == "comet":
                     tail_frac = min((COMET_TAIL_SECONDS * 1000.0) / p["dur"],
@@ -623,18 +921,37 @@ def build_flowpath_still(payload: dict, out_path, log=print) -> dict:
                         pts = _tail_points(p, fr, span * (1.0 - k / 3.0)) \
                             if span > 1e-6 else None
                         if pts is not None:
-                            ax.plot(pts[:, 0], pts[:, 1], color=pcolor, alpha=a,
+                            ax.plot(pts[:, 0], pts[:, 1],
+                                    color=(cols[j] if rainbow else pcolor), alpha=a,
                                     linewidth=w * 1.4, solid_capstyle="round",
                                     zorder=5)
             hx = [h[0] for h in heads]
             hy = [h[1] for h in heads]
-            if style != "comet":
-                ax.plot(hx, hy, marker="o", markersize=6.0, color=pcolor, alpha=0.35,
-                        markeredgecolor="none", linestyle="none", zorder=5)
-            ax.plot(hx, hy, marker="o", markersize=3.4, color=pcolor,
-                    markeredgecolor="none", linestyle="none", zorder=6)
+            if rainbow:
+                if style != "comet":
+                    ax.scatter(hx, hy, s=6.0 ** 2, c=cols, alpha=0.35,
+                               edgecolors="none", zorder=5)
+                ax.scatter(hx, hy, s=3.4 ** 2, c=cols, edgecolors="none", zorder=6)
+            else:
+                if style != "comet":
+                    ax.plot(hx, hy, marker="o", markersize=6.0, color=pcolor,
+                            alpha=0.35, markeredgecolor="none", linestyle="none",
+                            zorder=5)
+                ax.plot(hx, hy, marker="o", markersize=3.4, color=pcolor,
+                        markeredgecolor="none", linestyle="none", zorder=6)
             ax.plot(hx, hy, marker="o", markersize=1.4, color=core,
                     markeredgecolor="none", linestyle="none", zorder=7)
+            if rainbow:
+                still_rainbow = (trng, mode)
+
+    # One legend serves particles and lines (shared scale); drawn when either is
+    # in a rainbow mode, animation or not.
+    if still_rainbow or (line_rainbow and line_rng):
+        rng_use = still_rainbow[0] if still_rainbow else line_rng
+        _draw_time_legend(ax, rng_use,
+                          legend_label(still_rainbow[1] if still_rainbow else None,
+                                       line_mode if line_rainbow else None),
+                          (width_px, height_px))
 
     ax.text(0.995, 0.005, "Basemap: USGS The National Map", transform=ax.transAxes,
             ha="right", va="bottom", fontsize=6, color="#333",

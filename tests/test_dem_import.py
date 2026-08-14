@@ -139,6 +139,15 @@ def test_budget_decimation_reports_the_coarsened_resolution(tmp_path):
         assert abs(ds.transform.a) == pytest.approx(res["resolution_m"], rel=0.01)
 
 
+def test_no_budget_when_max_pixels_none(tmp_path):
+    # The app's desktop import path passes max_pixels=None: no pixel budget, verbatim
+    # source resolution (the old code compared w*h > None and would TypeError).
+    src, dom, reach, ctx = _site(tmp_path)
+    res = dem.import_local_dem(src, dom, tmp_path / "dem.tif", max_pixels=None)
+    assert res["note"] is None
+    assert res["resolution_m"] == pytest.approx(10.0, abs=0.01)
+
+
 def test_geographic_source_reports_metres(tmp_path):
     src, dom, reach, ctx = _site(tmp_path)
     geo = tmp_path / "geo.tif"

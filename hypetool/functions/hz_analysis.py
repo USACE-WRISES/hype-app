@@ -414,6 +414,25 @@ _IFACE_TEMPLATES: dict[int, tuple[tuple[float, float], ...]] = {
 #: run), so each extra sample per cell is a meaningful share of the whole distribution.
 IFACE_PARTICLES_PER_CELL = 4
 
+
+def iface_template(n: int) -> tuple[tuple[float, float], ...]:
+    """Plan-view release pattern for n particles per inflow cell. 1/3/4 keep the exact
+    historical placements (_IFACE_TEMPLATES) so existing runs reproduce bit-for-bit; any
+    other n >= 1 gets a deterministic centred g x g lattice (g = ceil(sqrt(n)), offsets
+    (i+0.5)/g, row-major, first n points). The app's desktop knob is the only caller
+    that passes anything but the default."""
+    n = int(n)
+    tpl = _IFACE_TEMPLATES.get(n)
+    if tpl is not None:
+        return tpl
+    if n < 1:
+        raise ValueError(f"interface particles_per_cell must be >= 1, got {n}")
+    g = 1
+    while g * g < n:
+        g += 1
+    pts = tuple(((j + 0.5) / g, (i + 0.5) / g) for i in range(g) for j in range(g))
+    return pts[:n]
+
 # Interface-pass per-particle class codes (hz_flux.npz "cls"). 1/2 predate the four-way
 # extension and must keep their meaning — the report's transit rows read them.
 FLUX_CLS = {"unresolved": 0, "returning": 1, "losing": 2, "gaining": 3, "throughflow": 4}
@@ -521,6 +540,98 @@ def _path_length(rec) -> float:
     return total if np.isfinite(total) else float("nan")
 
 
+def _flux_path_stats(pl_path: str | Path, n: int, log: Callable = print,
+                     chunk_rows: int = 2_000_000
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stream an MP7 pathline file once; per-seed (min_z, path_length_m, seen).
+
+    Replaces ``PathlineFile(...).get_alldata()`` for the FLUX pass only: that reader
+    parses the whole text file into per-particle recarrays (a 1.69 GB file took 30+
+    minutes and multiple GB of RAM on LL00726), while the flux pass needs exactly two
+    aggregates per particle - the minimum z along the path and the summed 3-D segment
+    length (`_path_length`'s metric). pandas' C whitespace tokenizer plus vectorized
+    `np.minimum.at`/`np.add.at` does that one chunk at a time and reports
+    percent-of-bytes progress so the parse never looks like a hang.
+
+    File layout (confirmed against flopy's v7 reader, modpathfile.py:_load): header
+    lines through END HEADER, then per-particle blocks of
+    ``sequencenumber group particleid count`` followed by ``count`` rows of
+    ``node x y z time xloc yloc zloc k stressperiod timestep``. Like flopy, particles
+    are keyed by ``sequencenumber - 1`` (unique per block; equal to the seed index for
+    these single-group, one-block-per-particle sims). Rows are consumed in file order,
+    which MODPATH writes time-ascending within a block - the same order the old path
+    measured after its defensive time sort.
+    """
+    import pandas as pd
+
+    pl_path = Path(pl_path)
+    total_b = float(pl_path.stat().st_size)
+    min_z = np.full(n, np.inf, dtype=np.float64)
+    length = np.zeros(n, dtype=np.float64)
+    npts = np.zeros(n, dtype=np.int64)
+    prev_pid = -1                # block continuing from the previous chunk
+    prev_xyz = None              # its last point, for the chunk-boundary segment
+    t0 = time.monotonic()
+    last_log = t0
+    next_pct = 10.0
+
+    skip = 0
+    with open(pl_path, encoding="ascii", errors="replace") as head_fh:
+        for skip, ln in enumerate(head_fh, start=1):
+            if "end header" in ln.lower():
+                break
+            if skip > 50:
+                raise ValueError("no END HEADER in the first 50 lines")
+
+    with open(pl_path, "rb") as fh:
+        # sep=r"\s+" is special-cased to the C engine's whitespace mode (not regex).
+        # Sub-header rows have 4 tokens and parse NaN-padded in the point columns.
+        for chunk in pd.read_csv(fh, sep=r"\s+", header=None, names=list(range(11)),
+                                 skiprows=skip, chunksize=int(chunk_rows),
+                                 dtype=np.float64, engine="c"):
+            a = chunk.to_numpy()
+            if a.shape[0] == 0:
+                continue
+            hdr = np.isnan(a[:, 4])
+            last_hdr = np.full(a.shape[0], -1, dtype=np.int64)
+            rows = np.flatnonzero(hdr)
+            last_hdr[rows] = rows
+            np.maximum.accumulate(last_hdr, out=last_hdr)
+            pid = np.where(last_hdr >= 0,
+                           a[np.maximum(last_hdr, 0), 0].astype(np.int64) - 1,
+                           prev_pid)
+            pts = ~hdr
+            p = pid[pts]
+            xyz = a[pts, 1:4]
+            ok = (p >= 0) & (p < n)
+            if ok.any():
+                np.minimum.at(min_z, p[ok], xyz[ok, 2])
+                np.add.at(npts, p[ok], 1)
+            if xyz.shape[0]:
+                if prev_xyz is not None and p[0] == prev_pid and 0 <= prev_pid < n:
+                    length[prev_pid] += float(np.linalg.norm(xyz[0] - prev_xyz))
+                if xyz.shape[0] > 1:
+                    d = np.linalg.norm(np.diff(xyz, axis=0), axis=1)
+                    tgt = p[1:]
+                    same = (tgt == p[:-1]) & (tgt >= 0) & (tgt < n)
+                    np.add.at(length, tgt[same], d[same])
+            prev_pid = int(pid[-1])
+            prev_xyz = xyz[-1].copy() if (xyz.shape[0] and not hdr[-1]) else None
+
+            done_b = float(fh.tell())
+            pct = min(100.0, 100.0 * done_b / max(total_b, 1.0))
+            now = time.monotonic()
+            if pct >= next_pct or now - last_log >= 60.0:
+                next_pct = pct - (pct % 10.0) + 10.0
+                last_log = now
+                log(f"Flux pathline parse: {pct:.0f}% "
+                    f"({done_b / 1e6:.0f} of {total_b / 1e6:.0f} MB, "
+                    f"{(now - t0) / 60:.1f} min elapsed)")
+
+    seen = npts > 0
+    return np.where(seen, min_z, np.nan), length, seen
+
+
 def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np.ndarray,
                        T: np.ndarray, B: np.ndarray, gwf_ws: str | Path, hz_ws: str | Path,
                        exe: str, porosity: float, max_time_days: float | None,
@@ -546,10 +657,7 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
     Returns {"accounting", "per_particle", "rtd", "rtd_by_class", "stream_cells"} or
     None when the model has no boundary inflow at all.
     """
-    tpl = _IFACE_TEMPLATES.get(int(particles_per_cell))
-    if tpl is None:
-        raise ValueError(f"interface particles_per_cell must be one of "
-                         f"{sorted(_IFACE_TEMPLATES)}, got {particles_per_cell}")
+    tpl = iface_template(particles_per_cell)
 
     nlay, nrow, ncol = idomain.shape
     member3 = np.asarray(member).reshape(nlay, nrow, ncol)
@@ -717,25 +825,24 @@ def run_interface_pass(gwf, *, member: np.ndarray, idomain: np.ndarray, head: np
                                      max_time_days=max_time_days, name="hz_flux_pl")
             run_mp7(mp_pl, log=log)
             pl_path = Path(hz_ws) / f"{mp_pl.name}.mppth"
-            by_pid = _pathlines_by_pid(pl_path)
+            min_z, seg_len, seen_pl = _flux_path_stats(pl_path, n, log=log)
             pl_path.unlink(missing_ok=True)
             (Path(hz_ws) / f"{mp_pl.name}.sloc").unlink(missing_ok=True)
             Tarr = np.asarray(T, dtype=float)
-            depths = np.full(n, np.nan, dtype=np.float32)
             # Travelled DISTANCE, not depth and not time. Microplastic retention in a streambed is
             # deep-bed filtration, whose coefficient is per centimetre of travel through the
             # medium: Munz et al. (2024) measured retention profiles that did not change with flow
             # duration beyond a couple of pore volumes, so path length is the only variable that
-            # carries the answer. Free here because this loop already holds the trajectory.
-            lengths = np.full(n, np.nan, dtype=np.float32)
-            for m in range(n):                       # flopy zero-bases pids: seed index m == pid m
-                rec = by_pid.get(m)
-                if rec is None or np.asarray(rec).size == 0:
-                    continue
-                k_d, rem_d = divmod(int(src[m]), nrow * ncol)
-                i_d, j_d = divmod(rem_d, ncol)
-                depths[m] = path_max_depth(Tarr[k_d, i_d, j_d], np.asarray(rec["z"], float))
-                lengths[m] = _path_length(rec)
+            # carries the answer. Free here because the streaming parse held the trajectory anyway.
+            src_i = np.asarray(src, dtype=np.int64)
+            k_d, rem_d = np.divmod(src_i, nrow * ncol)
+            i_d, j_d = np.divmod(rem_d, ncol)
+            # path_max_depth semantics, vectorized: max(top - min z, 0); NaN when the
+            # particle never appeared in the pathline file.
+            depths = np.where(seen_pl,
+                              np.maximum(Tarr[k_d, i_d, j_d] - min_z, 0.0),
+                              np.nan).astype(np.float32)
+            lengths = np.where(seen_pl, seg_len, np.nan).astype(np.float32)
             max_depth_m, path_length_m = depths, lengths
             log(f"Interface pass: captured max penetration depth for {int(np.isfinite(depths).sum())}"
                 f"/{n} particles, path length for {int(np.isfinite(lengths).sum())}/{n}")
@@ -1225,6 +1332,7 @@ def _fmt_int(n: float) -> str:
 def run_hz_analysis(work_dir: str | Path, *, crs,
                     left_line, right_line, up_line, down_line,
                     particles_per_cell: int = 1, sample_per_class: int = 300,
+                    iface_particles_per_cell: int = IFACE_PARTICLES_PER_CELL,
                     max_time_days: float | None = 1.0e6, saturated_clip: bool = True,
                     classes_for_volume: tuple[str, ...] = HZ_CLASSES,
                     porosity: float = 0.3, gwf_name: str = "gwf_model",
@@ -1337,13 +1445,13 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
     t0 = time.monotonic()
     flux = None
     try:
-        # Passed explicitly, never left to the signature default: this is the release density of
-        # the distribution every screening number rests on, so it belongs where a reader of the
-        # orchestrator can see it. `sample_per_class`/`hz_ppc` govern the OTHER pass.
+        # The release density of the distribution every screening number rests on.
+        # Defaults to IFACE_PARTICLES_PER_CELL (4); the app's desktop-only knob can raise
+        # it. `sample_per_class`/`hz_ppc` govern the OTHER pass.
         flux = run_interface_pass(gwf, member=member, idomain=idomain, head=head, T=T, B=B,
                                   gwf_ws=gwf_ws, hz_ws=hz_ws, exe=exe, porosity=porosity,
                                   max_time_days=max_time_days,
-                                  particles_per_cell=IFACE_PARTICLES_PER_CELL,
+                                  particles_per_cell=int(iface_particles_per_cell),
                                   cell_area2d=np.outer(delc, delr), log=log)
     except Exception as e:  # noqa: BLE001 — the classification results stand on their own
         log(f"Interface pass failed (continuing without flux metrics): {e}")
@@ -1461,6 +1569,7 @@ def run_hz_analysis(work_dir: str | Path, *, crs,
         "version": 1,
         "knobs": {"particles_per_cell": int(particles_per_cell),
                   "sample_per_class": int(sample_per_class),
+                  "iface_particles_per_cell": int(iface_particles_per_cell),
                   "max_time_days": max_time_days, "porosity": float(porosity),
                   "saturated_clip": bool(saturated_clip),
                   "min_sat_frac": float(min_sat_frac)},

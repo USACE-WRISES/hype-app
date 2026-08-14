@@ -162,10 +162,12 @@ def _pixel_res_m(transform, crs, lat0: float) -> float:
 
 
 def import_local_dem(src_path, domain_gdf_4326, out_path, *, reach_feat_4326=None,
-                     buffer_frac: float = BUFFER_FRAC, max_pixels: int = _MAX_PIXELS) -> dict:
+                     buffer_frac: float = BUFFER_FRAC,
+                     max_pixels: int | None = _MAX_PIXELS) -> dict:
     """Import a user GeoTIFF as the working DEM: clip it to the same reach-buffer AOI the
     3DEP fetch uses and write `out_path` as float32 / nodata -9999 in the SOURCE grid + CRS
-    (verbatim pixel copy, no resampling; decimated only past `max_pixels`). Clipping here is
+    (verbatim pixel copy, no resampling; decimated only past `max_pixels`, and never when
+    max_pixels is None — the app's desktop import path). Clipping here is
     what keeps the GW grid sane: the engine sizes the MODFLOW grid from the whole raster's
     bounds, so an unclipped county-wide DEM would explode the cell count. Validation failures
     raise DemImportError with a user-facing message; `reach_feat_4326` (a GeoJSON Feature)
@@ -243,7 +245,7 @@ def import_local_dem(src_path, domain_gdf_4326, out_path, *, reach_feat_4326=Non
 
         # Verbatim-grid read; integer-stride decimation only past the pixel budget.
         out_w, out_h, decimated = w, h, False
-        if w * h > max_pixels:
+        if max_pixels and w * h > max_pixels:
             stride = math.ceil(math.sqrt((w * h) / max_pixels))
             out_w, out_h = math.ceil(w / stride), math.ceil(h / stride)
             decimated = True

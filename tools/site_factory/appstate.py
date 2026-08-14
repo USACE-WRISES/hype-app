@@ -101,7 +101,7 @@ def _path_key(p) -> str:
 
 def merge_state(existing: dict | None, *, site_id: str,
                 factory_wells: list[dict], aerial_layers: list[dict],
-                format_version) -> dict:
+                format_version, results_state: dict | None = None) -> dict:
     """Overlay the factory-owned state keys onto an existing app state dict.
 
     Policy:
@@ -114,10 +114,16 @@ def merge_state(existing: dict | None, *, site_id: str,
     - well_pairs pass through (the factory never writes pairs)
     - map_layers: existing preserved, factory aerials appended unless a record
       with the same path (case-insensitive, slash-normalized) already exists
+    - results_state (ras_result/run_result/hz_result/...) fills ONLY keys the
+      app has not authored: a state the app saved after re-running a stage
+      in-session must keep its own fresher values
 
     Idempotent: merge_state(merge_state(x, ...), ...) == merge_state(x, ...).
     """
     state = dict(existing or {})
+    for k, v in (results_state or {}).items():
+        if state.get(k) is None and v is not None:
+            state[k] = v
     state["format_version"] = format_version
     state["desktop_project"] = True
     state["project_name"] = site_id

@@ -76,6 +76,33 @@ jobs:
           --releaseName "HYPE Desktop v${{ steps.ver.outputs.version }}"
           --tag ${{ github.ref_name }}
 
+      - name: Release notes from CHANGELOG.md
+        shell: pwsh
+        run: |
+          # Fill the release body with this tag's CHANGELOG section so the GitHub release
+          # page shows the same bullets users see in the app's What's new dialog. The
+          # section header is redundant with the release title, so only the bullets ship.
+          $tag = '${{ github.ref_name }}'
+          $lines = @(Get-Content CHANGELOG.md)
+          $head = $lines | Select-String -Pattern ("^## " + [regex]::Escape($tag) + " \(") |
+            Select-Object -First 1
+          if (-not $head) {
+            Write-Host "no CHANGELOG.md section for $tag - leaving the release body as packed"
+            exit 0
+          }
+          $rest = $lines[$head.LineNumber..($lines.Count - 1)]   # LineNumber is 1-based: skips the header
+          $next = $rest | Select-String -Pattern '^## v' | Select-Object -First 1
+          $section = if (-not $next) { $rest }
+                     elseif ($next.LineNumber -le 1) { @() }
+                     else { $rest[0..($next.LineNumber - 2)] }
+          $body = ($section -join "`n").Trim()
+          if (-not $body) {
+            Write-Host "empty CHANGELOG.md section for $tag - leaving the release body as packed"
+            exit 0
+          }
+          Set-Content -Encoding utf8 release-notes.md $body
+          gh release edit $tag --notes-file release-notes.md
+
       - name: Update shell block on the rolling desktop-current manifest
         shell: pwsh
         run: |

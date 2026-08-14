@@ -13,8 +13,8 @@ from .dem import BUFFER_FRAC
 
 # Cell-count guardrail bands. Anchored to observed runs (≈1.65M cells solved in ~4 s locally,
 # ~2.67M crashed mid-setup) and the 8 GB Connect Cloud target (don't max it out). Override per
-# environment with HYPE_GREEN_CELLS / HYPE_MAX_CELLS — the local dev preview sets a lower
-# HYPE_MAX_CELLS so testing is bounded by what this machine reliably runs.
+# environment with HYPE_GREEN_CELLS / HYPE_MAX_CELLS. Desktop mode never blocks on the red
+# band — the app-layer gates are advisory there (see hype_app.runmode).
 GREEN_MAX = int(os.environ.get("HYPE_GREEN_CELLS", 1_500_000))   # < this: fast (≈ proven 1.65M)
 AMBER_MAX = int(os.environ.get("HYPE_MAX_CELLS", 4_000_000))     # < this: allowed (warn); >= this: blocked
 

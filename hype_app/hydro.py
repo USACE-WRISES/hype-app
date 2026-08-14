@@ -119,21 +119,17 @@ def snap(lat: float, lon: float, flowlines_gdf=None) -> Optional[dict]:
             "dist_ft": dist_ft}
 
 
-def snap_reach_da(p_up: dict, p_dn: dict, flowlines_gdf=None,
-                  max_ft: float = 500.0) -> Optional[dict]:
-    """Drainage area for a hand-drawn reach: among flowlines within `max_ft` of EITHER endpoint,
-    take the largest `totdasqkm`. Nearest-only snapping (plain `snap`) is wrong for this — at a
-    confluence a tributary mouth can out-snap a wide river whose artificial path runs
-    mid-channel, and the mainstem splits into segments there so no single feature need be near
-    both endpoints. The mainstem dominates every qualifying tributary by drainage area.
-    Returns {da_sqkm, name, comid, dist_ft} (dist to the nearer endpoint) or None."""
+def _reach_candidates(p1: dict, p2: dict, flowlines_gdf=None):
+    """Shared prep for the two-endpoint reach helpers: candidate flowlines as an Albers
+    GeoDataFrame plus the two endpoints as Albers Points, or None when nothing usable
+    exists. Fetches a padded bbox around the endpoints when no GDF is passed in."""
     import geopandas as gpd
     from shapely.geometry import Point
 
     gdf = flowlines_gdf
     if gdf is None or getattr(gdf, "empty", True):
         pad = 0.01
-        lons, lats = [p_up["lon"], p_dn["lon"]], [p_up["lat"], p_dn["lat"]]
+        lons, lats = [p1["lon"], p2["lon"]], [p1["lat"], p2["lat"]]
         gj = flowlines_bbox(min(lons) - pad, min(lats) - pad, max(lons) + pad, max(lats) + pad,
                             max_area_deg2=2.0)
         if not gj or not gj.get("features"):
@@ -143,8 +139,23 @@ def snap_reach_da(p_up: dict, p_dn: dict, flowlines_gdf=None,
     g = g[g.geometry.notna() & ~g.geometry.is_empty]
     if g.empty:
         return None
-    pts = gpd.GeoSeries([Point(p["lon"], p["lat"]) for p in (p_up, p_dn)],
+    pts = gpd.GeoSeries([Point(p["lon"], p["lat"]) for p in (p1, p2)],
                         crs=CRS_WGS84).to_crs(CRS_ALBERS)
+    return g, pts
+
+
+def snap_reach_da(p_up: dict, p_dn: dict, flowlines_gdf=None,
+                  max_ft: float = 500.0) -> Optional[dict]:
+    """Drainage area for a hand-drawn reach: among flowlines within `max_ft` of EITHER endpoint,
+    take the largest `totdasqkm`. Nearest-only snapping (plain `snap`) is wrong for this — at a
+    confluence a tributary mouth can out-snap a wide river whose artificial path runs
+    mid-channel, and the mainstem splits into segments there so no single feature need be near
+    both endpoints. The mainstem dominates every qualifying tributary by drainage area.
+    Returns {da_sqkm, name, comid, dist_ft} (dist to the nearer endpoint) or None."""
+    prep = _reach_candidates(p_up, p_dn, flowlines_gdf)
+    if prep is None:
+        return None
+    g, pts = prep
     max_m = float(max_ft) / FT_PER_M
     best = None
     for _, row in g.iterrows():
@@ -161,6 +172,52 @@ def snap_reach_da(p_up: dict, p_dn: dict, flowlines_gdf=None,
                     "comid": (int(comid) if comid is not None else None),
                     "name": (str(name) if name else None)}
     return best
+
+
+def reach_flow_direction(p_start: dict, p_end: dict, flowlines_gdf=None,
+                         max_ft: float = 500.0) -> Optional[str]:
+    """Does a hand-drawn start→end order match the NHD flow direction? Returns "ok" when it
+    does, "reversed" when the draw runs against the flow, and None when NHD cannot decide
+    (no qualifying flowline, ambiguous match, degenerate geometry) — the caller falls back
+    to the terrain check on None.
+
+    Each endpoint matches the LARGEST-drainage-area flowline within `max_ft`, never the
+    nearest (the snap_reach_da lesson applied per endpoint: at a confluence a tributary
+    mouth can out-snap the mainstem). When both endpoints match the same flowline, its own
+    digitized direction decides — NHDPlus digitizes flowlines upstream → downstream, so the
+    endpoint projecting to the smaller measure is upstream. That is robust on a horseshoe,
+    where the two ends sit close in space but far apart along the line and DEM slopes are
+    too small to trust. Across two different flowlines (the mainstem splits into segments at
+    confluences) the larger total drainage area is downstream — the same ordering rule
+    reach_between applies to Auto picks."""
+    prep = _reach_candidates(p_start, p_end, flowlines_gdf)
+    if prep is None:
+        return None
+    g, pts = prep
+    max_m = float(max_ft) / FT_PER_M
+    best = [None, None]                    # per endpoint: (da_sqkm, gdf index, geometry)
+    for idx, row in g.iterrows():
+        da = _prop(row, ("totdasqkm", "TotDASqKm", "TotDASqKM"))
+        if da is None:
+            continue
+        for i in (0, 1):
+            if row.geometry.distance(pts.iloc[i]) > max_m:
+                continue
+            if best[i] is None or float(da) > best[i][0]:
+                best[i] = (float(da), idx, row.geometry)
+    if best[0] is None or best[1] is None:
+        return None
+    if best[0][1] == best[1][1]:           # one flowline serves both ends (the common case)
+        geom = best[0][2]
+        if geom.geom_type != "LineString":
+            return None                    # multi-part order is not flow order
+        m1, m2 = geom.project(pts.iloc[0]), geom.project(pts.iloc[1])
+        if abs(m1 - m2) < 30.0:
+            return None                    # both ends collapse to one spot on the line
+        return "ok" if m1 < m2 else "reversed"
+    if best[0][0] == best[1][0]:
+        return None
+    return "ok" if best[0][0] < best[1][0] else "reversed"
 
 
 def reach_between(up: dict, dn: dict) -> dict:

@@ -36,7 +36,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import ras_h5
+from . import ras_h5, runmode
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE_DIR = Path(__file__).resolve().parent / "data" / "ras_template"
@@ -277,6 +277,77 @@ def cell_budget() -> tuple[int, int]:
     return green, cap
 
 
+def run_timeout_s() -> float | None:
+    """Wall-clock kill per RAS CLI step. Cloud default 1800 s; no deadline (None) in
+    Desktop Run, where the machine is the limit and Cancel still works. An explicit
+    HYPE_RAS_TIMEOUT_S wins in both modes."""
+    env = os.environ.get("HYPE_RAS_TIMEOUT_S")
+    if env:
+        return float(env)
+    return None if runmode.IS_DESKTOP else 1800.0
+
+
+def stall_timeout_s() -> float | None:
+    """Liveness threshold for one RAS CLI step, BOTH run modes: the step is killed only
+    after this much TOTAL silence (no stdout line AND no file write under the project
+    dir). Not a run-time cap: any sign of life resets the clock, so a slow but advancing
+    solve is never touched (an advancing solve writes a result profile every output
+    interval). HYPE_RAS_STALL_MIN <= 0 disables; default 30 minutes. Born from a wedged
+    151k-cell solve that spun at full CPU for 38 minutes writing nothing."""
+    try:
+        mins = float(os.environ.get("HYPE_RAS_STALL_MIN", "30"))
+    except ValueError:
+        mins = 30.0
+    return None if mins <= 0 else mins * 60.0
+
+
+def _latest_mtime(root) -> float | None:
+    """Newest file mtime (epoch seconds) under root; None when no files are visible.
+    Per-entry try/except: RAS deletes scratch files mid-run."""
+    newest = None
+    for dirpath, _dirs, files in os.walk(root):
+        for fn in files:
+            try:
+                mt = os.path.getmtime(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            if newest is None or mt > newest:
+                newest = mt
+    return newest
+
+
+MESH_BUILD_FAILED_MSG = (
+    "HEC-RAS could not build a mesh for this domain (the mesher reported a conceptual "
+    "mesh failure but exited cleanly). Try a larger cell size or simpler boundary lines.")
+
+
+def read_mesh_summary_checked(geometry_h5):
+    """read_mesh_summary, with the CLI's silent meshing failure translated into a clear
+    error: `ras mesh` prints 'Failed to build conceptual mesh.' yet exits 0, leaving the
+    geometry H5 without the mesh Attributes, so the reader's KeyError is that failure."""
+    try:
+        return ras_h5.read_mesh_summary(geometry_h5)
+    except KeyError as e:
+        raise RasError(MESH_BUILD_FAILED_MSG) from e
+
+
+def mesh_cap_gate(cell_count: int, cell_size_m: float, log=print) -> None:
+    """Post-mesh capacity check against cell_budget(). The pre-run gate in app.py only
+    saw an estimate; the real count can land higher. Cloud: raise. Desktop Run: advisory
+    log only, mirroring the app-layer gate."""
+    _green, cap = cell_budget()
+    if cell_count <= cap:
+        return
+    if runmode.IS_DESKTOP:
+        log(f"Mesh is over the {cap:,}-cell cloud budget: no limit in Desktop Run, "
+            "but a mesh this size may take a long time.")
+        return
+    need = float(cell_size_m) * (cell_count / cap) ** 0.5
+    raise RasError(
+        f"The mesh has {cell_count:,} cells — above the {cap:,} cap for this server. "
+        f"Increase the cell size to ~{need:.0f} m or shrink the domain.")
+
+
 def default_friction_slope(dem_path, up_feat, down_feat) -> float | None:
     """Prefill for the Normal Depth slope: mean DEM elevation drop from the upstream to the
     downstream boundary line over the distance between their midpoints. None if unsampleable."""
@@ -325,8 +396,8 @@ def _run_ras(args, *, cwd, env, log, cancel_evt, proc_holder, timeout_s, label,
     """Run one RAS CLI verb, streaming de-noised output lines to `log`. `Progress: N%`
     lines (the engine emits one per percent of simulated time during the compute, and
     0-100 sweeps in other stages) are routed to `on_progress(pct)` instead of the log.
-    Kills the process on cancel or when the wall-clock deadline passes; raises RasError
-    on any failure."""
+    Kills the process on cancel or when the wall-clock deadline passes (timeout_s=None
+    means no deadline); raises RasError on any failure."""
     cmd, base_env = ras_cmd()
     full = cmd + args
     log(f"$ ras {' '.join(args[:3])}{' ...' if len(args) > 3 else ''}")
@@ -338,18 +409,41 @@ def _run_ras(args, *, cwd, env, log, cancel_evt, proc_holder, timeout_s, label,
         text=True, encoding="utf-8", errors="replace", bufsize=1,
     )
     proc_holder["proc"] = proc
-    deadline = time.monotonic() + timeout_s
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    stall_s = stall_timeout_s()
+    activity = {"t": time.monotonic(), "pct": None}
     timed_out = {"v": False}
+    stalled = {"v": False}
 
     def _watchdog():
+        last_scan = 0.0
+        file_age = None
+        warned = False
         while proc.poll() is None:
             if cancel_evt is not None and cancel_evt.is_set():
                 proc.kill()
                 return
-            if time.monotonic() > deadline:
+            now = time.monotonic()
+            if deadline is not None and now > deadline:
                 timed_out["v"] = True
                 proc.kill()
                 return
+            if stall_s is not None:
+                if now - last_scan >= 30.0:
+                    last_scan = now
+                    mt = _latest_mtime(cwd)
+                    file_age = None if mt is None else max(0.0, time.time() - mt)
+                silence = now - activity["t"]
+                if file_age is not None:
+                    silence = min(silence, file_age)
+                if silence > stall_s:
+                    stalled["v"] = True
+                    proc.kill()
+                    return
+                if not warned and silence > stall_s / 2.0:
+                    warned = True
+                    log(f"{label}: no solver output or file writes for "
+                        f"{silence / 60:.0f} min (stall kill at {stall_s / 60:.0f} min)")
             time.sleep(0.5)
 
     wd = threading.Thread(target=_watchdog, daemon=True)
@@ -362,12 +456,21 @@ def _run_ras(args, *, cwd, env, log, cancel_evt, proc_holder, timeout_s, label,
                 continue
             m = _PROGRESS_RE.match(line)
             if m:
+                # Percent lines count as life only when the percent ADVANCES: a hung
+                # compute that keeps reprinting the same percent must read as silent,
+                # while a slow-but-moving solve (percent ticking, profiles landing)
+                # never trips the stall kill.
+                pct = min(100, int(m.group(1)))
+                if pct != activity["pct"]:
+                    activity["pct"] = pct
+                    activity["t"] = time.monotonic()
                 if on_progress is not None:
                     try:
-                        on_progress(min(100, int(m.group(1))))
+                        on_progress(pct)
                     except Exception:  # noqa: BLE001 — progress display must never kill a run
                         pass
                 continue
+            activity["t"] = time.monotonic()   # any non-progress line is real output
             if any(k in line for k in _NOISE):
                 continue
             tail.append(line)
@@ -380,6 +483,14 @@ def _run_ras(args, *, cwd, env, log, cancel_evt, proc_holder, timeout_s, label,
         proc_holder["proc"] = None
     if cancel_evt is not None and cancel_evt.is_set():
         raise RasError("Run cancelled.")
+    if stalled["v"]:
+        at = (f" (last progress {activity['pct']}%)"
+              if activity["pct"] is not None else "")
+        raise RasError(
+            f"{label} stalled: no solver output or file writes for "
+            f"{stall_s / 60:.0f}+ minutes{at}. The process was stopped. A solve that "
+            "freezes like this usually needs a coarser mesh cell size; the log lines "
+            "above show the last activity.")
     if timed_out["v"]:
         raise RasError(f"{label} exceeded the {timeout_s:.0f}s time limit and was stopped.")
     if rc != 0:
@@ -414,7 +525,7 @@ def run_surface_model(payload: dict, log=print, cancel_evt=None, proc_holder=Non
     from . import geometry, ras_results
 
     proc_holder = proc_holder if proc_holder is not None else {}
-    timeout_s = float(os.environ.get("HYPE_RAS_TIMEOUT_S", 1800))
+    timeout_s = run_timeout_s()
     t0 = time.monotonic()
 
     def _stage(name):
@@ -505,14 +616,9 @@ def run_surface_model(payload: dict, log=print, cancel_evt=None, proc_holder=Non
     _run_ras(["mesh", "--source", str(geometry_h5)],
              cwd=proj, env=None, log=log, cancel_evt=cancel_evt, proc_holder=proc_holder,
              timeout_s=timeout_s, label="Meshing", on_progress=_stage("Meshing"))
-    mesh = ras_h5.read_mesh_summary(geometry_h5)
-    _green, cap = cell_budget()
+    mesh = read_mesh_summary_checked(geometry_h5)
     log(f"Mesh: {mesh['cell_count']:,} cells")
-    if mesh["cell_count"] > cap:
-        need = float(payload["cell_size_m"]) * (mesh["cell_count"] / cap) ** 0.5
-        raise RasError(
-            f"The mesh has {mesh['cell_count']:,} cells — above the {cap:,} cap for this server. "
-            f"Increase the cell size to ~{need:.0f} m or shrink the domain.")
+    mesh_cap_gate(mesh["cell_count"], float(payload["cell_size_m"]), log=log)
 
     # -- solve
     _run_ras(["solve", str(ras_project), "--solver", "CPU", "--core-count", "-1", "--force"],
@@ -627,7 +733,7 @@ def build_mesh_preview(payload: dict, log=print, cancel_evt=None, proc_holder=No
     from . import geometry, ras_results
 
     proc_holder = proc_holder if proc_holder is not None else {}
-    timeout_s = float(os.environ.get("HYPE_RAS_TIMEOUT_S", 1800))
+    timeout_s = run_timeout_s()
     prepare_linux_bundle()
 
     proj = Path(payload["work_dir"]) / "ras_mesh"
@@ -652,13 +758,34 @@ def build_mesh_preview(payload: dict, log=print, cancel_evt=None, proc_holder=No
     _run_ras(["mesh", "--source", str(geometry_h5)],
              cwd=proj, env=None, log=log, cancel_evt=cancel_evt, proc_holder=proc_holder,
              timeout_s=timeout_s, label="Meshing")
+    return mesh_preview_from_h5(geometry_h5, cell, crs=crs, log=log)
 
-    with h5py.File(geometry_h5, "r") as f:
-        mesh = f["Geometry/2D Flow Areas/Mesh"]
-        att = f["Geometry/2D Flow Areas/Attributes"][...]
-        cell_count = int(att["Cell Count"][0])
-        nodes = mesh["Node Coordinates"][...]
-        faces = mesh["Face Data"][...]            # columns: [CellA, CellB, NodeA, NodeB]
+
+def mesh_preview_from_h5(geometry_h5, cell_size_m: float, *, crs, log=print) -> dict:
+    """Rasterize the mesh already inside a RAS geometry HDF into the ImageOverlay payload.
+
+    Shared tail of `build_mesh_preview`, and the whole story for project restore: a saved
+    workspace's `ras/Geometries/Geometry.h5` holds the run's actual mesh, so the overlay
+    rebuilds from disk with no mesher run. `crs` is the model CRS (anything pyproj accepts,
+    e.g. "EPSG:5070"); `cell_size_m` only rides the return dict — restore passes the -1.0
+    sentinel so the next real run's auto-mesh comparison always rebuilds.
+    """
+    import h5py
+    import numpy as np
+    from pyproj import Transformer
+
+    from . import ras_results
+
+    cell = float(cell_size_m)
+    try:
+        with h5py.File(geometry_h5, "r") as f:
+            mesh = f["Geometry/2D Flow Areas/Mesh"]
+            att = f["Geometry/2D Flow Areas/Attributes"][...]
+            cell_count = int(att["Cell Count"][0])
+            nodes = mesh["Node Coordinates"][...]
+            faces = mesh["Face Data"][...]        # columns: [CellA, CellB, NodeA, NodeB]
+    except KeyError as e:
+        raise RasError(MESH_BUILD_FAILED_MSG) from e
     a, b = faces[:, 2], faces[:, 3]
     ok = (a >= 0) & (b >= 0) & (a < len(nodes)) & (b < len(nodes))
     a, b = a[ok], b[ok]
@@ -681,6 +808,11 @@ def build_mesh_preview(payload: dict, log=print, cancel_evt=None, proc_holder=No
 def build_mesh_preview_safe(payload: dict, log=print, cancel_evt=None,
                             proc_holder=None) -> dict:
     try:
+        if payload.get("from_h5"):
+            # Restore path: the mesh already exists in a saved workspace's geometry HDF.
+            return mesh_preview_from_h5(Path(payload["from_h5"]),
+                                        float(payload.get("cell_size_m") or -1.0),
+                                        crs=payload["crs"], log=log)
         return build_mesh_preview(payload, log=log, cancel_evt=cancel_evt,
                                   proc_holder=proc_holder)
     except RasError as e:

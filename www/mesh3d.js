@@ -1234,14 +1234,15 @@
     // darkened class color (deepest) to the full color (near-surface), so distance
     // into the grid reads directly off the line brightness. The mapper then ignores
     // actor color — hype3d_style re-ramps the CTF on line-color restyles.
-    var ctf = null;
+    var ctf = null, za = null, zs = null;
     if (bx[5] > bx[4] && vtk.Rendering.Core.vtkColorTransferFunction
         && vtk.Common.Core.vtkDataArray) {
       var nPts = pts.length / 3;
-      var zs = new Float32Array(nPts);
+      zs = new Float32Array(nPts);
       for (var zi = 0; zi < nPts; zi++) zs[zi] = pts[zi * 3 + 2];
-      pd.getPointData().setScalars(vtk.Common.Core.vtkDataArray.newInstance({
-        name: "z", values: zs, numberOfComponents: 1 }));
+      za = vtk.Common.Core.vtkDataArray.newInstance({
+        name: "z", values: zs, numberOfComponents: 1 });
+      pd.getPointData().setScalars(za);
       ctf = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
       var lr = parseInt(c.slice(1, 3), 16) / 255;
       var lg = parseInt(c.slice(3, 5), 16) / 255;
@@ -1255,12 +1256,18 @@
     if (ctf) {
       S.layers[key].ctf = ctf;
       S.layers[key].zr = [bx[4], bx[5]];
+      // Kept for the line rainbow: the scalar array is REWRITTEN in place (time norms
+      // <-> raw z) and the mapper's LUT swaps between the depth ramp and a turbo CTF.
+      S.layers[key].lineScal = za;
+      S.layers[key].zvals = zs;
+      S.layers[key].lineMappers = [mapper];
     }
     // Retain the raw polylines + per-path residence times so the particle animator
     // can move dots along them (the polydata alone loses per-path identity). times
-    // and pids arrive ALIGNED with polylines from scene.flowpaths_payload.
+    // and pids arrive ALIGNED with polylines from scene.flowpaths_payload. p0/np =
+    // each path's slice of the merged point array (the line-rainbow scalar fill).
     if (msg.times && msg.times.length) {
-      var paths = [];
+      var paths = [], base3 = 0;
       lines.forEach(function (flat, li) {
         var n2 = flat.length / 3;
         if (n2 < 2) return;
@@ -1273,12 +1280,48 @@
         }
         var pid = (msg.pids && +msg.pids[li]) || (li + 1);
         paths.push({ flat: flat, cum: cum, total: cum[n2 - 1] || 1,
-                     td: +(msg.times[li]) || 0,
+                     td: +(msg.times[li]) || 0, p0: base3, np: n2,
                      ph: (pid * 0.6180339887) % 1 });
+        base3 += n2;
       });
       S.layers[key].paths = paths;
     }
+    // A rebuild landing while the line rainbow is active re-applies it immediately
+    // (the style message that set the mode may long predate this geometry).
+    if ((S.lineMode3 === "total" || S.lineMode3 === "elapsed") && S.lineRng3
+        && S.layers[key].paths && S.layers[key].lineScal) {
+      lineRainbowScalars(S.layers[key], S.lineMode3, S.lineRng3);
+    }
     animRebuild();
+  }
+
+  function lineRainbowScalars(L, lmode, trng) {
+    // Residence-time coloring for the merged line polydata: per-point scalars in
+    // [0,1] through a turbo CTF. "total" = one norm per path; "elapsed" = the norm of
+    // td * cumulative-arc fraction, a true gradient along each path (the constant-
+    // arc-speed physics the particle animation moves by).
+    var t0 = Math.log10(trng[0]), t1 = Math.log10(trng[1]);
+    function nrm(days) {
+      if (!(days > 0)) return 0;
+      var f = (Math.log10(days) - t0) / ((t1 - t0) || 1);
+      return f <= 0 ? 0 : f >= 1 ? 1 : f;
+    }
+    var vals = L.lineScal.getData();
+    L.paths.forEach(function (p) {
+      if (p.p0 === undefined) return;
+      for (var i = 0; i < p.np; i++) {
+        vals[p.p0 + i] = (lmode === "total")
+          ? nrm(p.td)
+          : nrm(p.td * (p.cum[i] / (p.total || 1)));
+      }
+    });
+    L.lineScal.setData(vals);
+    if (!L.tctf) L.tctf = turboCtf(V());
+    (L.lineMappers || []).forEach(function (mp) {
+      mp.setLookupTable(L.tctf);
+      if (mp.setUseLookupTableScalarRange) mp.setUseLookupTableScalarRange(true);
+    });
+    L.lineRainbow = true;
   }
 
   // ---- flow-path particle animation (the 3-D twin of www/path_anim.js) -------------------
@@ -1292,8 +1335,98 @@
   // (clip-plane slicing); positions stay in RAW z, the actor scale transform applies
   // the exaggeration. Line opacity is deliberately ignored, matching 2-D: hidden
   // lines keep animating, the class checkbox is what stops them.
-  var A3 = { on: false, speed: 3, color: "#ff2bd6", style: "comet", msPerDay: 1,
+  var A3 = { on: false, speed: 3, color: "#ff2bd6", style: "comet", mode: "solid",
+             msPerDay: 1, tMin: 1, tMax: 1, t0: 0, t1: 0,
              raf: 0, wait: 0, pulse: 0, errs: 0, lastTick: 0, parts: {} };
+
+  // Turbo rainbow (same polynomial as path_anim.js) for the residence-time color modes:
+  // mode "total" fixes each particle at its path's total-time color, "elapsed" shifts the
+  // color with time in transit. Colors ride the SAME scalar machinery as the depth ramp
+  // (a per-point Float32 array + a mapper lookup table), just with a time-norm scalar and
+  // a turbo CTF instead of z over a two-point class ramp.
+  function turbo3(t) {
+    function ch(v) { v = Math.round(v); return v < 0 ? 0 : v > 255 ? 255 : v; }
+    return [
+      ch(34.61 + t * (1172.33 + t * (-10793.56 + t * (33300.12
+        + t * (-38394.49 + t * 14825.05))))),
+      ch(23.31 + t * (557.33 + t * (1225.33 + t * (-3574.96
+        + t * (1073.77 + t * 707.56))))),
+      ch(27.2 + t * (3211.1 + t * (-15327.97 + t * (27814.0
+        + t * (-22569.18 + t * 6838.66)))))];
+  }
+
+  function turboCtf(vtk) {
+    var ctf = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
+    for (var i = 0; i <= 16; i++) {
+      var c = turbo3(i / 16);
+      ctf.addRGBPoint(i / 16, c[0] / 255, c[1] / 255, c[2] / 255);
+    }
+    return ctf;
+  }
+
+  function tNorm(days) {
+    // log10 over the displayed range, clamped: identical mapping to path_anim.js tIdx
+    // so the 2-D and 3-D views of the same run always agree on a particle's color.
+    if (!(days > 0)) return 0;
+    var f = (Math.log10(days) - A3.t0) / ((A3.t1 - A3.t0) || 1);
+    return f <= 0 ? 0 : f >= 1 ? 1 : f;
+  }
+
+  function animRainbow() { return A3.mode === "total" || A3.mode === "elapsed"; }
+
+  function fmtDays3(v) {
+    if (v >= 100) return String(Math.round(v));
+    if (v >= 10) return String(Math.round(v * 10) / 10);
+    return String(Math.round(v * 100) / 100);
+  }
+
+  function legendLabel3() {
+    // Shared title rule with the 2-D module: one rainbow meaning gets its specific
+    // title; particles and lines active with different meanings share the scale, so
+    // the generic title.
+    var kinds = {};
+    if (A3.on && animRainbow()) kinds[A3.mode] = 1;
+    if (S.lineMode3 === "total" || S.lineMode3 === "elapsed") kinds[S.lineMode3] = 1;
+    var ks = Object.keys(kinds);
+    if (ks.length === 1) {
+      return ks[0] === "total" ? "Total residence time (days)"
+                               : "Elapsed residence time (days)";
+    }
+    return "Residence time (days)";
+  }
+
+  function animLegend() {
+    // HTML overlay in the 3-D container (the GL canvas cannot host 2-D chrome); shown
+    // while a rainbow mode colors the particles OR the lines, removed otherwise. Lives
+    // inside #hype-mesh3d, so it hides with the pane. Not part of 3-D captures (GL
+    // pixels only).
+    var el = container();
+    if (!el) return;
+    var lg = el.querySelector(".hype-fp3d-legend");
+    var animRb = A3.on && animRainbow() && Object.keys(A3.parts).length > 0;
+    var lineRb = (S.lineMode3 === "total" || S.lineMode3 === "elapsed")
+      && S.lineRng3 && animLayers().length > 0;
+    if (!animRb && !lineRb) { if (lg) lg.remove(); return; }
+    var tMin = animRb ? A3.tMin : S.lineRng3[0];
+    var tMax = animRb ? A3.tMax : S.lineRng3[1];
+    if (!lg) {
+      lg = document.createElement("div");
+      lg.className = "hype-fp3d-legend";
+      el.appendChild(lg);
+    }
+    var stops = [];
+    for (var i = 0; i <= 12; i++) {
+      var c = turbo3(i / 12);
+      stops.push("rgb(" + c[0] + "," + c[1] + "," + c[2] + ") "
+                 + Math.round(i / 12 * 100) + "%");
+    }
+    lg.innerHTML =
+      "<div>" + legendLabel3() + "</div>"
+      + "<div class='bar' style='background:linear-gradient(90deg,"
+      + stops.join(",") + ")'></div>"
+      + "<div class='ticks'><span>" + fmtDays3(tMin) + "</span><span>"
+      + fmtDays3(tMax) + "</span></div>";
+  }
 
   // Arc-length sampler shared by heads and tails: binary-search the cumulative
   // distances, lerp inside the segment, write xyz into out. Returns the low index.
@@ -1323,6 +1456,18 @@
     tds.sort(function (x, y) { return x - y; });
     var med = tds.length ? tds[(tds.length - 1) >> 1] : 1;
     A3.msPerDay = (36000 / Math.max(A3.speed, 0.1)) / (med || 1);
+    // Rainbow scale range across the displayed population (same recipe as the 2-D
+    // module: a one-value range spreads half a decade each way); per-path total-time
+    // norms are frozen here, elapsed norms interpolate per frame on the same scale.
+    var lo = tds.length ? tds[0] : 1;
+    var hi = tds.length ? tds[tds.length - 1] : 1;
+    if (!(lo > 0)) lo = 0.001;
+    if (!(hi > lo)) { hi = lo * Math.sqrt(10); lo = lo / Math.sqrt(10); }
+    A3.tMin = lo; A3.tMax = hi;
+    A3.t0 = Math.log10(lo); A3.t1 = Math.log10(hi);
+    animLayers().forEach(function (k) {
+      S.layers[k].paths.forEach(function (p) { p.tn = tNorm(p.td); });
+    });
   }
 
   function animStop() {
@@ -1345,6 +1490,7 @@
       });
     });
     A3.parts = {};
+    animLegend();   // no particles -> no residence-time legend
   }
 
   function animRebuild() {
@@ -1374,12 +1520,24 @@
       actor.getProperty().setColor(cr, cg, cb);
       if (actor.getProperty().setPointSize) actor.getProperty().setPointSize(7);
       if (actor.getProperty().setLighting) actor.getProperty().setLighting(false);
-      // Same deeper-equals-darker ramp as the static lines (L.zr recorded at line
-      // build): a parcel diving deep visibly dims while staying on the undiluted
-      // overlay. Recreated on every rebuild, so color swaps re-ramp for free; a
-      // flat-z layer (no zr) keeps the solid color.
+      // Scalar coloring, two flavors sharing one machinery (a per-point Float32 array
+      // + a mapper LUT): the rainbow modes map a time-norm scalar through a turbo CTF
+      // (works on every layer, flat-z included); solid mode keeps the round-9
+      // deeper-equals-darker ramp built from the swatch color over L.zr (recreated on
+      // every rebuild, so color swaps re-ramp for free; a flat-z layer stays solid).
       var ctfP = null, zbuf = null, za = null;
-      if (L.zr && vtk.Rendering.Core.vtkColorTransferFunction
+      var rainbow = animRainbow();
+      if (rainbow && vtk.Rendering.Core.vtkColorTransferFunction
+          && vtk.Common.Core.vtkDataArray) {
+        ctfP = turboCtf(vtk);
+        zbuf = new Float32Array(n);
+        for (var i2 = 0; i2 < n; i2++) zbuf[i2] = L.paths[i2].tn || 0;
+        za = vtk.Common.Core.vtkDataArray.newInstance({
+          name: "tnorm", values: zbuf, numberOfComponents: 1 });
+        pd.getPointData().setScalars(za);
+        mapper.setLookupTable(ctfP);
+        if (mapper.setUseLookupTableScalarRange) mapper.setUseLookupTableScalarRange(true);
+      } else if (L.zr && vtk.Rendering.Core.vtkColorTransferFunction
           && vtk.Common.Core.vtkDataArray) {
         ctfP = vtk.Rendering.Core.vtkColorTransferFunction.newInstance();
         ctfP.addRGBPoint(L.zr[0], cr * 0.55, cg * 0.55, cb * 0.55);
@@ -1422,7 +1580,7 @@
           S.mappers.push(tmap);
           if (S.clipping) { try { tmap.addClippingPlane(S.plane); } catch (e) { /**/ } }
           var tza = null;
-          if (ctfP) {   // tails share the class depth ramp
+          if (ctfP) {   // tails share the head cloud's LUT (depth ramp or turbo)
             tza = vtk.Common.Core.vtkDataArray.newInstance({
               name: "z", values: new Float32Array(0), numberOfComponents: 1 });
             tpd.getPointData().setScalars(tza);
@@ -1433,8 +1591,9 @@
         }
       }
       A3.parts[k] = { actor: actor, mapper: mapper, pd: pd, arr: arr,
-                      zbuf: zbuf, za: za, tails: tails };
+                      zbuf: zbuf, za: za, tails: tails, rainbow: rainbow };
     });
+    animLegend();
     animKick();
   }
 
@@ -1469,7 +1628,13 @@
         var fr = ((now / dur) + p.ph) % 1;
         arcPoint(p, fr * p.total, head);
         arr[i * 3] = head[0]; arr[i * 3 + 1] = head[1]; arr[i * 3 + 2] = head[2];
-        if (P.zbuf) P.zbuf[i] = head[2];   // depth ramp scalar
+        if (P.zbuf) {
+          // scalar = time norm in the rainbow modes (total is frozen per path,
+          // elapsed ages with the loop), else the depth-ramp z
+          P.zbuf[i] = P.rainbow
+            ? (A3.mode === "total" ? (p.tn || 0) : tNorm(fr * p.td))
+            : head[2];
+        }
       }
       P.pd.getPoints().setData(arr, 3);
       if (P.za) P.za.setData(P.zbuf);
@@ -1484,21 +1649,28 @@
           for (var j = 0; j < paths.length; j++) {
             var p2 = paths[j];
             var dur2 = Math.max(p2.td * A3.msPerDay, 800);
-            var s2 = (((now / dur2) + p2.ph) % 1) * p2.total;
+            var fr2 = ((now / dur2) + p2.ph) % 1;
+            var s2 = fr2 * p2.total;
             var tailLen = Math.min(p2.total / dur2 * 1000, p2.total * 0.25);
             var ta = Math.max(s2 - tailLen, 0);
             var span = s2 - ta;
             if (span < 1e-6) continue;
+            // rainbow tails wear the head's current color (the 2-D comet recipe:
+            // one color per comet, the taper carries the motion cue)
+            var sv = P.rainbow
+              ? (A3.mode === "total" ? (p2.tn || 0) : tNorm(fr2 * p2.td)) : 0;
             var loT = arcPoint(p2, ta + span * k2 / 3, tail0);
             var loH = arcPoint(p2, s2, head);
             var base = pts2.length / 3, n3 = 0;
-            pts2.push(tail0[0], tail0[1], tail0[2]); zs2.push(tail0[2]); n3++;
+            pts2.push(tail0[0], tail0[1], tail0[2]);
+            zs2.push(P.rainbow ? sv : tail0[2]); n3++;
             for (var vi = loT + 1; vi <= loH; vi++) {
               pts2.push(p2.flat[vi * 3], p2.flat[vi * 3 + 1], p2.flat[vi * 3 + 2]);
-              zs2.push(p2.flat[vi * 3 + 2]);
+              zs2.push(P.rainbow ? sv : p2.flat[vi * 3 + 2]);
               n3++;
             }
-            pts2.push(head[0], head[1], head[2]); zs2.push(head[2]); n3++;
+            pts2.push(head[0], head[1], head[2]);
+            zs2.push(P.rainbow ? sv : head[2]); n3++;
             conn2.push(n3);
             for (var c2 = 0; c2 < n3; c2++) conn2.push(base + c2);
           }
@@ -1561,6 +1733,9 @@
     if (typeof msg.speed === "number" && msg.speed > 0) A3.speed = msg.speed;
     if (typeof msg.color === "string" && msg.color) A3.color = msg.color;
     if (msg.style === "comet" || msg.style === "dots") A3.style = msg.style;
+    if (msg.mode === "solid" || msg.mode === "total" || msg.mode === "elapsed") {
+      A3.mode = msg.mode;
+    }
     // animPulse arms even when animRebuild bails early (no renderer yet): the
     // watchdog then owns recovery once the scene exists.
     if (A3.on) { animPulse(); animRebuild(); } else { animClear(); animStop(); render(); }
@@ -1583,6 +1758,7 @@
     if (window.__hypeFpAnim.speed > 0) A3.speed = window.__hypeFpAnim.speed;
     if (window.__hypeFpAnim.color) A3.color = window.__hypeFpAnim.color;
     if (window.__hypeFpAnim.style) A3.style = window.__hypeFpAnim.style;
+    if (window.__hypeFpAnim.mode) A3.mode = window.__hypeFpAnim.mode;
   }
 
   // Translucent closed volume (hyporheic-zone shells): data = {points:[x,y,z,...],
@@ -1775,6 +1951,7 @@
     S.grw = null; S.ren = null; S.rw = null;
     S.renP = null;                       // overlay renderer died with the window
     A3.parts = {};                       // its particle actors are gone too
+    animLegend();                        // the legend div must not outlive them
     animStop();                          // no loop over wiped state; the watchdog or the
     if (A3.on) animPulse();              // server resends restart it once layers return
     S.actors = []; S.mappers = []; S.layers = {}; S.origin = null; S.meshFramed = false;
@@ -2147,6 +2324,15 @@
         applyWireframe();
         return;
       }
+      var lrb = msg && msg.lmode === "total" || msg && msg.lmode === "elapsed";
+      if (msg && msg.key && msg.key.indexOf("hz3d_paths_") === 0
+          && msg.lmode !== undefined) {
+        // Remember the line color-by mode + scale globally BEFORE the built-layer
+        // gate: a restore's style push can predate the 3-D geometry, and the
+        // buildLines3d tail re-applies from this state when the lines arrive.
+        S.lineMode3 = msg.lmode;
+        S.lineRng3 = (lrb && msg.trng && msg.trng.length === 2) ? msg.trng : null;
+      }
       if (!L) return;
       (L.actors || []).forEach(function (a) {
         var p = a.getProperty();
@@ -2159,9 +2345,18 @@
         if (typeof msg.opacity === "number") p.setOpacity(Math.max(0, Math.min(msg.opacity, 1)));
         if (typeof msg.visible === "boolean") a.setVisibility(msg.visible);
       });
-      if (L.ctf && L.zr && msg.color && /^#[0-9a-fA-F]{6}$/.test(msg.color)) {
+      if (lrb && msg.trng && msg.trng.length === 2
+          && L.paths && L.lineScal) {
+        lineRainbowScalars(L, msg.lmode, msg.trng);
+      } else if (L.ctf && L.zr && msg.color && /^#[0-9a-fA-F]{6}$/.test(msg.color)) {
         // Depth-shaded line layers color through their CTF (actor color is
-        // ignored): re-ramp it so line restyles keep working.
+        // ignored): re-ramp it so line restyles keep working. Leaving a rainbow
+        // mode restores the raw z scalars + the depth ramp.
+        if (L.lineRainbow && L.lineScal && L.zvals) {
+          L.lineScal.setData(L.zvals);
+          (L.lineMappers || []).forEach(function (mp) { mp.setLookupTable(L.ctf); });
+          L.lineRainbow = false;
+        }
         var cr = parseInt(msg.color.slice(1, 3), 16) / 255;
         var cg = parseInt(msg.color.slice(3, 5), 16) / 255;
         var cb = parseInt(msg.color.slice(5, 7), 16) / 255;
@@ -2169,6 +2364,7 @@
         L.ctf.addRGBPoint(L.zr[0], cr * 0.55, cg * 0.55, cb * 0.55);
         L.ctf.addRGBPoint(L.zr[1], cr, cg, cb);
       }
+      animLegend();          // the line rainbow shows/hides the legend without the animator
       render();
     });
     // Model grid pane's 3D display controls (opacity + wire/edge color).

@@ -18,8 +18,9 @@ $RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
 $OutDir = [IO.Path]::GetFullPath($OutDir)
 $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 
-# The tracked paths the app needs at runtime (repo-root app: app.py + packages + static assets).
-$appPaths = @('app.py', 'hype_app', 'hypetool', 'www')
+# The tracked paths the app needs at runtime (repo-root app: app.py + packages + static assets,
+# plus CHANGELOG.md so the app can render its What's new dialog from the shipped file).
+$appPaths = @('app.py', 'hype_app', 'hypetool', 'www', 'CHANGELOG.md')
 
 Push-Location $RepoRoot
 try {
@@ -49,7 +50,7 @@ try {
         --commit $commit --out $manifestOut
     if ($LASTEXITCODE -ne 0) { throw "manifest generation failed ($LASTEXITCODE)" }
 
-    # -- 3. Zip (root = app.py hype_app/ hypetool/ www/ desktop-manifest.json) + sha256 --
+    # -- 3. Zip (root = app.py hype_app/ hypetool/ www/ CHANGELOG.md desktop-manifest.json) + sha256 --
     New-Item -ItemType Directory -Force $OutDir | Out-Null
     $zipPath = Join-Path $OutDir "hype-$AppsVersion.zip"
     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue

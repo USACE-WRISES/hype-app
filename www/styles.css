@@ -126,9 +126,13 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   background: rgba(255, 255, 255, .14); border: 1px solid rgba(255, 255, 255, .25);
   font-size: var(--fs-1); font-weight: 500; white-space: nowrap; max-width: min(220px, 100%);
   overflow: hidden; text-overflow: ellipsis; cursor: default; }
-/* App version chip — static release identity after the brand/badge; hidden first when narrow */
+/* App version chip — release identity after the brand/badge; hidden first when narrow.
+   Clickable: the version number opens the What's new dialog (nav-link hover treatment). */
 .hype-version-chip { flex: none; margin-left: 12px; font-size: var(--fs-0);
-  color: var(--hype-on-accent-dim); letter-spacing: .2px; white-space: nowrap; cursor: default; }
+  color: var(--hype-on-accent-dim); letter-spacing: .2px; white-space: nowrap;
+  cursor: pointer; }
+.hype-version-chip:hover { color: #fff; text-decoration: underline;
+  text-underline-offset: 3px; }
 
 /* Project pane metadata rows (Name / Location / Units / Created) */
 .hype-proj-row { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px;
@@ -580,6 +584,28 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
   border: 1px solid var(--hype-border); cursor: pointer; }
 .hype-anim-swatch.active { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--hype-accent); }
 .hype-anim-swatch:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+/* a rainbow color-by mode is active: swatches stay clickable (a click returns to Solid)
+   but read as parked */
+.hype-anim-swatch.dim { opacity: .35; }
+.hype-anim-swatch.dim.active { box-shadow: 0 0 0 1px var(--hype-border); }
+
+/* residence-time rainbow legend over the 3-D view (the 2-D twin draws on its canvas) */
+.hype-fp3d-legend { position: absolute; left: 12px; bottom: 12px; z-index: 30;
+  background: rgba(255, 255, 255, .85); border-radius: 6px; padding: 6px 10px 7px;
+  font: 500 11px/1.35 var(--font-body); color: #1a2733; pointer-events: none; }
+.hype-fp3d-legend .bar { width: 190px; height: 10px; border-radius: 2px; margin: 4px 0 2px; }
+.hype-fp3d-legend .ticks { display: flex; justify-content: space-between;
+  font-size: 10px; font-weight: 400; }
+
+/* In-pane residence-time legend (Flow paths pane) — the pane twin of the map/3-D bars */
+.hype-pane-legend { margin: 10px 0 4px; max-width: 300px; font-size: var(--fs-1);
+  color: var(--hype-text); }
+.hype-pane-legend-title { font-weight: 600; color: var(--hype-text-strong); }
+.hype-pane-legend .bar { height: 10px; border-radius: 2px; margin: 4px 0 2px; }
+.hype-pane-legend .ticks { display: flex; justify-content: space-between;
+  font-size: var(--fs-0); color: var(--hype-text-muted); }
+.hype-pane-legend-sub { margin-top: 3px; font-size: var(--fs-0);
+  color: var(--hype-text-faint); }
 
 /* Results map-layer toggles */
 .hype-lyr-head { font-size: var(--fs-1); font-weight: 600; color: var(--hype-text-strong); margin: 6px 0 2px; }
@@ -1358,7 +1384,12 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-welcome-mark { font-family: var(--font-head); font-weight: 700; font-size: 34px;
   letter-spacing: .5px; color: var(--hype-accent-dark); }
 .hype-welcome-sub { color: var(--hype-text-muted); font-size: var(--fs-1); margin-top: 2px; }
-.hype-welcome-ver { color: var(--hype-text-faint); font-size: var(--fs-0); margin-top: 4px; }
+/* The version line doubles as the What's new door; fit-content keeps the click target on
+   the text itself, not the full centered row. */
+.hype-welcome-ver { color: var(--hype-text-faint); font-size: var(--fs-0); margin-top: 4px;
+  width: fit-content; margin-inline: auto; cursor: pointer; }
+.hype-welcome-ver:hover { color: var(--hype-text-muted); text-decoration: underline;
+  text-underline-offset: 3px; }
 .hype-welcome-actions { display: flex; justify-content: center; gap: 12px; margin: 0 0 8px; }
 .hype-welcome-actions .btn { padding: 8px 22px; }
 .hype-welcome-list { display: flex; flex-direction: column; gap: 2px; max-height: 300px;
@@ -1378,6 +1409,15 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-welcome-rm { color: var(--hype-text-faint); font-size: 15px; line-height: 1;
   padding: 0 2px; opacity: 0.55; }
 .hype-welcome-rm:hover { color: #d83933; opacity: 1; }
+
+/* ============ 11.y What's new dialog (CHANGELOG.md rendered as markdown) ============ */
+/* The body div is the only scroll region, so a long history never outgrows the modal. */
+.hype-whatsnew { max-height: min(56vh, 520px); overflow-y: auto; padding-right: 4px; }
+.hype-whatsnew h2 { font-size: 1rem; font-weight: 600; color: var(--hype-text-strong);
+  margin: 18px 0 8px; }
+.hype-whatsnew h2:first-child { margin-top: 0; }
+.hype-whatsnew ul { margin: 0 0 4px; padding-left: 20px; }
+.hype-whatsnew li { margin: 4px 0; }
 
 /* ============ 12. responsive guards ============ */
 @media (max-width: 980px) {

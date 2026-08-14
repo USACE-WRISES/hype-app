@@ -39,14 +39,18 @@ def test_interface_release_density_is_the_screening_resolution():
 
 
 def test_the_orchestrator_passes_the_release_density_explicitly():
-    """Left to the signature default it silently reverted to 3, and nothing in the call site
-    told a reader that the screening resolution was being decided there."""
+    """Left to run_interface_pass's own signature default it silently reverted to 3.
+    The density is now an orchestrator parameter (the app's desktop-only knob feeds it)
+    whose default MUST stay pinned to IFACE_PARTICLES_PER_CELL, and the call site must
+    pass that parameter through, never fall back to the inner default."""
     import inspect
 
     from hypetool.functions import hz_analysis
 
+    sig = inspect.signature(hz_analysis.run_hz_analysis)
+    assert sig.parameters["iface_particles_per_cell"].default == IFACE_PARTICLES_PER_CELL
     src = inspect.getsource(hz_analysis.run_hz_analysis)
-    assert "particles_per_cell=IFACE_PARTICLES_PER_CELL" in src
+    assert "particles_per_cell=int(iface_particles_per_cell)" in src
 
 
 def test_path_max_depth():

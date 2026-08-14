@@ -51,12 +51,84 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def make_ras_progress_logger(log, clock=time.time, heartbeat_s: float = 300.0):
+    """Progress callback for ras.run_surface_model: stage headers, 10% milestones with
+    elapsed/ETA, and a heartbeat line at least every `heartbeat_s` while percent creeps
+    inside one band. The engine eats per-percent Progress lines, and big meshes can sit
+    below 10% for half an hour; without the heartbeat the log looks frozen and a healthy
+    solve gets mistaken for a wedge (SS02107: 24 quiet minutes, then finished fine)."""
+    last = {"stage": None, "pct": -10, "t0": clock(), "logged": clock()}
+
+    def _prog(stage, pct):
+        now = clock()
+        if stage != last["stage"]:
+            last.update(stage=stage, pct=-10, t0=now, logged=now)
+            log(f"[{stage}]")
+        if pct is None:
+            return
+        el = (now - last["t0"]) / 60.0
+        eta = (f", ~{el / pct * (100 - pct):.0f} min left" if 0 < pct < 100 else "")
+        if pct >= last["pct"] + 10:
+            last["pct"] = pct - (pct % 10)
+            last["logged"] = now
+            log(f"[{stage}] {pct}% ({el:.1f} min elapsed{eta})")
+        elif now - last["logged"] >= heartbeat_s:
+            last["logged"] = now
+            log(f"[{stage}] still at {pct}% ({el:.1f} min elapsed{eta})")
+
+    return _prog
+
+
 def jread(p):
     return json.loads(Path(p).read_text(encoding="utf-8"))
 
 
 def jwrite(p, obj):
     Path(p).write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+
+
+def results_state(work_dir: Path, inputs: Path, site_id: str) -> dict:
+    """The run/results state keys the app's restore consumes (app.py _rehydrate):
+    ras_result re-arms Surface Water and its overlays, run_result unlocks the
+    Results stage (restore also requires model/gwf_workspace on disk), hz_result
+    unlocks Report, results_model rehydrates the canonical results, wse_used
+    records the raster the GW run consumed. Shapes mirror the app's own
+    _project_state save (the *_fc fields restore as null there too). Everything
+    derives from durable workspace artifacts rather than in-memory run returns,
+    so a bundle-only rerun hydrates sites built before this existed. Paths are
+    ABSOLUTE here; the caller tokenizes to $WORKSPACE$ form before merging.
+    """
+    st: dict = {}
+    rr = jread(inputs / "ras_result.json") if (inputs / "ras_result.json").exists() else None
+    if rr and rr.get("depth_tif") and Path(rr["depth_tif"]).is_file():
+        st["ras_result"] = rr
+    if (inputs / "wse_filter.json").exists():
+        st["wse_used"] = jread(inputs / "wse_filter.json").get("path")
+    elif rr:
+        st["wse_used"] = rr.get("wse_for_gw")
+    head = work_dir / "summary" / "head"
+    tifs = sorted(str(p) for p in (head / "per_layer_tif").glob("head_L*.tif"))
+    gwj = inputs / "gw_result.json"
+    if tifs and (work_dir / "model" / "gwf_workspace").is_dir() and gwj.exists():
+        nc, ncm = head / "head_zyx.nc", head / "model_vars.nc"
+        st["run_result"] = {
+            "points_fc": None, "pathlines_fc": None,
+            "pathlines_fc_3d": None, "pathlines_fc_3d_full": None,
+            "head": {"netcdf": str(nc) if nc.exists() else None,
+                     "mosaic_gdb": None, "mosaic_dataset": None,
+                     "geotiffs": tifs,
+                     "netcdf_multi": str(ncm) if ncm.exists() else None},
+            "contours": {},
+            "group_name": f"hyporheic Results {site_id}",
+            "grid": (jread(gwj) or {}).get("grid"),
+        }
+    if (inputs / "hz_result.json").exists():
+        hz = jread(inputs / "hz_result.json")
+        if hz.get("hz_dir") and Path(hz["hz_dir"]).is_dir():
+            st["hz_result"] = hz
+    if (work_dir / "assessment_results.json").exists():
+        st["results_model"] = jread(work_dir / "assessment_results.json")
+    return st
 
 
 class Driver:
@@ -240,7 +312,8 @@ class Driver:
         }
         t0 = time.time()
         res = ras.run_surface_model(payload, log=lambda m: log(f"  ras| {m}"),
-                                    progress=lambda st, pct: None)
+                                    progress=make_ras_progress_logger(
+                                        lambda m: log(f"  ras| {m}")))
         res = {k: (str(v) if isinstance(v, Path) else v) for k, v in (res or {}).items()}
         jwrite(self.inputs / "ras_result.json", res)
         log(f"ras: done in {time.time() - t0:.0f}s, wse_for_gw={res.get('wse_for_gw')}")
@@ -398,10 +471,12 @@ class Driver:
                             if p.suffix.lower() in (".tif", ".tiff"))
                      if aer_dir.is_dir() else [])
         factory_wells = appstate.app_well_records(self.site_id, self.wells_rows())
+        res_state = bundle.tokenize_paths(
+            results_state(self.work_dir, self.inputs, self.site_id), self.work_dir)
         state = appstate.merge_state(
             payload.get("state"), site_id=self.site_id, factory_wells=factory_wells,
             aerial_layers=appstate.aerial_layer_records(self.site_id, aer_files),
-            format_version=bundle.FORMAT_VERSION)
+            format_version=bundle.FORMAT_VERSION, results_state=res_state)
         bundle.save_bundle_to(self.work_dir, target, vectors=vectors,
                               params=self.params(), run_config=payload.get("run_config"),
                               state=state, assessment_input=snap.model_dump(mode="json"),
@@ -454,6 +529,9 @@ class Driver:
             try:
                 getattr(self, f"stage_{st}")()
                 done.append(st)
+                # a stage that now succeeds retires its old failure marker, so the
+                # site dir always reflects CURRENT state (history stays in _runs)
+                (self.work_dir / f"_error_{st}.txt").unlink(missing_ok=True)
             except Exception as e:  # noqa: BLE001
                 err = f"{st}: {e}"
                 tb = traceback.format_exc()

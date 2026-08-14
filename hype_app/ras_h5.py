@@ -106,6 +106,29 @@ def _replace_dataset(group, name, data, attrs: dict):
     return d
 
 
+def conceptual_control_point(nodes: np.ndarray, arcs: list) -> np.ndarray:
+    """Interior control point for the conceptual mesher, shape (1, 2).
+
+    The mean of the four corner nodes (the historical choice) whenever it lies inside
+    the arc ring, keeping byte-identical meshes for every domain that already builds.
+    On a horseshoe reach the corners all sit at the open end and their mean falls
+    OUTSIDE the domain, which makes `ras mesh` print "Failed to build conceptual mesh."
+    yet exit 0 (seen on CH00518); there the polygon's representative point (guaranteed
+    interior) is used instead. Degenerate rings keep the historical mean.
+    """
+    mean = np.mean(nodes, axis=0, keepdims=True)
+    try:
+        from shapely.geometry import Point, Polygon
+
+        poly = Polygon(np.vstack(arcs))
+        if poly.is_valid and not poly.contains(Point(mean[0])):
+            rp = poly.representative_point()
+            return np.asarray([[rp.x, rp.y]], dtype=np.float64)
+    except Exception:  # noqa: BLE001 — fall back to the historical choice
+        pass
+    return mean
+
+
 def write_geometry_topology(geometry_h5, sides_xy: dict, cell_size: float):
     """Rewrite the conceptual mesh from the app's four boundary lines.
 
@@ -148,7 +171,7 @@ def write_geometry_topology(geometry_h5, sides_xy: dict, cell_size: float):
         })
         # numeric single-field writes only (string-truncation gotcha; see module docstring)
         mt["Arc Attributes"]["Count"] = arc_cell_counts
-        mt["Control Points"][...] = np.mean(nodes, axis=0, keepdims=True)
+        mt["Control Points"][...] = conceptual_control_point(nodes, arcs)
         mt["Control Point Attributes"]["ConstantSize"] = np.asarray([cell_size], dtype=np.float32)
     return {"arc_cell_counts": arc_cell_counts.tolist(), "n_internal_points": int(len(internal))}
 
