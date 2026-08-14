@@ -60,6 +60,10 @@ internal static class Program
             shellLog.WriteLine($"[shell] reaped {reaped} orphaned payload process(es) from a previous session");
         }
 
+        // Portable installs extracted from a pre-fix zip carry a stale title-named launcher
+        // after their first update (see PortableJanitor) — quietly remove it.
+        PortableJanitor.CleanStaleLauncher(AppContext.BaseDirectory, shellLog.WriteLine);
+
         using var job = KillOnCloseJob.TryCreate(shellLog.WriteLine);
         if (job is null)
         {
