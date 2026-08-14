@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.0.2 (2026-08-14)
+- Portable installs now clean up the leftover "HYPE Desktop.exe" launcher from the original download, and the portable download ships one standard launcher name (HypeDesktop.exe).
+
 ## v1.0.1 (2026-08-14)
 - Faster particle tracking results: large MODPATH output now processes in minutes instead of tens of minutes, with progress shown in the run log.
 - Desktop runs are no longer bound by the cloud size limits: cell count, DEM resolution, runtime, and particle caps are lifted.

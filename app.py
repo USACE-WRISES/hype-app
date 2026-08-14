@@ -153,7 +153,7 @@ MODFLOW_UNAVAILABLE_MSG = (
     "MODFLOW 6 / MODPATH 7 not found — expected mf6 and mp7 in the bundled bin/win "
     "(Windows) or bin/linux folder, or set HYPE_MODFLOW_BIN to a folder containing them.")
 
-APP_VERSION = "1.0.1"          # single source of truth: About dialog, header chip, welcome splash,
+APP_VERSION = "1.0.2"          # single source of truth: About dialog, header chip, welcome splash,
                                # run_config.json, the project-file manifest, and report footers.
                                # Bump TOGETHER with desktop/src/Hype.Desktop/Hype.Desktop.csproj
                                # <Version> and a matching CHANGELOG.md section (test-pinned).

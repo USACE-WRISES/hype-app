@@ -110,3 +110,17 @@ satisfied by `env.lock` (floors, not exact pins — see `desktop/scripts/check_l
   the first post-v1.0.1 shell release (`PortableJanitor`), and deleting it by hand is fine.
 - Offline/air-gapped install: download the shell installer + both payload zips +
   `latest-desktop.json` to a folder, then use "Install from file…" on the setup screen.
+
+## Release retention
+
+Published versions are immutable: never rebuild or move a released tag — roll forward with a
+new patch version (updaters only offer strictly higher versions, and moved tags break the
+delta chain and anyone who fetched them). Release assets are free on a public repo (only the
+LFS solver binaries in-repo carry quotas), so pruning saves nothing; if tidying anyway:
+
+- **Keep every `v*` shell release** — history, rollback targets, and the Velopack delta chain.
+- **Keep `desktop-tools-*`** — pinned by `desktop/payload/tools.lock` indefinitely.
+- **Payload prereleases**: only two are load-bearing at any time — the NEWEST (the manifest's
+  apps zip) and whichever one hosts the env zip the current `latest-desktop.json` references
+  (env carries forward across payload builds, so that release may be weeks old — check the
+  manifest's env URL before deleting anything). Everything older is dead storage.
