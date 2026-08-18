@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.5 (2026-08-18)
+- New start page: New project, Open project and Example projects side by side with your recent projects and what changed in each release, shown once the map is ready and any time from Projects in the header (which replaces the separate New and Open links).
+- Example projects: download a finished site from the start page, one at a time, and open it with all of its results to explore before building your own. Works in HYPE Desktop and in the cloud; downloads resume if interrupted.
+- A loading screen now covers the app until the map is up, so the start page never appears over a blank window.
+
 ## v1.0.4 (2026-08-14)
 - The update banner now waits for both update checks before it appears, so updating can no longer split into two steps when the app and the desktop shell update together.
 

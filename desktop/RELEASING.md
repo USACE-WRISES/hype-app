@@ -11,6 +11,7 @@ Velopack's updater and humans use it.
 | Shell | `v*` (e.g. `v0.1.0`) | **normal** release | `HypeDesktop-win-Setup.exe`, portable zip, Velopack deltas + `RELEASES` feed | rarely — only when the C# shell changes |
 | Payload | `desktop-payload-YYYY.MM.DD-<sha>` | prerelease | `hype-apps-….zip` (~3 MB, every run) and `hype-env-cp312-….zip` (~450 MB, only when locks changed) | **automatic on every push to `main`** touching app code |
 | Tools | `desktop-tools-N` | prerelease | Windows HEC-RAS 2025 CLI + mf6/mp7 zips, pinned by `desktop/payload/tools.lock` | manual, ~never |
+| Examples | `examples-N` | prerelease | complete `.hype` example projects (`<id>.hype`), listed by `hype_app/data/examples.json` (ships in the payload) | manual, when the example set changes |
 | Manifest | `desktop-current` | rolling prerelease | `latest-desktop.json` — the one URL every installed shell polls | refreshed by both workflows |
 
 ## Routine app update (the whole point)
@@ -67,6 +68,29 @@ CI cannot rebuild it — the zips are uploaded by hand once and pinned by hash:
 3. Update `desktop/payload/tools.lock` (url + sha256), push to main.
 
 The tools.lock change bumps ENV_VERSION → CI rebuilds and re-ships the env automatically.
+
+## Example projects update
+
+The start page's Example projects are complete `.hype` bundles hosted as release assets and
+described by `hype_app/data/examples.json` (+ `www/examples/<id>.jpg` thumbnails), both of which
+ship inside the apps payload, so an app build only ever lists examples it can open. Assets are
+immutable once published (`is_cached` trusts `<id>-<sha8>.hype` by size); a rebuilt example gets a
+new asset name and the catalog moves to it.
+
+1. Pack from the finished project folder (writes `<id>.hype` + a catalog row `<id>.json`, and the
+   thumbnail with `--thumbnail`); `--verify` re-opens the bundle and checks Results/Report hydrate:
+   `python tools/examples/pack.py <folder> --out <dir> --id SS01208 --title "…" --description "…" --tags "a,b" --credit "…" --release-tag examples-2 --verify --thumbnail`
+2. `gh release create examples-2 --prerelease --title "HYPE example projects 2" <dir>/*.hype`
+   (upload the exact files that were packed: the sha256 in each `<id>.json` is the file's).
+3. Paste the rows into `hype_app/data/examples.json` (`tests/test_examples.py` validates the
+   file, the URL prefix, and that every thumbnail exists), run the suite, push to main.
+4. Retiring an example: remove its row first, push (payload ships the new catalog), THEN delete
+   the release. A stale install that still lists it shows "no longer available, update HYPE"
+   (HTTP 404 → `ExampleGone`) instead of a broken download.
+
+Local end-to-end without GitHub: serve the packed files (`python -m http.server 8020 --directory <dir>`)
+and run the app with `HYPE_EXAMPLES_BASE_URL=http://127.0.0.1:8020/` (`.claude/launch.json` has the
+`hype-app-desktop-examples` / `hype-app-cloud-examples` / `examples-files` configs).
 
 ## Dependency (wheel) update
 

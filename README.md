@@ -19,7 +19,9 @@ Edge on Windows 10/11). First launch downloads the modeling runtime (~450 MB, re
 sha256-verified). After that the app keeps itself current: app updates ship on every push
 to `main`, and shell updates arrive with each `v*` release (see `desktop/RELEASING.md`).
 What changed in each version: [CHANGELOG.md](CHANGELOG.md), also shown in the app by
-clicking the version number.
+clicking the version number and on the start page. The start page (**Projects** in the
+header) also offers **Example projects**: finished sites you download one at a time and open
+with all of their results (`desktop/RELEASING.md`, "Example projects update").
 
 ## What it does
 

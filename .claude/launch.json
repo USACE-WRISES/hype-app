@@ -32,6 +32,50 @@
         "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
         "PYTHONUNBUFFERED": "1"
       }
+    },
+    {
+      "name": "hype-app-desktop-examples",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import os; from shiny import run_app; run_app('app.py', host='127.0.0.1', port=int(os.environ.get('PORT', '8324')))"
+      ],
+      "port": 8324,
+      "autoPort": true,
+      "env": {
+        "HYPE_DESKTOP": "1",
+        "HYPE_DATA_ROOT": "D:\\Code\\Work\\hype-app\\.dev-data",
+        "HYPE_EXAMPLES_BASE_URL": "http://127.0.0.1:8020/",
+        "HYPE_PICKER": "modal",
+        "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
+        "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "hype-app-cloud-examples",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-c",
+        "import os; from shiny import run_app; run_app('app.py', host='127.0.0.1', port=int(os.environ.get('PORT', '8325')))"
+      ],
+      "port": 8325,
+      "autoPort": true,
+      "env": {
+        "HYPE_EXAMPLES_BASE_URL": "http://127.0.0.1:8020/",
+        "HYPE_RAS_BIN": "D:\\Code\\Work\\hype-app\\reference\\HEC-RAS_2025\\HEC-RAS 2025 Alpha",
+        "HYPE_MODFLOW_BIN": "D:\\Code\\Work\\hype-tool\\bin\\modflow",
+        "PYTHONUNBUFFERED": "1"
+      }
+    },
+    {
+      "name": "examples-files",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "-m", "http.server", "8020", "--directory",
+        "C:\\Users\\gtmen\\AppData\\Local\\Temp\\claude\\D--Code-Work-hype-app\\6849b6ae-9231-4f3f-8db2-e01c659be17c\\scratchpad\\examples-1"
+      ],
+      "port": 8020
     }
   ]
 }

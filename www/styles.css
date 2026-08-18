@@ -1419,6 +1419,189 @@ h1, h2, h3, h4, h5, h6 { font-family: var(--font-head); }
 .hype-whatsnew ul { margin: 0 0 4px; padding-left: 20px; }
 .hype-whatsnew li { margin: 4px 0; }
 
+/* ============ 11.y2 start page (the startup gate, RAS2025-style, three columns) ============ */
+/* rail (New / Open / Example projects) · center (recent projects or the example gallery) ·
+   side (what's new or the selected example). The modal itself is widened inline
+   (app.py _START_MODAL_CSS); everything below is the page inside it. Columns scroll on
+   their own; the modal body never does. */
+.hype-start { flex: 1 1 auto; min-width: 0; min-height: 0; display: grid;
+  grid-template-columns: 232px minmax(0, 1fr) 300px; position: relative;
+  font-family: var(--font-body); color: var(--hype-text); }
+.hype-start > * { min-width: 0; min-height: 0; overflow-y: auto; }
+/* (a Shiny action button, so `.btn` rules apply too: the extra selector depth wins them) */
+.hype-start > .hype-start-close { position: absolute; top: 10px; right: 12px; z-index: 2; width: 30px;
+  height: 30px; padding: 0; border: 0; border-radius: 50%; background: transparent;
+  color: var(--hype-text-muted); font: 400 22px/1 var(--font-body); cursor: pointer; box-shadow: none; }
+.hype-start > .hype-start-close:hover { background: var(--hype-surface-soft); color: var(--hype-text-strong); }
+.hype-start > .hype-start-close:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-start-h { font: 600 var(--fs-3)/1.3 var(--font-head); color: var(--hype-text-strong); }
+
+/* --- rail --- */
+.hype-start-rail { display: flex; flex-direction: column; gap: 18px; padding: 26px 18px 16px;
+  background: var(--hype-surface-soft); border-right: 1px solid var(--hype-rule);
+  border-radius: 12px 0 0 12px; }
+.hype-start-brand { padding: 4px 6px 0; }
+.hype-start-mark { display: block; font-family: var(--font-head); font-weight: 700; font-size: 32px;
+  letter-spacing: .04em; line-height: 1; color: var(--hype-accent-dark); }
+.hype-start-sub { color: var(--hype-text-muted); font-size: var(--fs-1); margin-top: 6px; }
+.hype-start-chips { display: flex; gap: 6px; margin-top: 10px; }
+.hype-start-ver, .hype-start-mode { display: inline-block; padding: 2px 8px; border-radius: 999px;
+  font-size: var(--fs-0); font-weight: 600; letter-spacing: .02em; }
+.hype-start-ver { background: var(--hype-accent); color: #fff; }
+.hype-start-mode { background: #fff; border: 1px solid var(--hype-border); color: var(--hype-text-muted); }
+.hype-start-tiles { display: flex; flex-direction: column; gap: 8px; }
+.hype-start-tile { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 10px; align-items: center;
+  width: 100%; padding: 10px 12px; border: 1px solid var(--hype-border); border-radius: var(--r-2);
+  background: #fff; text-align: left; cursor: pointer; font: inherit; color: var(--hype-text);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .04); transition: border-color .12s, box-shadow .12s; }
+.hype-start-tile:hover { border-color: var(--hype-accent-border); box-shadow: var(--shadow-1); }
+.hype-start-tile:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-start-tile.is-primary { border-color: var(--hype-accent-border); background: var(--hype-accent-soft); }
+.hype-start-tile.is-active { border-color: var(--hype-accent); box-shadow: 0 0 0 1px var(--hype-accent) inset; }
+.hype-start-tile-ic { width: 34px; height: 34px; border-radius: 9px; background: var(--hype-accent-soft);
+  position: relative; }
+.hype-start-tile.is-primary .hype-start-tile-ic { background: var(--hype-accent); }
+.hype-start-tile-ic::before { content: ""; position: absolute; inset: 8px; background: var(--hype-accent);
+  -webkit-mask: var(--ic) center / contain no-repeat; mask: var(--ic) center / contain no-repeat; }
+.hype-start-tile.is-primary .hype-start-tile-ic::before { background: #fff; }
+.hype-start-tile-ic.ic-new { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E"); }
+.hype-start-tile-ic.ic-open { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Cpath d='M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E"); }
+.hype-start-tile-ic.ic-examples { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='7' height='7' rx='1.5'/%3E%3Crect x='14' y='3' width='7' height='7' rx='1.5'/%3E%3Crect x='3' y='14' width='7' height='7' rx='1.5'/%3E%3Crect x='14' y='14' width='7' height='7' rx='1.5'/%3E%3C/svg%3E"); }
+.hype-start-tile-txt { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.hype-start-tile-t { font-weight: 600; color: var(--hype-text-strong); font-size: var(--fs-2); }
+.hype-start-tile-s { color: var(--hype-text-muted); font-size: var(--fs-0); line-height: 1.3; }
+.hype-start-link { padding: 0; border: 0; background: transparent; color: var(--hype-accent);
+  font: 500 var(--fs-1)/1.4 var(--font-body); text-align: left; cursor: pointer; text-decoration: none; }
+.hype-start-link:hover { text-decoration: underline; text-underline-offset: 3px; color: var(--hype-accent-dark); }
+.hype-start-foot { margin-top: auto; display: flex; gap: 14px; padding: 8px 6px 0;
+  border-top: 1px solid var(--hype-rule); }
+
+/* --- center: recent projects --- */
+.hype-start-main { padding: 26px 26px 20px; }
+.hype-start-feat { display: grid; grid-template-columns: 200px minmax(0, 1fr); gap: 18px; margin: 14px 0 6px;
+  border: 1px solid var(--hype-border); border-radius: var(--r-2); background: #fff;
+  overflow: hidden; cursor: pointer; box-shadow: var(--shadow-1); }
+.hype-start-feat:hover { border-color: var(--hype-accent-border); box-shadow: var(--shadow-2); }
+.hype-start-thumb { background: var(--hype-accent-soft); display: grid; place-items: center; min-height: 128px; }
+.hype-start-thumb svg { width: 100%; height: 100%; display: block; }
+.hype-start-thumb.is-empty { width: 200px; height: 110px; margin: 10px auto 12px; border-radius: var(--r-2); }
+.hype-start-feat-body { display: flex; flex-direction: column; gap: 4px; padding: 16px 16px 14px 0; min-width: 0; }
+.hype-start-feat-name { font: 600 var(--fs-4)/1.2 var(--font-head); color: var(--hype-text-strong);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hype-start-feat-when { color: var(--hype-text-muted); font-size: var(--fs-1); }
+.hype-start-feat-dir { color: var(--hype-text-faint); font-size: var(--fs-0); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.hype-start-feat-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: auto;
+  padding-top: 12px; }
+.hype-start-feat-rm { color: var(--hype-text-faint); text-decoration: none; margin-left: auto; }
+.hype-start-feat-rm:hover { color: #d83933; }
+.hype-start-group { margin-top: 18px; }
+.hype-start-list { max-height: none; margin: 0 -6px; }
+.hype-start-empty { text-align: center; color: var(--hype-text-muted); padding: 30px 12px; }
+.hype-start-empty p { max-width: 340px; margin: 0 auto; }
+.hype-start-lead { color: var(--hype-text-muted); margin: 12px 0 14px; }
+.hype-start-steps { padding-left: 20px; margin: 0; }
+.hype-start-steps li { margin: 8px 0; line-height: 1.45; }
+
+/* --- side: what's new --- */
+.hype-start-side { padding: 26px 22px 20px; border-left: 1px solid var(--hype-rule);
+  border-radius: 0 12px 12px 0; }
+.hype-start-side-head { display: flex; align-items: center; gap: 10px; }
+.hype-start-verchip { padding: 2px 8px; border-radius: 999px; background: var(--hype-accent-soft);
+  color: var(--hype-accent); font-size: var(--fs-0); font-weight: 600; }
+.hype-start-rels { margin-top: 12px; }
+.hype-start-rel { padding: 12px 0; border-top: 1px solid var(--hype-rule-faint); }
+.hype-start-rel:first-child { border-top: 0; padding-top: 4px; }
+.hype-start-rel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.hype-start-rel-date { font-weight: 600; color: var(--hype-accent); font-size: var(--fs-1); }
+.hype-start-rel-ver { color: var(--hype-text-faint); font-size: var(--fs-0); font-family: var(--font-mono); }
+.hype-start-rel ul { margin: 6px 0 0; padding-left: 18px; }
+.hype-start-rel li { margin: 4px 0; font-size: var(--fs-1); line-height: 1.4; }
+.hype-start-rel-none { color: var(--hype-text-muted); font-size: var(--fs-1); margin-top: 6px; }
+
+/* --- examples view: gallery (center) + selected example (side) --- */
+.hype-start.is-examples { grid-template-columns: 232px minmax(0, 1fr) 340px; }
+.hype-start-main-head { display: flex; align-items: center; gap: 14px; }
+.hype-start-back { font-size: var(--fs-2); }
+.hype-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 14px; margin-top: 8px; }
+.hype-gallery-tile { display: flex; flex-direction: column; padding: 0; border: 1px solid var(--hype-border);
+  border-radius: var(--r-2); background: #fff; text-align: left; cursor: pointer; font: inherit;
+  color: var(--hype-text); overflow: hidden; box-shadow: var(--shadow-1);
+  transition: border-color .12s, box-shadow .12s; }
+.hype-gallery-tile:hover { border-color: var(--hype-accent-border); box-shadow: var(--shadow-2); }
+.hype-gallery-tile:focus-visible { outline: none; box-shadow: var(--hype-focus); }
+.hype-gallery-tile.is-sel { border-color: var(--hype-accent); box-shadow: 0 0 0 1px var(--hype-accent) inset; }
+.hype-gallery-thumb { aspect-ratio: 16 / 10; background: var(--hype-accent-soft); overflow: hidden; }
+.hype-gallery-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hype-gallery-body { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px 12px; min-width: 0; }
+.hype-gallery-title { font: 600 var(--fs-2)/1.3 var(--font-head); color: var(--hype-text-strong); }
+.hype-gallery-desc { font-size: var(--fs-1); font-style: italic; color: var(--hype-text-muted); line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.hype-gallery-tags { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; margin-top: 2px; }
+.hype-gallery-tag { padding: 1px 7px; border-radius: 999px; background: var(--hype-surface-soft);
+  border: 1px solid var(--hype-rule); color: var(--hype-text-muted); font-size: var(--fs-0); }
+.hype-gallery-size { padding: 1px 7px; border-radius: 999px; background: var(--hype-accent-soft);
+  color: var(--hype-accent); font-size: var(--fs-0); font-weight: 600; margin-left: auto; }
+.hype-gallery-size.is-cached { background: var(--hype-ok-soft); color: var(--hype-ok); }
+.hype-gallery-detail { display: flex; flex-direction: column; gap: 8px; }
+.hype-gallery-hero { border-radius: var(--r-2); overflow: hidden; background: var(--hype-accent-soft);
+  border: 1px solid var(--hype-border); }
+.hype-gallery-hero img { width: 100%; display: block; }
+.hype-gallery-dtitle { margin-top: 4px; }
+.hype-gallery-ddesc { margin: 0; font-size: var(--fs-2); line-height: 1.45; }
+.hype-gallery-detail .hype-gallery-size { margin-left: 0; }
+.hype-gallery-credit { color: var(--hype-text-faint); font-size: var(--fs-0); }
+.hype-gallery-target { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; align-items: baseline;
+  margin-top: 6px; padding: 8px 10px; border: 1px solid var(--hype-rule); border-radius: var(--r-1);
+  background: var(--hype-surface-soft); }
+.hype-gallery-k { font-size: var(--fs-0); font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--hype-text-muted); }
+.hype-gallery-path { font-size: var(--fs-1); color: var(--hype-text); overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; direction: rtl; text-align: left; }
+.hype-gallery-err { padding: 8px 10px; border-radius: var(--r-1); background: var(--hype-err-soft);
+  border: 1px solid var(--hype-err-border); color: var(--hype-err); font-size: var(--fs-1); }
+.hype-gallery-progress { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.hype-gallery-progress .btn { align-self: flex-start; }
+.hype-gallery-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+
+/* narrow windows: the three columns stack (block flow, not a squeezed grid) and the whole
+   page scrolls inside the modal */
+@media (max-width: 900px) {
+  .hype-start, .hype-start.is-examples { display: block; overflow-y: auto; }
+  .hype-start > * { overflow: visible; min-height: 0; }
+  .hype-start-rail { border-right: 0; border-bottom: 1px solid var(--hype-rule); border-radius: 12px 12px 0 0;
+    padding: 20px 18px 14px; gap: 14px; }
+  .hype-start-tiles { flex-direction: row; flex-wrap: wrap; }
+  .hype-start-tile { flex: 1 1 200px; }
+  .hype-start-foot { margin-top: 0; }
+  .hype-start-side { border-left: 0; border-top: 1px solid var(--hype-rule); border-radius: 0 0 12px 12px; }
+  .hype-start-feat { grid-template-columns: 1fr; }
+  .hype-start-thumb { min-height: 0; height: 120px; }
+  .hype-start-thumb svg { height: 120px; }
+  .hype-start-feat-body { padding: 0 16px 14px; }
+}
+
+/* ============ 11.z boot veil (first byte → main map in the DOM) ============ */
+/* Same palette + type as the desktop launcher page (desktop/launcher/launcher.css), so the
+   shell's handoff to the app reads as one continuous loading screen. Sits under the modal
+   ladder (1490+) but over every panel: nothing behind it is clickable until the map is up.
+   map_bounds.js adds .is-done (fade) then hidden. */
+.hype-boot { position: absolute; inset: 0; z-index: 1450; display: grid; place-items: center;
+  background: var(--hype-surface-soft); color: var(--hype-text);
+  transition: opacity .28s ease; }
+.hype-boot.is-done { opacity: 0; pointer-events: none; }
+.hype-boot[hidden] { display: none; }
+.hype-boot-card { text-align: center; }
+.hype-boot-mark { display: block; font-family: var(--font-head); font-weight: 700; font-size: 34px;
+  letter-spacing: .04em; color: var(--hype-accent-dark); }
+.hype-boot-sub { color: var(--hype-text-muted); font-size: var(--fs-2); margin-top: 2px; }
+.hype-boot-spin { width: 30px; height: 30px; margin: 22px auto 10px; border-radius: 50%;
+  border: 3px solid var(--hype-accent-soft); border-top-color: var(--hype-accent);
+  animation: hype-boot-spin .8s linear infinite; }
+@keyframes hype-boot-spin { to { transform: rotate(360deg); } }
+.hype-boot-msg { color: var(--hype-text-muted); font-size: var(--fs-1); }
+
 /* ============ 12. responsive guards ============ */
 @media (max-width: 980px) {
   .hype-brand small { display: none; }

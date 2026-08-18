@@ -16,6 +16,7 @@ import os
 import queue as _queue
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -38,9 +39,9 @@ warnings.filterwarnings("ignore", message=r".*Widget\.widgets is deprecated.*")
 import anyio  # noqa: E402
 from shiny import App, reactive, render, ui  # noqa: E402
 
-from hype_app import (assess, bieger, bundle, carve, delineate, dem, dims,  # noqa: E402
-                      estimate, geocode, geometry, gms, hydro, hz_results,
-                      map_layers as ml_mod, mesh,
+from hype_app import (assess, bieger, bundle, carve, changelog, delineate, dem, dims,  # noqa: E402
+                      estimate, examples as examples_mod, geocode, geometry, gms, hydro,
+                      hz_results, map_layers as ml_mod, mesh,
                       project_meta, ras_results, recents, report as report_mod, results,
                       results_lifecycle, runmode, scene, signature, snapshot, ui_tree,
                       video as video_mod, wells as wells_mod)
@@ -153,11 +154,38 @@ MODFLOW_UNAVAILABLE_MSG = (
     "MODFLOW 6 / MODPATH 7 not found — expected mf6 and mp7 in the bundled bin/win "
     "(Windows) or bin/linux folder, or set HYPE_MODFLOW_BIN to a folder containing them.")
 
-APP_VERSION = "1.0.4"          # single source of truth: About dialog, header chip, welcome splash,
+APP_VERSION = "1.0.5"          # single source of truth: About dialog, header chip, start page,
                                # run_config.json, the project-file manifest, and report footers.
                                # Bump TOGETHER with desktop/src/Hype.Desktop/Hype.Desktop.csproj
                                # <Version> and a matching CHANGELOG.md section (test-pinned).
-APP_VERSION_LABEL = f"v{APP_VERSION}"   # user-visible spelling (header chip + welcome splash)
+APP_VERSION_LABEL = f"v{APP_VERSION}"   # user-visible spelling (header chip + start page)
+ISSUES_URL = "https://github.com/USACE-WRISES/hype-app/issues"   # start page: Report an issue
+
+# Start page modal geometry. `.modal-dialog` / `.modal-body` are shared Bootstrap classes, so the
+# widening is injected INLINE with the modal (scoped to #shiny-modal while it is open) exactly like
+# the report modal does, instead of globally in styles.css where it would resize every size="xl"
+# dialog. Three columns need the width; the fixed height lets each column scroll on its own.
+_START_MODAL_CSS = (
+    "#shiny-modal .modal-dialog{max-width:min(1180px,94vw);width:94vw;margin:1rem auto}"
+    "#shiny-modal .modal-content{height:min(720px,calc(100vh - 2rem));"
+    "max-height:calc(100vh - 2rem);overflow:hidden;display:flex;flex-direction:column;"
+    "border-radius:12px;border:0}"
+    "#shiny-modal .modal-body{flex:1 1 auto;min-height:0;padding:0;overflow:hidden;display:flex}")
+
+# Placeholder art for a recent-project card (no per-project thumbnail exists yet): a floodplain
+# band with a reach through it, in the map-overlay palette. Inline so it ships with the page.
+_START_GLYPH_SVG = (
+    '<svg viewBox="0 0 160 100" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
+    '<rect width="160" height="100" rx="8" fill="#eef3fb"/>'
+    '<path d="M0 62 C 30 40, 55 84, 85 58 S 135 30, 160 44 L160 100 L0 100 Z" '
+    'fill="#c8d8f0" opacity=".7"/>'
+    '<path d="M0 50 C 30 28, 55 72, 85 46 S 135 18, 160 32" fill="none" stroke="#2f4b7c" '
+    'stroke-width="3" stroke-linecap="round"/>'
+    '<path d="M0 26 C 30 6, 55 50, 85 24 S 135 -4, 160 10" fill="none" stroke="#c8d8f0" '
+    'stroke-width="2" stroke-dasharray="4 4"/>'
+    '<path d="M0 74 C 30 54, 55 96, 85 70 S 135 42, 160 56" fill="none" stroke="#c8d8f0" '
+    'stroke-width="2" stroke-dasharray="4 4"/>'
+    '</svg>')
 
 
 def _desktop_build_line() -> str:
@@ -376,11 +404,11 @@ app_ui = ui.page_fillable(
                         id="hype-export-menu", class_="hype-export-menu"),
                     id="hype-export", class_="hype-export"),
                 class_="hype-header-center"),
-            ui.div(ui.input_action_link("nav_new", "New"),
-                   # Ellipsis = "raises a chooser", the convention `Save As…` already sets in
-                   # this nav. Open lands on the start menu, not straight on a file dialog.
-                   ui.input_action_link("nav_open", "Open…",
-                                        title="Open a project, or start a new one"),
+            # One door to the start page (New, Open, Example projects, recents, What's new),
+            # the way RAS2025 reopens its own project dialog through "Projects". No ellipsis:
+            # it raises the start page, not a chooser.
+            ui.div(ui.input_action_link("nav_start", "Projects",
+                                        title="New, open, example and recent projects"),
                    ui.output_ui("save_project"),
                    ui.tags.span(class_="hype-nav-sep"),
                    ui.input_action_link("nav_about", "About"),
@@ -431,6 +459,19 @@ app_ui = ui.page_fillable(
         # comparison payload, so the normal single-project canvas is untouched; comparison.js
         # owns everything inside this div.
         ui.div(id="hype-comparison", class_="hype-compare", hidden=True),
+        # Boot veil: covers the shell from the first byte until the main Leaflet map is in the
+        # DOM (www/map_bounds.js hides it and posts `hype_map_ready`, with a 6 s fallback so
+        # nobody is ever trapped behind it). Same palette as the desktop launcher page, so the
+        # shell's handoff reads as one continuous loading screen; in the cloud it is the only
+        # loading screen. The start page (_welcome_gate) opens off that same ready ping, so it
+        # always lands over a painted map, never over a blank one.
+        ui.div(
+            ui.div(ui.span("HYPE", class_="hype-boot-mark"),
+                   ui.div("Hyporheic Exchange Explorer", class_="hype-boot-sub"),
+                   ui.div(class_="hype-boot-spin"),
+                   ui.div("Loading the map", class_="hype-boot-msg"),
+                   class_="hype-boot-card"),
+            id="hype-boot", class_="hype-boot"),
         class_="hype-shell",
     ),
     title="HYPE — Hyporheic Exchange Explorer",
@@ -762,7 +803,7 @@ def server(input, output, session):
     # particular — re-fires the handler and grafts the stale task result onto the fresh session.
     _task_armed = {"sw": False, "gw": False, "hz": False, "alt": False, "report": False,
                    "video": False, "video3d": False, "still": False,
-                   "gms": False, "pick": False}
+                   "gms": False, "pick": False, "example": False}
     _gms_pending: dict = {}    # one-slot newest-wins payload while a GMS build is in flight
     _gms_epoch = {"n": 0}      # bumped by sweeps/resets; stale builds are undone post-hoc
     _gms_flight: dict = {}     # {"epoch", "work_dir"} of the GMS build in flight
@@ -11002,16 +11043,14 @@ def server(input, output, session):
             await _clear_reach_all()
 
     async def _begin_new_project():
-        """The New Project flow, shared by the header's New and the start menu's New Project.
+        """The New Project flow behind the start page's New project tile (the header's own New
+        door was folded into the start page in v1.0.5).
 
-        GATE-AWARE, which PRESERVES both of today's behaviours rather than changing either.
-        Under the startup gate there is nothing to lose, so it goes straight to the pick/name
-        dialog: that is what the menu's own button has always done. With a project open it
-        confirms first: that is what the header's New has always done.
-
-        The distinction only began to matter when `Open…` made the menu reachable mid-session.
-        Without this, its New Project button would be a one-click session wipe in cloud mode,
-        where the confirm is the only thing standing between a click and an unsaved reach."""
+        GATE-AWARE. Under the startup gate there is nothing to lose, so it goes straight to the
+        pick/name dialog. With a project open it confirms first: the start page is reachable
+        mid-session from the header's Projects link, and without the confirm its New tile would
+        be a one-click session wipe in cloud mode, where the confirm is the only thing standing
+        between a click and an unsaved reach."""
         if _gated():
             if runmode.IS_DESKTOP:
                 await _pick_path("new_project", save=True)
@@ -11047,11 +11086,6 @@ def server(input, output, session):
                                        class_="btn-danger"),
             ),
             easy_close=True))
-
-    @reactive.effect
-    @reactive.event(input.nav_new)
-    async def _confirm_new_project():
-        await _begin_new_project()
 
     @reactive.effect
     async def _new_create():
@@ -11226,42 +11260,66 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.nav_help)
     def _help():
+        _show_help()
+
+    @reactive.effect
+    @reactive.event(input.start_help)     # start-page rail link (nonce): never ignore_init
+    def _help_from_start():
+        _show_help()
+
+    @reactive.effect
+    def _help_close():
+        # `_clicked_dynamic`: the Close button is rebuilt on every show. Help raised from the
+        # start page REPLACES it (one modal at a time), so Close funnels back through
+        # _ensure_welcome like every other project-dialog exit; a no-op once a project is open.
+        if _clicked_dynamic("help_close"):
+            ui.modal_remove()
+            _ensure_welcome()
+
+    def _show_help():
         ui.modal_show(ui.modal(
             ui.markdown(
                 "**How to use**\n\n"
-                "Follow the numbered stages across the top — each stage's settings open in the "
+                "Follow the numbered stages across the top; each stage's settings open in the "
                 "panel on the right. The **Layers** panel (left) shows/hides everything on the "
                 "map; select any item there for its details.\n\n"
-                "1. **Reach** — Auto (default): zoom in until the streams appear, then click the "
+                "1. **Reach**: Auto (default): zoom in until the streams appear, then click the "
                 "upstream and downstream points on one (≤ 1 mile apart). Or Manual: draw the "
                 "centerline from upstream to downstream and enter the drainage area.\n"
-                "2. **Terrain** — fetched automatically from USGS 3DEP once the reach is set. "
+                "2. **Terrain**: fetched automatically from USGS 3DEP once the reach is set. "
                 "Re-fetch at another resolution, or carve a channel, under Terrain.\n"
-                "3. **Boundaries** — generated automatically from the terrain (floodplain width "
-                "× bankfull depth). Select a side — or click its line on the map — to edit it.\n"
-                "4. **Water surface** — choose the source: run the **HEC-RAS 2025 2D** model, "
+                "3. **Boundaries**: generated automatically from the terrain (floodplain width "
+                "× bankfull depth). Select a side, or click its line on the map, to edit it.\n"
+                "4. **Water surface**: choose the source: run the **HEC-RAS 2025 2D** model, "
                 "use the auto/drawn wetted extent, or upload a WSE raster.\n"
-                "5. **Groundwater** — review the subsurface properties and model grid, set the "
+                "5. **Groundwater**: review the subsurface properties and model grid, set the "
                 "boundary-condition gradients, then **Run groundwater model**.\n"
-                "6. **Results** — explore hydraulic head, **delineate the hyporheic zone**, and "
+                "6. **Results**: explore hydraulic head, **delineate the hyporheic zone**, and "
                 "click flow paths (or drag a box) for their statistics.\n\n"
-                "The water-surface extent becomes the constant-head (CHD) top boundary — from "
+                "The water-surface extent becomes the constant-head (CHD) top boundary: from "
                 "the surface model's WSE when available, else the DEM elevations inside the "
-                "drawn extent. Nothing is saved on the server — **Save** (top right) gives you "
-                "a project file (.hype) to pick up later with **Open**: complete with all "
+                "drawn extent. Nothing is saved on the server; **Save** (top right) gives you "
+                "a project file (.hype) to pick up later from **Projects**: complete with all "
                 "computed data, or settings-only for a small file. A .hype file is a ZIP "
-                "archive — rename it to .zip to browse the stage folders in GIS."
-                + ("\n\n**Desktop projects**: HYPE Desktop works in project folders. **New** "
-                   "asks where to put the project's main .hype file, and every stage saves "
-                   "into that folder as you work (terrain, models, results sit next to the "
-                   "main file, like a GMS project). **Save** rewrites the main file in place; "
-                   "settings also autosave after each completed run. **Save As** copies the "
-                   "whole project to a new name or location and switches to it. The project "
-                   "folder also holds an Aquaveo GMS copy of the groundwater model in GMS, "
-                   "refreshed after each run. Avoid working in "
-                   "two windows on the same folder; the last writer wins."
+                "archive; rename it to .zip to browse the stage folders in GIS.\n\n"
+                "**Projects** (top right) is the start page: new project, open project, "
+                "example projects to download and explore, your recent projects, and what "
+                "changed in each release."
+                + ("\n\n**Desktop projects**: HYPE Desktop works in project folders. **New "
+                   "project** asks where to put the project's main .hype file, and every "
+                   "stage saves into that folder as you work (terrain, models, results sit "
+                   "next to the main file, like a GMS project). **Save** rewrites the main "
+                   "file in place; settings also autosave after each completed run. **Save "
+                   "As** copies the whole project to a new name or location and switches to "
+                   "it. The project folder also holds an Aquaveo GMS copy of the groundwater "
+                   "model in GMS, refreshed after each run. Avoid working in two windows on "
+                   "the same folder; the last writer wins."
                    if runmode.IS_DESKTOP else "")),
-            title="Help", easy_close=True))
+            title="Help",
+            # Server-side Close (not modal_button): raised from the start page this dialog
+            # replaces the gate, so Close must funnel back; easy_close stays off while gated.
+            footer=ui.input_action_button("help_close", "Close", class_="btn-primary"),
+            easy_close=not _gated()))
 
     @reactive.effect
     @reactive.event(input.nav_about)
@@ -12390,6 +12448,11 @@ def server(input, output, session):
         raw_path = res.get("path")
         if res.get("cancelled") or (not paths and not raw_path):
             _pending_pick.pop("comparison_close_after_save", None)
+            if purpose == "example_target":
+                # The Save-to chooser came off the start page's example detail: go back
+                # there (gated or not; the page was open either way).
+                _show_welcome("examples", example=_welcome.get("example"))
+                return
             if not comparison_mode_v():
                 _ensure_welcome()          # exactly the pre-comparison cancel contract
             return
@@ -12442,20 +12505,20 @@ def server(input, output, session):
         await _on_project_path(purpose, Path(str(raw_path)))
 
     @reactive.effect
-    @reactive.event(input.nav_open)
-    async def _open_dialog():
-        """Header Open: the START MENU, not a file dialog.
+    @reactive.event(input.nav_start)
+    async def _start_dialog():
+        """Header Projects: the START PAGE (New, Open, Example projects, recents, What's new),
+        never a file dialog.
 
-        It used to branch straight to the picker (desktop) or the upload modal (cloud), which
-        skipped the one screen that offers recents and New side by side. `_show_welcome` is
-        deliberate over `_ensure_welcome`: that one no-ops when a project is open, which is what
-        every cancel funnel relies on. Cloud pays one extra hop for this (its menu carries no
-        recents), and keeps one rule instead of two behaviours behind one label."""
+        The header used to carry New and Open as two doors, and Open once branched straight to
+        the picker (desktop) or the upload modal (cloud), skipping the one screen that offers
+        recents and New side by side. `_show_welcome` is deliberate over `_ensure_welcome`: that
+        one no-ops when a project is open, which is what every cancel funnel relies on."""
         if _busy_tasks():
             ui.modal_show(ui.modal(
                 ui.p("A task is still running. Wait for it to finish (or cancel it) before "
                      "opening a project."),
-                title="Open project", easy_close=True))
+                title="Projects", easy_close=True))
             return
         _show_welcome()
 
@@ -12882,14 +12945,19 @@ def server(input, output, session):
             except (ValueError, OSError):
                 pass
 
-    # ---- Startup gate: RAS2025-style welcome dialog (both run modes) -------------------
+    # ---- Startup gate: RAS2025-style start page (both run modes) ----------------------
     # Hard gate by design: the user must create or open a project before entering the app.
     # Desktop: a project = a folder (model runs are heavy; everything saves in place), so
     # there is no unsaved desktop session. Cloud: a project = a name (nothing persists
     # server-side; the name titles the session and the Save download). Every cancel/error
     # exit from the project dialogs funnels back via _ensure_welcome, so a project-less
     # session is never left dialog-less.
-    _welcome = {"recents": []}     # snapshot behind the rendered rows (onclick idx → path)
+    #
+    # The start page is ONE modal with three columns (rail: New / Open / Example projects;
+    # center: recent projects; right: what's new) and two views: "home" and "examples" (the
+    # gallery + detail, same shell, Back returns home). It opens off the client's map-ready
+    # ping (_welcome_gate) and from the header's Projects link.
+    _welcome = {"recents": [], "view": "home", "example": None}  # snapshot behind the rows
 
     def _gated() -> bool:
         if runmode.IS_DESKTOP:
@@ -12918,71 +12986,208 @@ def server(input, output, session):
             return f"{int(secs // 86400)} days ago"
         return dt.astimezone().strftime("%b %d, %Y")
 
-    def _show_welcome():
-        # Minimal splash (user call): wordmark + two actions + recents, zero body copy,
-        # no Bootstrap title bar. The recents block is omitted entirely when empty
-        # (cloud always: a Cloud Run container has no meaningful recents to offer).
+    def _nonce_js(evt_id: str, **fields) -> str:
+        """Inline onclick that posts a nonce'd event input (the _evt_btn pattern) with optional
+        extra fields. Only indices ever ride in here, never paths (backslash-escape trap)."""
+        extra = "".join(f"{k}: {v}, " for k, v in fields.items())
+        return (f"Shiny.setInputValue('{evt_id}', {{{extra}n: Date.now() + Math.random()}}, "
+                "{priority: 'event'})")
+
+    def _start_tile(evt_id: str, title: str, sub: str, icon: str, *,
+                    primary: bool = False, active: bool = False):
+        cls = "hype-start-tile" + (" is-primary" if primary else "") + (" is-active" if active else "")
+        return ui.tags.button(
+            ui.span(class_=f"hype-start-tile-ic ic-{icon}"),
+            ui.span(ui.span(title, class_="hype-start-tile-t"),
+                    ui.span(sub, class_="hype-start-tile-s"),
+                    class_="hype-start-tile-txt"),
+            type="button", class_=cls, title=title, onclick=_nonce_js(evt_id))
+
+    def _recent_groups(items: list[dict]) -> list[tuple[str, list[tuple[int, dict]]]]:
+        """RAS2025's buckets for everything below the featured card: Today / Last 7 days /
+        Older by last_opened, newest-first inside each, empty buckets dropped. Carries the
+        item's index in the SNAPSHOT so the rows keep firing positional events."""
+        now = datetime.now(timezone.utc)
+        today = now.astimezone().date()
+        buckets: dict[str, list[tuple[int, dict]]] = {"Today": [], "Last 7 days": [], "Older": []}
+        for i, it in enumerate(items):
+            if i == 0:
+                continue                      # the featured card
+            key = "Older"
+            try:
+                dt = datetime.fromisoformat(it["last_opened"])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt.astimezone().date() == today:
+                    key = "Today"
+                elif (now - dt).total_seconds() < 7 * 86400:
+                    key = "Last 7 days"
+            except (ValueError, TypeError):
+                pass
+            buckets[key].append((i, it))
+        return [(k, v) for k, v in buckets.items() if v]
+
+    def _start_recent_row(i: int, it: dict):
+        return ui.tags.button(
+            ui.span(it["name"], class_="hype-welcome-name"),
+            ui.span(str(Path(it["path"]).parent), class_="hype-welcome-dir"),
+            ui.span(_welcome_when(it["last_opened"]), class_="hype-welcome-when"),
+            # a span, not a button — the row is a <button> and HTML forbids nesting
+            # buttons; stopPropagation keeps the row's open-onclick out
+            ui.span("×", class_="hype-welcome-rm", title="Remove from recent projects",
+                    onclick="event.stopPropagation(); " + _nonce_js("welcome_recent_rm", i=i)),
+            type="button", class_="hype-welcome-row hype-start-row", title=it["path"],
+            # idx only — never a path — goes into inline JS (backslash-escape trap)
+            onclick=_nonce_js("welcome_recent", i=i))
+
+    def _start_home_columns(items: list[dict]):
+        """Center (recent projects) + right (what's new) of the home view."""
+        if runmode.IS_DESKTOP:
+            if items:
+                feat = items[0]
+                featured = ui.div(
+                    ui.div(ui.HTML(_START_GLYPH_SVG), class_="hype-start-thumb"),
+                    ui.div(
+                        ui.div(feat["name"], class_="hype-start-feat-name"),
+                        ui.div(f"Last opened {_welcome_when(feat['last_opened'])}",
+                               class_="hype-start-feat-when"),
+                        ui.div(str(Path(feat["path"]).parent), class_="hype-start-feat-dir",
+                               title=feat["path"]),
+                        ui.div(
+                            ui.tags.button("Open", type="button",
+                                           class_="btn btn-primary btn-sm",
+                                           onclick="event.stopPropagation(); "
+                                                   + _nonce_js("welcome_recent", i=0)),
+                            ui.tags.button("Show in folder", type="button",
+                                           class_="btn btn-outline-secondary btn-sm",
+                                           onclick="event.stopPropagation(); "
+                                                   + _nonce_js("welcome_reveal", i=0)),
+                            ui.tags.button("Remove", type="button",
+                                           class_="btn btn-link btn-sm hype-start-feat-rm",
+                                           title="Remove from recent projects",
+                                           onclick="event.stopPropagation(); "
+                                                   + _nonce_js("welcome_recent_rm", i=0)),
+                            class_="hype-start-feat-actions"),
+                        class_="hype-start-feat-body"),
+                    class_="hype-start-feat", title=feat["path"],
+                    onclick=_nonce_js("welcome_recent", i=0))
+                groups = [
+                    ui.div(ui.div(label, class_="hype-sec hype-start-group"),
+                           ui.div(*[_start_recent_row(i, it) for i, it in rows],
+                                  class_="hype-welcome-list hype-start-list"))
+                    for label, rows in _recent_groups(items)]
+                center_body = [featured, *groups]
+            else:
+                center_body = [ui.div(
+                    ui.div(ui.HTML(_START_GLYPH_SVG), class_="hype-start-thumb is-empty"),
+                    ui.p("No recent projects yet. Start with New project, or download an "
+                         "example to explore a finished site."),
+                    class_="hype-start-empty")]
+        else:
+            center_body = [ui.div(
+                ui.p("Nothing is stored on the server: a project lives in your browser "
+                     "session and in the .hype file you save.", class_="hype-start-lead"),
+                ui.tags.ol(
+                    ui.tags.li(ui.tags.b("New project"), " names a project, then you pick a "
+                               "site on the map and build the model stage by stage."),
+                    ui.tags.li(ui.tags.b("Open project"), " uploads a .hype file saved "
+                               "earlier, with everything it holds."),
+                    ui.tags.li(ui.tags.b("Example projects"), " downloads a finished site to "
+                               "explore its results before you build your own."),
+                    class_="hype-start-steps"),
+                class_="hype-start-getstarted")]
+        center = ui.div(ui.div("Recent projects" if runmode.IS_DESKTOP else "Get started",
+                               class_="hype-start-h"),
+                        *center_body, class_="hype-start-main")
+        rels = changelog.load()
+        if rels:
+            rel_nodes = [
+                ui.div(ui.div(ui.span(r.date_display, class_="hype-start-rel-date"),
+                              ui.span(r.label, class_="hype-start-rel-ver"),
+                              class_="hype-start-rel-head"),
+                       ui.tags.ul(*[ui.tags.li(changelog.plain(b)) for b in r.bullets])
+                       if r.bullets else ui.div("Maintenance release.",
+                                                class_="hype-start-rel-none"),
+                       class_="hype-start-rel")
+                for r in rels]
+        else:
+            rel_nodes = [ui.div(f"HYPE {APP_VERSION_LABEL}", class_="hype-start-rel-none")]
+        side = ui.div(ui.div(ui.span("What's new", class_="hype-start-h"),
+                             ui.span(APP_VERSION_LABEL, class_="hype-start-verchip"),
+                             class_="hype-start-side-head"),
+                      ui.div(*rel_nodes, class_="hype-start-rels"),
+                      class_="hype-start-side")
+        return center, side
+
+    def _show_welcome(view: str = "home", *, example: str | None = None):
+        # The start page. Rail = New / Open / Example projects (+ Open a comparison on
+        # desktop, Help and Report an issue at the foot); center + right depend on the view:
+        # "home" = recent projects + what's new, "examples" = the gallery + the selected
+        # example's detail (see _start_examples_columns). No Bootstrap title bar; the modal is
+        # widened inline (_START_MODAL_CSS) so three columns fit and scroll independently.
         #
         # TWO MODES SINCE THE HEADER CAN RAISE IT. Under the startup gate it is a HARD gate with
-        # no way out at all (see the footer/easy_close note below). Reached from `Open…` with a
+        # no way out at all (see the footer/easy_close note below). Reached from Projects with a
         # project already open it is an ordinary dialog and must be dismissable, or it is a trap:
         # `_ensure_welcome` no-ops once a project exists, so no cancel funnel would bring it back.
-        # Same shape as `_show_open_modal` and `_show_typed_pick_modal`.
         #
         # RECENTS ARE RE-READ ON EVERY CALL, never cached: `_adopt_workspace` touches the store on
         # each project open, and the handlers index `_welcome["recents"]` POSITIONALLY, so a stale
         # snapshot would open the wrong project.
         gated = _gated()
-        items = recents.load()[:8] if runmode.IS_DESKTOP else []
+        items = recents.load() if runmode.IS_DESKTOP else []
         _welcome["recents"] = items
-        recent_block: tuple = ()
-        if items:
-            recent_block = (
-                ui.div("Recent Projects", class_="hype-sec"),
-                ui.div(*[
-                    ui.tags.button(
-                        ui.span(it["name"], class_="hype-welcome-name"),
-                        ui.span(str(Path(it["path"]).parent), class_="hype-welcome-dir"),
-                        ui.span(_welcome_when(it["last_opened"]), class_="hype-welcome-when"),
-                        # a span, not a button — the row is a <button> and HTML forbids
-                        # nesting buttons; stopPropagation keeps the row's open-onclick out
-                        ui.span("×", class_="hype-welcome-rm",
-                                title="Remove from recent projects",
-                                onclick="event.stopPropagation(); "
-                                        f"Shiny.setInputValue('welcome_recent_rm', "
-                                        f"{{i: {i}, n: Date.now()}}, {{priority: 'event'}})"),
-                        type="button", class_="hype-welcome-row", title=it["path"],
-                        # idx only — never a path — goes into inline JS (backslash-escape trap)
-                        onclick=f"Shiny.setInputValue('welcome_recent', "
-                                f"{{i: {i}, n: Date.now()}}, {{priority: 'event'}})")
-                    for i, it in enumerate(items)], class_="hype-welcome-list"),
-            )
-        ui.modal_show(ui.modal(
+        catalog = _examples_catalog()
+        if view == "examples" and not catalog:
+            view = "home"
+        _welcome["view"] = view
+        _welcome["example"] = example
+        rail = ui.div(
+            ui.div(ui.span("HYPE", class_="hype-start-mark"),
+                   ui.div("Hyporheic Exchange Explorer", class_="hype-start-sub"),
+                   ui.div(ui.span(APP_VERSION_LABEL, class_="hype-start-ver"),
+                          ui.span("Desktop" if runmode.IS_DESKTOP else "Cloud",
+                                  class_="hype-start-mode"),
+                          class_="hype-start-chips"),
+                   class_="hype-start-brand"),
             ui.div(
-                ui.div(ui.span("HYPE", class_="hype-welcome-mark"),
-                       ui.div("Hyporheic Exchange Explorer", class_="hype-welcome-sub"),
-                       ui.div(APP_VERSION_LABEL, class_="hype-welcome-ver",
-                              title="What's new in HYPE",
-                              onclick="Shiny.setInputValue('whatsnew_evt', "
-                                      "Date.now() + Math.random(), {priority: 'event'})"),
-                       class_="hype-welcome-brand"),
-                ui.div(_evt_btn("welcome_new", "New Project", "btn-primary"),
-                       _evt_btn("welcome_open", "Open Project", "btn-outline-secondary"),
-                       # Comparisons are project-independent, so opening one must not
-                       # require opening a project first (desktop only: file access).
-                       *([_evt_btn("welcome_compare", "Open Comparison",
-                                   "btn-outline-secondary")]
-                         if runmode.IS_DESKTOP else []),
-                       class_="hype-welcome-actions"),
-                *recent_block,
-                class_="hype-welcome"),
-            # `title=None` drops the modal header AND its x; `footer=None` drops Bootstrap's
-            # default Dismiss. Together with easy_close=False that is a dialog with no exit,
-            # which is the point under the gate and wrong the moment there is something to
-            # go back to.
+                _start_tile("welcome_new", "New project", "Pick a site and build a model",
+                            "new", primary=True),
+                _start_tile("welcome_open", "Open project",
+                            "Open a project folder or a .hype file" if runmode.IS_DESKTOP
+                            else "Upload a .hype file", "open"),
+                *([_start_tile("start_examples", "Example projects",
+                               "Download a worked site and explore it", "examples",
+                               active=(view == "examples"))] if catalog else []),
+                class_="hype-start-tiles"),
+            # Comparisons are project-independent, so opening one must not require opening
+            # a project first (desktop only: file access). Kept as a quiet link, not a tile.
+            *([ui.tags.button("Open a comparison", type="button", class_="hype-start-link",
+                              onclick=_nonce_js("welcome_compare"))]
+              if runmode.IS_DESKTOP else []),
+            ui.div(ui.tags.button("Help", type="button", class_="hype-start-link",
+                                  onclick=_nonce_js("start_help")),
+                   ui.a("Report an issue", href=ISSUES_URL, target="_blank",
+                        rel="noopener", class_="hype-start-link"),
+                   class_="hype-start-foot"),
+            class_="hype-start-rail")
+        if view == "examples":
+            center, side = _start_examples_columns(catalog, example)
+        else:
+            center, side = _start_home_columns(items)
+        # `title=None` drops the modal header AND its x; `footer=None` drops Bootstrap's
+        # default Dismiss. Together with easy_close=False that is a dialog with no exit,
+        # which is the point under the gate and wrong the moment there is something to go
+        # back to: off the gate a close button rides in the page's own top-right corner.
+        close = ([] if gated
+                 else [ui.input_action_button("welcome_cancel", "×", class_="hype-start-close",
+                                              title="Close")])
+        ui.modal_show(ui.modal(
+            ui.tags.style(_START_MODAL_CSS),
+            ui.div(rail, center, side, *close,
+                   class_="hype-start" + (" is-examples" if view == "examples" else "")),
             title=None,
-            footer=(None if gated
-                    else ui.input_action_button("welcome_cancel", "Cancel")),
+            footer=None,
             easy_close=not gated))
 
     @reactive.effect
@@ -12991,6 +13196,373 @@ def server(input, output, session):
         # so its counter resets to 0 each time and an event binding would miss the second click.
         if _clicked_dynamic("welcome_cancel"):
             ui.modal_remove()
+
+    @reactive.effect
+    @reactive.event(input.start_examples)   # nonce: never ignore_init
+    def _start_examples_open():
+        _show_welcome("examples")
+
+    @reactive.effect
+    @reactive.event(input.start_back)       # nonce: never ignore_init
+    def _start_back():
+        _show_welcome("home")
+
+    @reactive.effect
+    @reactive.event(input.welcome_reveal)   # nonce: never ignore_init
+    def _welcome_reveal():
+        """Featured card's Show in folder (desktop): select the main .hype in Explorer. The
+        server IS the user's machine in desktop mode, so a local process is the right tool."""
+        msg = input.welcome_reveal() or {}
+        try:
+            it = _welcome["recents"][int(msg.get("i"))]
+        except (TypeError, ValueError, IndexError):
+            return
+        p = Path(it["path"])
+        if not p.exists():
+            ui.notification_show("That project file is no longer there.", type="warning",
+                                 duration=6)
+            return
+        try:
+            if os.name == "nt":
+                subprocess.Popen(["explorer", "/select,", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p.parent)])
+        except OSError:
+            ui.notification_show("Could not open the folder.", type="warning", duration=6)
+
+    # ---- Example projects (the start page's second view) --------------------------------
+    # The catalog + thumbnails ship inside the app (hype_app/data/examples.json, www/examples/);
+    # the bundles are GitHub release assets fetched on demand into the per-user cache
+    # (examples.cache_dir()). Opening a downloaded example IS the existing import path:
+    # desktop -> _import_bundle_to (folder-clash gate, restore, adopt, rehydrate, main file,
+    # recents); cloud -> _apply_project. Nothing here knows about the workspace beyond that.
+    #
+    # The two dynamic columns are OUTPUTS inside the modal (start_gallery / start_detail /
+    # start_dl_status) rather than markup rebuilt by _show_welcome, so picking a tile or a
+    # download tick re-renders a column, never the whole dialog. They register with
+    # suspend_when_hidden=False like every other late-bound modal output (the USGS lesson).
+    if not runmode.IS_DESKTOP:
+        # A container's home may be read-only and nothing there should outlive the session.
+        examples_mod.set_cache_dir(Path(tempfile.gettempdir()) / "hype_examples")
+    _start_sel = reactive.value("")          # selected example id (examples view)
+    _start_ver = reactive.value(0)           # bump: re-render gallery + detail
+    _example_target: dict = {}               # id -> chosen Save-to main file (desktop)
+    _example_prog: dict = {"id": "", "done": 0, "total": 0, "t0": 0.0}
+    _example_cancel = threading.Event()
+    example_tick = reactive.value(0)
+    _example_err: dict = {}                  # id -> last error message (shown in the detail)
+
+    def _examples_catalog() -> list:
+        return examples_mod.load_catalog(app_version=APP_VERSION, desktop=runmode.IS_DESKTOP)
+
+    def _example_by_id(ex_id: str):
+        for ex in _examples_catalog():
+            if ex.id == ex_id:
+                return ex
+        return None
+
+    def _example_default_target(ex) -> Path:
+        """<last project's parent>/<stem>/<stem>.hype: the picker's own initial folder, so the
+        example lands next to the user's other projects."""
+        return Path(_pick_initial_dir()) / ex.stem / f"{ex.stem}.hype"
+
+    def _example_target_for(ex) -> Path:
+        t = _example_target.get(ex.id)
+        return Path(t) if t else _example_default_target(ex)
+
+    def _start_examples_columns(catalog: list, example: str | None):
+        """Center (gallery) + right (detail) of the examples view: two outputs."""
+        sel = example if any(e.id == example for e in catalog) else (catalog[0].id if catalog else "")
+        _start_sel.set(sel)
+        center = ui.div(
+            ui.div(ui.tags.button("‹ Back", type="button", class_="hype-start-link hype-start-back",
+                                  onclick=_nonce_js("start_back")),
+                   ui.span("Example projects", class_="hype-start-h"),
+                   class_="hype-start-main-head"),
+            ui.p("Finished sites you can download one at a time and open with their results, "
+                 "to explore before you build your own.", class_="hype-start-lead"),
+            ui.output_ui("start_gallery"),
+            class_="hype-start-main hype-start-gallery-col")
+        side = ui.div(ui.output_ui("start_detail"), class_="hype-start-side hype-start-detail-col")
+        return center, side
+
+    def _example_tile(i: int, ex, selected: bool):
+        chips = [ui.span(t, class_="hype-gallery-tag") for t in ex.tags[:4]]
+        cached = examples_mod.is_cached(ex)
+        return ui.tags.button(
+            ui.div(ui.tags.img(src=_asset(ex.thumbnail), alt="", loading="lazy"),
+                   class_="hype-gallery-thumb"),
+            ui.div(ui.div(ex.title, class_="hype-gallery-title"),
+                   ui.div(ex.description, class_="hype-gallery-desc"),
+                   ui.div(*chips,
+                          ui.span("Downloaded" if cached else ex.size_display,
+                                  class_="hype-gallery-size" + (" is-cached" if cached else "")),
+                          class_="hype-gallery-tags"),
+                   class_="hype-gallery-body"),
+            type="button", class_="hype-gallery-tile" + (" is-sel" if selected else ""),
+            title=ex.title, **{"data-id": ex.id},
+            onclick=_nonce_js("start_pick", i=i))     # index into the catalog, never a path
+
+    @output(suspend_when_hidden=False)
+    @render.ui
+    def start_gallery():
+        _ = _start_ver()
+        sel = _start_sel()
+        catalog = _examples_catalog()
+        if not catalog:
+            return ui.p("No example projects are available in this build.",
+                        class_="hype-start-empty")
+        return ui.div(*[_example_tile(i, ex, ex.id == sel) for i, ex in enumerate(catalog)],
+                      class_="hype-gallery-grid")
+
+    @output(suspend_when_hidden=False)
+    @render.ui
+    def start_detail():
+        _ = _start_ver()
+        ex = _example_by_id(_start_sel())
+        if ex is None:
+            return None
+        cached = examples_mod.is_cached(ex)
+        partial = examples_mod.part_path(ex).exists()
+        meta = [ui.span(ex.size_display, class_="hype-gallery-size"),
+                *[ui.span(t, class_="hype-gallery-tag") for t in ex.tags]]
+        rows = [
+            ui.div(ui.tags.img(src=_asset(ex.thumbnail), alt=""), class_="hype-gallery-hero"),
+            ui.div(ex.title, class_="hype-start-h hype-gallery-dtitle"),
+            ui.p(ex.description, class_="hype-gallery-ddesc"),
+            ui.div(*meta, class_="hype-gallery-tags"),
+        ]
+        if ex.credit:
+            rows.append(ui.div(ex.credit, class_="hype-gallery-credit"))
+        if ex.published:
+            rows.append(ui.div(f"Published {ex.published}", class_="hype-gallery-credit"))
+        if runmode.IS_DESKTOP:
+            target = _example_target_for(ex)
+            rows.append(ui.div(
+                ui.div("Save to", class_="hype-gallery-k"),
+                ui.div(str(target.parent), class_="hype-gallery-path", title=str(target)),
+                ui.tags.button("Change…", type="button", class_="hype-start-link",
+                               onclick=_nonce_js("start_change_target")),
+                class_="hype-gallery-target"))
+        else:
+            rows.append(ui.div("Opens in this session. Save it as a .hype file to keep it.",
+                               class_="hype-gallery-credit"))
+        err = _example_err.get(ex.id)
+        if err:
+            rows.append(ui.div(err, class_="hype-gallery-err"))
+        rows.append(ui.output_ui("start_dl_status"))
+        if cached:
+            primary = ui.tags.button("Open example", type="button", class_="btn btn-primary",
+                                     onclick=_nonce_js("start_open"))
+            secondary = [ui.tags.button("Remove download", type="button",
+                                        class_="btn btn-outline-secondary",
+                                        onclick=_nonce_js("start_remove"))]
+        else:
+            label = "Resume download and open" if partial else "Download and open"
+            primary = ui.tags.button(label, type="button", class_="btn btn-primary",
+                                     onclick=_nonce_js("start_open"))
+            secondary = []
+        rows.append(ui.div(primary, *secondary, class_="hype-gallery-actions"))
+        return ui.div(*rows, class_="hype-gallery-detail")
+
+    def _on_example_progress(done: int, total: int):
+        # Worker-thread writer; the poller mirrors it into example_tick (plain dict only).
+        _example_prog["done"] = int(done)
+        _example_prog["total"] = int(total)
+
+    @reactive.extended_task
+    async def example_task(payload: dict) -> dict:
+        ex = payload["example"]
+
+        def _work():
+            p = examples_mod.fetch(ex, progress=_on_example_progress, cancel=_example_cancel)
+            return {"id": ex.id, "path": str(p)}
+        return await anyio.to_thread.run_sync(_work)
+
+    @reactive.effect
+    def _example_poll():
+        if example_task.status() != "running":
+            return
+        reactive.invalidate_later(0.5)
+        example_tick.set(int(_example_prog["done"]) // 4096 * 7 + int(time.monotonic() * 2))
+
+    @output(suspend_when_hidden=False)
+    @render.ui
+    def start_dl_status():
+        if example_task.status() != "running":
+            return None
+        _ = example_tick()
+        if _example_prog["id"] != _start_sel():
+            return ui.div("Another example is downloading.", class_="hype-gallery-credit")
+        done, total = _example_prog["done"], _example_prog["total"]
+        pct = int(round(100.0 * done / total)) if total else 0
+        line = (f"{examples_mod.human_size(done)} of {examples_mod.human_size(total)}"
+                if total else "Starting the download")
+        return ui.div(
+            ui.div(ui.div(class_="hype-spinner"), ui.span(line), class_="hype-busy"),
+            ui.div(ui.div(class_="hype-prog-bar", style=f"width:{pct}%;"), class_="hype-prog"),
+            ui.input_action_button("start_dl_cancel", "Cancel", class_="btn-sm"),
+            class_="hype-gallery-progress")
+
+    @reactive.effect
+    def _start_dl_cancel():
+        if _clicked_dynamic("start_dl_cancel"):
+            _example_cancel.set()          # cooperative: checked per chunk; keeps the .part
+
+    @reactive.effect
+    @reactive.event(input.start_pick)      # nonce: never ignore_init
+    def _start_pick():
+        msg = input.start_pick() or {}
+        try:
+            ex = _examples_catalog()[int(msg.get("i"))]
+        except (TypeError, ValueError, IndexError):
+            return
+        _welcome["example"] = ex.id
+        _start_sel.set(ex.id)
+
+    @reactive.effect
+    @reactive.event(input.start_change_target)   # nonce: never ignore_init
+    async def _start_change_target():
+        ex = _example_by_id(_start_sel())
+        if ex is None or not runmode.IS_DESKTOP:
+            return
+        _welcome["example"] = ex.id
+        await _pick_path("example_target", save=True, file_name=f"{ex.stem}.hype")
+
+    @reactive.effect
+    @reactive.event(input.start_remove)    # nonce: never ignore_init
+    def _start_remove():
+        ex = _example_by_id(_start_sel())
+        if ex is None:
+            return
+        if example_task.status() == "running" and _example_prog["id"] == ex.id:
+            ui.notification_show("Cancel the download first.", type="warning", duration=5)
+            return
+        examples_mod.remove(ex)
+        _example_err.pop(ex.id, None)
+        _start_ver.set(_start_ver() + 1)
+
+    @reactive.effect
+    @reactive.event(input.start_open)      # nonce: never ignore_init
+    async def _start_open():
+        """Download and open / Open example. Cached -> open now; else start the download
+        (the done handler opens it). Cloud with a project open confirms first: opening
+        replaces the whole session there, exactly like Open."""
+        ex = _example_by_id(_start_sel())
+        if ex is None:
+            return
+        if _busy_tasks():
+            ui.notification_show("A task is still running. Wait for it to finish (or cancel "
+                                 "it) before opening an example.", type="warning", duration=6)
+            return
+        if example_task.status() == "running":
+            ui.notification_show("A download is already in progress.", type="warning",
+                                 duration=5)
+            return
+        if not runmode.IS_DESKTOP and not _gated():
+            _pending_pick["example_confirm"] = ex.id
+            ui.modal_show(ui.modal(
+                ui.p(f"Opening {ex.title} replaces everything in the current session. Save or "
+                     "download your project first if you want to keep it."),
+                title="Open example project?",
+                footer=ui.TagList(
+                    ui.input_action_button("example_confirm_cancel", "Cancel"),
+                    ui.input_action_button("example_confirm_go", "Open example",
+                                           class_="btn-danger")),
+                easy_close=True))
+            return
+        await _example_go(ex)
+
+    @reactive.effect
+    def _example_confirm_cancel():
+        if _clicked_dynamic("example_confirm_cancel"):
+            ui.modal_remove()
+            _pending_pick.pop("example_confirm", None)
+            _show_welcome("examples", example=_welcome.get("example"))
+
+    @reactive.effect
+    async def _example_confirm_go():
+        if not _clicked_dynamic("example_confirm_go"):
+            return
+        ex = _example_by_id(str(_pending_pick.pop("example_confirm", "") or ""))
+        ui.modal_remove()
+        if ex is None:
+            _ensure_welcome()
+            return
+        _show_welcome("examples", example=ex.id)   # back on the page: progress renders there
+        await _example_go(ex)
+
+    async def _example_go(ex):
+        _example_err.pop(ex.id, None)
+        if examples_mod.is_cached(ex):
+            await _example_open(ex)
+            return
+        _example_cancel.clear()
+        _example_prog.update({"id": ex.id, "done": 0, "total": ex.size_bytes,
+                              "t0": time.monotonic()})
+        _task_armed["example"] = True
+        _start_ver.set(_start_ver() + 1)
+        example_task({"example": ex})
+
+    @reactive.effect
+    async def _example_done():
+        if example_task.status() in ("initial", "running", "cancelled"):
+            return
+        if not _task_armed["example"]:
+            return
+        _task_armed["example"] = False
+        ex_id = _example_prog.get("id") or ""
+        ex = _example_by_id(ex_id)
+        try:
+            out = example_task.result()
+        except examples_mod.ExampleCancelled:
+            ui.notification_show("Download cancelled. It resumes where it stopped.", duration=5)
+            _start_ver.set(_start_ver() + 1)
+            return
+        except examples_mod.ExampleError as e:
+            _example_err[ex_id] = str(e)
+            _start_ver.set(_start_ver() + 1)
+            return
+        except Exception as e:  # noqa: BLE001 — a failed download must never kill the session
+            _example_err[ex_id] = f"Download failed: {e}"
+            _start_ver.set(_start_ver() + 1)
+            return
+        _start_ver.set(_start_ver() + 1)
+        if ex is None or out.get("id") != ex.id:
+            return
+        await _example_open(ex)
+
+    async def _example_open(ex):
+        """Open the cached bundle: desktop imports it into the chosen project folder (the
+        clash modal / Create subfolder / Use anyway re-enter _import_bundle_to with the src
+        stashed, exactly like a portable-file import); cloud applies it to the session."""
+        src = examples_mod.cached_path(ex)
+        if not src.is_file():
+            _example_err[ex.id] = "The downloaded file is missing. Download it again."
+            _start_ver.set(_start_ver() + 1)
+            return
+        if _busy_tasks():
+            ui.notification_show("A task is still running. Wait for it to finish (or cancel "
+                                 "it) before opening an example.", type="warning", duration=6)
+            return
+        ui.modal_remove()
+        try:
+            if runmode.IS_DESKTOP:
+                _pending_import["src"] = str(src)
+                await _import_bundle_to(_example_target_for(ex))
+            else:
+                ui.notification_show("Opening example…", duration=None, id="open_prog")
+                try:
+                    await _apply_project(str(src), fallback_name=ex.title)
+                    ui.notification_show(f"Opened {ex.title}.", duration=6)
+                finally:
+                    ui.notification_remove("open_prog")
+        except bundle.ProjectError as e:
+            ui.notification_show(str(e), type="error", duration=10)
+            _ensure_welcome()
+        except Exception as e:  # noqa: BLE001 — a failed open must never kill the session
+            ui.notification_show(f"Couldn't open the example: {e}", type="error", duration=10)
+            _ensure_welcome()
 
     # ---- What's new: the changelog behind every version number -------------------------
     # Opened by clicking the version wherever it appears (header chip, welcome splash,
@@ -13172,12 +13744,16 @@ def server(input, output, session):
     _welcome_shown: dict = {}
 
     @reactive.effect
+    @reactive.event(input.hype_map_ready)   # nonce from map_bounds.js: never ignore_init
     def _welcome_gate():
-        # One-shot per session. A reconnect is a fresh server session in Shiny, so every
-        # real page load re-gates (including a mid-work reload that lost the project); it
-        # can never pop over a live project — nothing returns the gate condition to True
-        # without immediately presenting the next dialog itself (cloud New resets straight
-        # into the name dialog).
+        # One-shot per session, fired by the client's map-ready ping (www/map_bounds.js posts
+        # it once the main Leaflet map is in the DOM, or 6 s after connect as a fallback), so
+        # the start page lands over a painted map rather than in the first flush over a blank
+        # one; the boot veil covers the gap, so nothing is clickable before it. A reconnect is
+        # a fresh server session in Shiny, so every real page load re-gates (including a
+        # mid-work reload that lost the project); it can never pop over a live project —
+        # nothing returns the gate condition to True without immediately presenting the next
+        # dialog itself (cloud New resets straight into the name dialog).
         if _welcome_shown.get("done"):
             return
         _welcome_shown["done"] = True
@@ -13313,7 +13889,8 @@ def server(input, output, session):
             _pending_pick["purpose"] = purpose
             _pick_flight["purpose"] = purpose
             titles = {"new_project": "New HYPE Project", "import_target":
-                      "Import Project To", "save_as": "Save Project As"}
+                      "Import Project To", "save_as": "Save Project As",
+                      "example_target": "Save Example Project To"}
             payload = {"mode": "save" if save else "open", "purpose": purpose,
                        "title": titles.get(purpose, "Open HYPE Project"),
                        "initial_file": (file_name or "Project1.hype") if save else "",
@@ -13449,6 +14026,9 @@ def server(input, output, session):
     def _dev_pick_cancel():
         if _clicked_dynamic("dev_pick_cancel"):
             ui.modal_remove()
+            if str(_pending_pick.get("purpose") or "") == "example_target":
+                _show_welcome("examples", example=_welcome.get("example"))
+                return
             _ensure_welcome()
 
     @reactive.effect
@@ -13462,6 +14042,9 @@ def server(input, output, session):
             known_stem = Path(_ws["project_file"]).stem
         elif purpose == "import_target" and _pending_import.get("src"):
             known_stem = Path(str(_pending_import["src"])).stem
+        elif purpose == "example_target":
+            ex = _example_by_id(str(_welcome.get("example") or ""))
+            known_stem = ex.stem if ex else None
         target, err = pathpick.interpret_typed_target(raw, purpose=purpose,
                                                       known_stem=known_stem)
         ui.modal_remove()
@@ -13545,6 +14128,13 @@ def server(input, output, session):
                 await _import_bundle_to(p)
             elif purpose == "save_as":
                 await _save_as_project(p)
+            elif purpose == "example_target":
+                # Store-only: the example detail's Save-to. Nothing is written until the
+                # user clicks Download and open / Open example.
+                ex_id = str(_welcome.get("example") or "")
+                if ex_id:
+                    _example_target[ex_id] = str(pathpick.ensure_hype_suffix(p))
+                _show_welcome("examples", example=ex_id or None)
         except bundle.ProjectError as e:
             ui.notification_show(str(e), type="error", duration=10)
             _ensure_welcome()

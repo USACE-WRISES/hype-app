@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "examples": [
+    {
+      "id": "SS01208",
+      "title": "San Saba River, SS01208",
+      "description": "A small, steep Hill Country stream: 35 cfs across a 48 ft wide channel with a 1 percent water-surface slope and a gravel bed (K about 173 ft/d). Five monitoring wells sit inside the bend. A quick tour of every stage, from reach and terrain through the groundwater model, the hyporheic zone and the site report.",
+      "tags": [
+        "Texas",
+        "San Saba",
+        "small stream",
+        "steep",
+        "wells"
+      ],
+      "size_bytes": 16747993,
+      "sha256": "ab0cce108fa35fed2d19f0e201a5c963fd5e8d2681ae488f5a65878acbc1116b",
+      "url": "https://github.com/USACE-WRISES/hype-app/releases/download/examples-1/SS01208.hype",
+      "thumbnail": "examples/SS01208.jpg",
+      "published": "2026-08-18",
+      "format_version": 2,
+      "min_app_version": "",
+      "desktop_only": false,
+      "credit": "USACE ERDC and Texas site data, 2021 field campaign"
+    },
+    {
+      "id": "CR07230",
+      "title": "Colorado River, CR07230",
+      "description": "A wide, low-gradient river reach: 341 cfs across a 230 ft wide channel with a 0.1 percent water-surface slope and a sandy bed (K about 111 ft/d). Five monitoring wells along the bank. Compare it with the San Saba example to see how width, slope and bed material change the hyporheic exchange.",
+      "tags": [
+        "Texas",
+        "Colorado River",
+        "large river",
+        "low gradient",
+        "wells"
+      ],
+      "size_bytes": 14954567,
+      "sha256": "5f591b888c836ef8dfd0702b88bf49f999d18dfd9b461a822cbc4510a8bb394b",
+      "url": "https://github.com/USACE-WRISES/hype-app/releases/download/examples-1/CR07230.hype",
+      "thumbnail": "examples/CR07230.jpg",
+      "published": "2026-08-18",
+      "format_version": 2,
+      "min_app_version": "",
+      "desktop_only": false,
+      "credit": "USACE ERDC and Texas site data, 2021 field campaign"
+    }
+  ]
+}

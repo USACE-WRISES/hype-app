@@ -50,6 +50,11 @@
     }
     if (!el.closest || !el.closest("#map")) return;   // a modal map — never bind
     window.__hypeMap = map;
+    // The main map exists in the DOM: this is "the map view is up". Reveal the app behind
+    // the boot veil on the next paint and tell the server, which opens the start page.
+    map.whenReady(function () {
+      requestAnimationFrame(function () { bootReady(); });
+    });
     map.on("moveend zoomend", function () { report(map); });
     report(map);
     guardVectors(map);
@@ -101,6 +106,38 @@
     }
     window.L.Evented.prototype.fire = orig;
   }
+
+  // ---- boot veil + map-ready ping ---------------------------------------------------------
+  // #hype-boot covers the shell from the first byte. It lifts once the main map is in the DOM
+  // (attach() above) or, failing that, 6 s after Shiny connects, so a widget that never comes
+  // up cannot trap the user behind a spinner. Either way the server hears `hype_map_ready`
+  // exactly once, and opens the start page off it (app.py _welcome_gate).
+  var bootDone = false;
+  function bootReady() {
+    if (bootDone) return;
+    bootDone = true;
+    var veil = document.getElementById("hype-boot");
+    if (veil) {
+      veil.classList.add("is-done");                       // opacity transition (CSS)
+      setTimeout(function () { veil.hidden = true; }, 320);
+    }
+    var post = function () {
+      if (window.Shiny && window.Shiny.setInputValue) {
+        window.Shiny.setInputValue("hype_map_ready", Date.now(), {priority: "event"});
+        return true;
+      }
+      return false;
+    };
+    if (!post()) {                                         // Shiny not up yet: retry briefly
+      var n = 0;
+      var r = setInterval(function () { if (post() || ++n > 50) clearInterval(r); }, 100);
+    }
+  }
+  window.__hypeBootReady = bootReady;                      // E2E + manual escape hatch
+  document.addEventListener("shiny:connected", function () { setTimeout(bootReady, 6000); });
+  // Belt and braces: a page that never connects at all (server down) still lifts the veil,
+  // so Shiny's own grey disconnect overlay is what the user sees, not ours.
+  setTimeout(bootReady, 15000);
 
   var hooked = false;
   var tries = 0;

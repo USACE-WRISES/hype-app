@@ -1,11 +1,12 @@
 """Versioning + shipped changelog ("What's new").
 
 CHANGELOG.md at the repo root is the single source of release notes: rendered in-app by
-the What's new dialog (opened by clicking the version number in the header chip, the
-welcome splash, or the About footer), shipped inside the desktop apps payload via the
-git-archive pathspec, and mirrored onto the GitHub v* release body by the shell workflow.
-These tests pin the file's format, the version lockstep (app.py / csproj / changelog),
-the ship wires, and the app wiring.
+the What's new dialog (opened by clicking the version number in the header chip or the About
+footer), listed release by release in the start page's What's new column (hype_app/changelog.py
+is the one parser), shipped inside the desktop apps payload via the git-archive pathspec, and
+mirrored onto the GitHub v* release body by the shell workflow. These tests pin the file's
+format, the parser, the version lockstep (app.py / csproj / changelog), the ship wires, and the
+app wiring.
 """
 from __future__ import annotations
 
@@ -13,11 +14,13 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from hype_app import changelog
+
 ROOT = Path(__file__).resolve().parents[1]
 APP_SRC = (ROOT / "app.py").read_text(encoding="utf-8")
 CHANGELOG = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-SECTION_RE = re.compile(r"^## v(\d+\.\d+\.\d+) \((\d{4}-\d{2}-\d{2})\)$", re.MULTILINE)
+SECTION_RE = changelog.SECTION_RE      # the app's own parser regex, not a private copy
 
 
 def _app_version() -> str:
@@ -44,6 +47,23 @@ def test_changelog_sections_format_and_order():
 def test_changelog_top_section_is_app_version():
     # The release runbook bumps APP_VERSION and writes the matching section together.
     assert SECTION_RE.search(CHANGELOG).group(1) == _app_version()
+
+
+def test_parser_reads_every_section_with_its_bullets():
+    rels = changelog.parse(CHANGELOG)
+    assert [r.version for r in rels] == [v for v, _ in SECTION_RE.findall(CHANGELOG)]
+    assert all(r.bullets for r in rels), "every release lists at least one bullet"
+    top = rels[0]
+    assert top.label == f"v{_app_version()}"
+    datetime.strptime(top.date, "%Y-%m-%d")
+    assert re.match(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}$", top.date_display)
+    # continuation lines fold into the bullet above; prose between bullets is ignored
+    md = "# Changelog\n\n## v9.9.9 (2026-01-02)\n- first line\n  continues here\nstray prose\n- second\n"
+    (r,) = changelog.parse(md)
+    assert r.bullets == ("first line continues here", "second")
+    assert changelog.plain("**Bold** and `code`") == "Bold and code"
+    assert changelog.load() == rels          # the file beside app.py IS the repo file
+    assert changelog.load(ROOT / "nope.md") == []
 
 
 def test_changelog_is_clean_user_copy():
@@ -95,16 +115,24 @@ def test_whatsnew_event_and_entry_points():
     # nonce event input: ignore_init would eat the first click (the 2026-07-25 lesson)
     m = re.search(r"@reactive\.event\(input\.whatsnew_evt[^)]*\)", APP_SRC)
     assert m and "ignore_init" not in m.group(0)
-    # two inline version-number doors (header chip + welcome splash) ...
-    assert APP_SRC.count("Shiny.setInputValue('whatsnew_evt'") == 2
+    # ONE inline version-number door (the header chip): the start page lists every release
+    # inline in its What's new column, so it needs no door of its own ...
+    assert APP_SRC.count("Shiny.setInputValue('whatsnew_evt'") == 1
     # ... plus the About-footer button, click-guarded for the rebuilt-modal counter reset
     assert '_clicked_dynamic("about_whatsnew")' in APP_SRC
 
 
+def test_start_page_lists_releases_from_the_parser():
+    # The right column renders changelog.load(): date, version chip, plain-text bullets.
+    body = APP_SRC[APP_SRC.index("def _start_home_columns("):APP_SRC.index("def _show_welcome(")]
+    assert "changelog.load()" in body
+    assert "r.date_display" in body and "r.label" in body and "changelog.plain(b)" in body
+
+
 def test_whatsnew_close_funnels_back_to_the_gate():
-    # Opening What's new from the welcome splash replaces the startup gate (one modal at
-    # a time), so Close must funnel back through _ensure_welcome, and easy_close must stay
-    # off while gated so Esc/backdrop cannot strand a project-less session dialog-less.
+    # Opening What's new while gated (About footer, header chip) replaces the startup gate
+    # (one modal at a time), so Close must funnel back through _ensure_welcome, and
+    # easy_close must stay off while gated so Esc/backdrop cannot strand a session.
     m = re.search(r'if _clicked_dynamic\("whatsnew_close"\):\s*\n'
                   r"\s*ui\.modal_remove\(\)\s*\n"
                   r"\s*_ensure_welcome\(\)", APP_SRC)

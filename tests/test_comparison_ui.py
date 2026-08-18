@@ -19,7 +19,7 @@ def _slice(start: str, end: str) -> str:
 
 
 WORKSPACE = _slice("# ---- Cross-project comparison workspace",
-                   "async def _open_dialog():")
+                   "async def _start_dialog():")
 LAUNCHER = _slice("# ---- Cross-Site Comparison (desktop only)",
                   "def _pane_chanmod():")
 
@@ -100,7 +100,10 @@ class TestThePickers:
 
 class TestTheDoors:
     def test_welcome_gains_open_comparison_desktop_only(self):
-        i = SRC.index('_evt_btn("welcome_compare", "Open Comparison"')
+        # The start page's rail carries "Open a comparison" as a quiet link (v1.0.5), still
+        # desktop-only: comparisons need file access, and must not require an open project.
+        i = SRC.index('ui.tags.button("Open a comparison"')
+        assert '_nonce_js("welcome_compare")' in SRC[i:i + 300]
         assert "if runmode.IS_DESKTOP else []" in SRC[i:i + 300]
 
     def test_the_hub_row_is_bespoke_and_desktop_gated(self):
