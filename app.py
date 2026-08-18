@@ -166,7 +166,11 @@ ISSUES_URL = "https://github.com/USACE-WRISES/hype-app/issues"   # start page: R
 # the report modal does, instead of globally in styles.css where it would resize every size="xl"
 # dialog. Three columns need the width; the fixed height lets each column scroll on its own.
 _START_MODAL_CSS = (
-    "#shiny-modal .modal-dialog{max-width:min(1180px,94vw);width:94vw;margin:1rem auto}"
+    # The dialog is a flex row that fills the viewport height minus its margins, so the fixed-
+    # height page sits vertically CENTERED (Bootstrap's own .modal-dialog-centered recipe) rather
+    # than pinned to the top with a dead band under it on tall windows.
+    "#shiny-modal .modal-dialog{max-width:min(1180px,94vw);width:94vw;margin:1rem auto;"
+    "display:flex;align-items:center;min-height:calc(100% - 2rem)}"
     "#shiny-modal .modal-content{height:min(720px,calc(100vh - 2rem));"
     "max-height:calc(100vh - 2rem);overflow:hidden;display:flex;flex-direction:column;"
     "border-radius:12px;border:0}"
