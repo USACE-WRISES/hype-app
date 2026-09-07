@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use HYPE in your work, please cite it as below."
+title: "HYPE: Hyporheic Exchange Explorer"
+type: software
+version: 1.2.0
+date-released: 2026-09-07
+repository-code: "https://github.com/USACE-WRISES/hype-app"
+abstract: "A Windows desktop application for reach-scale surface water and groundwater interaction modeling. From a reach picked on a map it builds and runs a HEC-RAS 2025 2D water surface, a MODFLOW 6 and MODPATH 7 groundwater model and a hyporheic-zone delineation, then produces the site reports and the ecological function screening that follow."
+authors:
+  - family-names: Menichino
+    given-names: Garrett T.
+    orcid: "https://orcid.org/0009-0005-6719-6356"
+    affiliation: "Environmental Laboratory, U.S. Army Engineer Research and Development Center"
+keywords:
+  - hyporheic exchange
+  - hyporheic zone
+  - groundwater
+  - surface water
+  - MODFLOW 6
+  - MODPATH 7
+  - HEC-RAS
