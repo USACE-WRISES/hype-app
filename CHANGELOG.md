@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.1 (2026-09-08)
+- Fixed: a transport run could hang for minutes after solving, then fail while writing its results.
+- Fixed: the transport size warning and the particle count read the whole grid box instead of the cells the model solves.
+- Injection points are one row each: name, screen elevation, type, value and duration in labelled columns.
+- A screen elevation can be set back to the water table from the injection points and observation wells tables.
+
 ## v1.2.0 (2026-09-07)
 - Transport Modeling: solute transport models (MODFLOW 6 GWT) run on the finished groundwater solution and save with the project.
 - New transport model: start from a species preset or blank; reaction, sorption and mobile-immobile transfer are independent choices.
