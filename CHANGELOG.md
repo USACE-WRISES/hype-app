@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.2.2 (2026-09-09)
+- Breakthrough curves are a live chart: hover to read the concentration at any day, and copy or save the still image.
+- Observation wells are one row per well: name, screen elevation, observed, computed and residual in labelled columns.
+
 ## v1.2.1 (2026-09-08)
 - Fixed: a transport run could hang for minutes after solving, then fail while writing its results.
 - Fixed: the transport size warning and the particle count read the whole grid box instead of the cells the model solves.
