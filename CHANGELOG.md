@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.3.0 (2026-09-14)
+- Heat transport: a temperature model runs through MODFLOW 6 GWE with a daily stream swing; temperature maps, curves and an energy budget.
+- Temperatures show in Fahrenheit under US Customary units.
+- Transport results open on the maximum over the run, each column's peak over every layer and step; untick the box for a layer and a step.
+- Heat: the preset row and a new heat model are named Heat; a heat model row has a checkbox that shows or hides its temperature map.
+- Concentration and temperature maps play through their saved steps, on the map and in the 3-D view, with a Play button and a speed slider.
+- The 3-D view shows a transport result as a slice at its layer's depth or as the cells above a cutoff, colored as on the map.
+- Mass and energy budgets by flow path: mass in and removed, or buffering, lag and mean shift, along each exchange class.
+- Habitat by flow path: streambed area, footprint and saturated volume per class, an optional depth filter, and a water-table map.
+- Habitat: the streambed card shows the hyporheic volume, equivalent active depth and P90 path depth, and follows the depth filter.
+- The Hyporheic Function Screening and its report are retired; its cited rates now seed the transport presets.
+- New model: fewer preset rows, each with species options (Salt, Bromide, Chloride; Zinc, Cobalt, Nickel) and cited rates.
+- Tree: Transport & Functions holds Transport Modeling and Habitat; a project saved on a screening row reopens on Transport Modeling.
+- The Hydraulics Report is now the Hyporheic Hydraulics Report, named for what it covers.
+- Breakthrough curves: the chart fills the pane, the wells list is the legend and readout, and Copy and Save export exactly what you see.
+- Zoom and pan the breakthrough chart: wheel to zoom, drag a box, Shift-drag to pan, double-click to reset; image exports follow the view.
+- Place an observation well on the map from the breakthrough curves pane, at the water table, without leaving it.
+- A finished run leaves the map layers as they were; only a stage's first result turns on one layer, and that is saved with the project.
+- Fixed: changing the saved time steps with a changed color range could kill the server.
+- Fixed: the 3-D view could come up blank on its first visit until Reset view and Fit.
+- Fixed: the breakthrough Data view left the chart showing, and tick labels on a 2.5 step dropped their decimal (2.5 read as 2).
+- Fixed: reopening a project reads the particle tracking from its folder, not an older copy saved in the project file.
+
 ## v1.2.2 (2026-09-09)
 - Breakthrough curves are a live chart: hover to read the concentration at any day, and copy or save the still image.
 - Observation wells are one row per well: name, screen elevation, observed, computed and residual in labelled columns.
