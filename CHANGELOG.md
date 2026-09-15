@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.3.2 (2026-09-15)
+- Minor visual updates to the workflow.
+
 ## v1.3.1 (2026-09-15)
 - Minor bug fixes for visualization: the step animation, its color range and the Concentration pane.
 - The splash and start screens say what HYPE models, Surface Water/Groundwater Interaction Modeling, in place of the name's expansion.
