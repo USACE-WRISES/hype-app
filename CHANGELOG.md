@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.3.1 (2026-09-15)
+- Minor bug fixes for visualization: the step animation, its color range and the Concentration pane.
+- The splash and start screens say what HYPE models, Surface Water/Groundwater Interaction Modeling, in place of the name's expansion.
+
 ## v1.3.0 (2026-09-14)
 - Heat transport: a temperature model runs through MODFLOW 6 GWE with a daily stream swing; temperature maps, curves and an energy budget.
 - Temperatures show in Fahrenheit under US Customary units.
