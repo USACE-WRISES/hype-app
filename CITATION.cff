@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use HYPE in your work, please cite it as below."
 title: "HYPE: Hyporheic Exchange Explorer"
 type: software
-version: 1.3.2
-date-released: 2026-09-15
+version: 1.3.3
+date-released: 2026-09-17
 repository-code: "https://github.com/USACE-WRISES/hype-app"
 abstract: "A Windows desktop application for reach-scale surface water and groundwater interaction modeling. From a reach picked on a map it builds and runs a HEC-RAS 2025 2D water surface, a MODFLOW 6 and MODPATH 7 groundwater model and a hyporheic-zone delineation, then runs solute and heat transport on the groundwater solution and produces the site reports that follow."
 authors:

@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.3.3 (2026-09-17)
+- Channel: draw a centerline, or copy the main reach or a tributary, and carve a channel through cross-sections.
+- Sections land where the flat LiDAR water surface changes width; with no flat surface only the two ends are placed.
+- Each channel has its own row: click a section, drag its end points, set its depth or bed elevation and its slopes.
+- Each section's upstream slope sets its bed from the section above; the reach slope, first to last, feeds Manning's.
+- A cross-section plot shows the existing ground, the carved shape and the water surface at the design flow.
+- Capacity, depth, velocity and average depth come from Manning's equation; Set depth from flow sizes a section to the flow.
+- Add sections by clicking the reach, remove or regenerate them; the channel is carved between its first and last sections.
+- Every terrain modification has its own row and pane; the Terrain modifications pane lists them in apply order.
+- Edit on map reshapes a modification's own line or polygon without touching the reach; Done keeps, Cancel puts it back.
+- Velocity: the surface run adds a Velocity (raster) row; the Results row animates the modeled flow, RAS Mapper style, in 2D and 3D.
+- Layer panes have Settings and Display tabs: what you are looking at on Settings, how it is drawn on Display.
+- Raster colors: continuous or discrete classes, linear or histogram breaks, preset color ramps, and a Full, View or Manual range.
+- The color scale covers terrain, water surface, depth, head, concentration and temperature, matches in 3-D, and saves with the project.
+- Color scale: the picker on every Display tab shows each color scale as a gradient bar, the current one checked.
+- Surface results: a run shows the water surface and wetted extent only; boxes you set by hand stay as you set them.
+- NAIP imagery now comes from the USGS National Map, since the previous source is no longer reachable.
+- Terrain cross-sections show the water surface while its layer is on, with its elevation and depth under the plot.
+- Smaller changes: selecting Wetted extent no longer starts a drawing, new transport results start collapsed, and NAIP errors show once.
+
 ## v1.3.2 (2026-09-15)
 - Minor visual updates to the workflow.
 
