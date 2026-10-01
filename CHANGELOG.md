@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.0 (2026-10-01)
+- Flow Area: smooth outlines, named boundaries, and conditions along part of a boundary.
+- Groundwater on MODFLOW 6.8.0: a river package under Newton, recharge, seepage, drains, wells and solver settings.
+- Exchange lines feed the groundwater exchange back to the surface model, checked pass by pass.
+- Zone water budgets, a coupling check, and observations scored against the run, with photos.
+- Cross-section panel: the water table, floodplain head gradients, zoom and pan, whole-reach profiles.
+- Channel carving: plots docked under the map, multi-section edits, and Fit with a minimum depth.
+- Undo and redo for every input, map legends, and a 3D view that draws every map layer.
+- Faster particle tracking, terrain imports and project opens, with no map freezes.
+- Examples re-run on the new engine; Example projects now holds Elwha, and 29 Texas calibration sites remain.
+- Desktop: a second launch brings the open window forward; many smaller fixes throughout.
+
 ## v1.3.3 (2026-09-17)
 - Channel: draw a centerline, or copy the main reach or a tributary, and carve a channel through cross-sections.
 - Sections land where the flat LiDAR water surface changes width; with no flat surface only the two ends are placed.
