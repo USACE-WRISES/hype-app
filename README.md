@@ -44,7 +44,7 @@ See [CITATION.cff](CITATION.cff); GitHub shows a "Cite this repository" button b
 
 ## Engines and data
 
-Terrain and streams: USGS 3DEP and NHD. Engines: HEC-RAS 2025 (2D surface water), MODFLOW 6 and
+Terrain and streams: USGS 3DEP and 3DHP. Engines: HEC-RAS 2025 (2D surface water), MODFLOW 6 and
 MODPATH 7 (groundwater and particle tracking). Site data: USGS StreamStats, NRCS soils and NLCD
 land cover services.
 

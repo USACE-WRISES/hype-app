@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.1 (2026-10-02)
+- Streams come from the USGS 3D Hydrography Program (3DHP) as map images from zoom 11, replacing the often unavailable NHDPlus HR.
+- Picks and traces follow 3DHP's stream network: either end can be clicked first, and drawn reaches take their direction from it.
+- The Flow Area is sized by its width alone; the drainage area, the Bankfull depth option and the channel-width box are gone.
+- The Model grid loads in a second or two and no longer blocks the app; its 3D imagery follows and is cached.
+- Smaller changes: the outage notice covers the map images, exports draw 3DHP streams, and Observations say why a well's head is n/a.
+
 ## v1.4.0 (2026-10-01)
 - Flow Area: smooth outlines, named boundaries, and conditions along part of a boundary.
 - Groundwater on MODFLOW 6.8.0: a river package under Newton, recharge, seepage, drains, wells and solver settings.
