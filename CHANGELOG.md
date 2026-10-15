@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.5.0 (2026-10-15)
+- Events: type, paste or generate a hydrograph on a Flow or Stage boundary, and HEC-RAS runs it with start and maximum maps.
+- Groundwater runs through the event: heads, exchange and the water budget at every saved time, and well readings fit over time.
+- One event timeline under the map plays the water surface, depth, velocity, heads and budgets, in 2D and 3D.
+- Particle tracking, solute and heat transport, the land surface, the report and the comparison all run through an event.
+- Two-way coupling replaces the exchange lines: events couple in 2 minute windows, steady runs one pass per click.
+- Two-way runs can be cancelled and continued and say how closely the exchange closed; exchange line projects open One-way.
+- HEC-RAS 2025 build 5048 with two implicit engines, Shallow water and Diffusion wave; the explicit engine is retired.
+- A surface re-run gives build 5048's results: more water through a recession, and inflow placed along the whole Upstream line.
+- Land surface with the river package: seepage drains no longer sit below the river's stage, so steady seepage drops on a re-run.
+- Projects with an event or two-way coupling open only in this version or later; the Elwha example is re-run on build 5048.
+- Many smaller changes: a water budget warning on every run, Base timestep in place of Compute timestep, and undo fixes.
+
 ## v1.4.1 (2026-10-02)
 - Streams come from the USGS 3D Hydrography Program (3DHP) as map images from zoom 11, replacing the often unavailable NHDPlus HR.
 - Picks and traces follow 3DHP's stream network: either end can be clicked first, and drawn reaches take their direction from it.

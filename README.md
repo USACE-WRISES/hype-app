@@ -2,9 +2,9 @@
 
 HYPE is a Windows desktop application for surface water and groundwater interaction modeling.
 From a reach you pick on a map it builds and runs a HEC-RAS 2025 2D water surface, a MODFLOW 6
-and MODPATH 7 groundwater model and a hyporheic-zone delineation, then produces the site reports
-and the ecological function screening that follow. Everything runs and saves on your own
-computer.
+and MODPATH 7 groundwater model and a hyporheic-zone delineation, then runs solute and heat
+transport on the groundwater solution and produces the site reports that follow. Everything runs
+and saves on your own computer.
 
 This repository is the public home of HYPE: the installers and their updates, the example
 projects, the changelog and the issue tracker. Development happens in a separate repository.
@@ -14,7 +14,7 @@ projects, the changelog and the issue tracker. Development happens in a separate
 Download `HypeDesktop-win-Setup.exe` from the
 [latest release](https://github.com/USACE-WRISES/hype-app/releases/latest) and run it.
 Per-user install, no admin rights; requires the Microsoft WebView2 Runtime (ships with Edge on
-Windows 10 and 11). First launch downloads the modeling runtime (about 450 MB, resumable,
+Windows 10 and 11). First launch downloads the modeling runtime (about 490 MB, resumable,
 checksum-verified). After that the app keeps itself current and offers each update in a banner.
 
 The same release page carries a portable zip: unzip it anywhere and run `HypeDesktop.exe`,
