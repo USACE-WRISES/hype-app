@@ -1,5 +1,31 @@
 # Changelog
 
+## v1.6.0 (2026-11-02)
+- Model areas: draw or import any outline and name its boundaries; a project no longer starts from a reach.
+- Plans: each sets its components, period, coupling and solvers and keeps its own Runs; Run outdated reruns what changed.
+- Projects open in a new format, converted with a backup and rebuilt on a model area; saved projects need 1.6.0 or later.
+- Two-way coupling runs over a period, the models trading water every coupling interval; steady Plans couple pass by pass.
+- Each two-way Run's combined water balance: its raw difference, then what is left after the surface's created water.
+- Weather over a Plan's period: rainfall (constant, a series, a gridded file or a design storm) with losses, and evaporation.
+- Two-way coupling takes rain, and groundwater that rises to the ground can seep onto dry ground, shown apart in the balance.
+- HEC-RAS solves every surface run 1,000 times tighter, keeping far more of its rain and draining water; reruns can differ slightly.
+- A Plan's surface Tolerances: Standard by default, Faster for exploring, Tighter for checks; two-way Plans run Standard or Tighter.
+- A project no longer reads as open in another window after that window closed and Windows reused its process number.
+- Groundwater over a period can start on a surface that is dry at its start, taking the water up through the streambed as it wets.
+- Groundwater over a period reads large floodplains' saved surfaces about 3.6 times faster, with the same results.
+- A general head boundary skips the cells above its head, which MODFLOW refused, so a low regional head no longer stops a run.
+- Groundwater-only Plans run on their waterbodies and boundaries, steady or over a period from their starting heads.
+- Waterbodies: a lake, pond or reservoir drawn on the map, through a bed, at a fixed level or open, its level a value or series.
+- Every Run gets a Site Report in HTML and PDF, results maps and a data files download; GMS exports follow the active Plan.
+- Particle tracking runs two sets, Exchange and Zones, seeding fewer cells away from the water by default, and shows where water came from.
+- Particle sets: place your own points, areas or lines, trace them forward or back, and read their paths, fates and zone maps.
+- Particle tracking and transport read a two-way Run over a period, rebuilt as a MODFLOW run and checked against it.
+- Nearby wells: public USGS and DBHYDRO wells on the map from a downloaded catalog; Find wells searches them and opens their own pages.
+- Add one to Observations with its screen where documented and a USGS well's water levels; DBHYDRO's water levels open in DBHYDRO Insights.
+- 29 of the 30 example sites are rebuilt on their model areas and re-run with this version.
+- A new example, the Kissimmee River in Florida: Hurricane Nicole on the restored and the channelized river, results included.
+- Not yet in 1.6.0: two-way coupling with the land surface on, and tracking or transport on groundwater-only Runs.
+
 ## v1.5.0 (2026-10-15)
 - Events: type, paste or generate a hydrograph on a Flow or Stage boundary, and HEC-RAS runs it with start and maximum maps.
 - Groundwater runs through the event: heads, exchange and the water budget at every saved time, and well readings fit over time.
