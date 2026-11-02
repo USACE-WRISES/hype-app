@@ -14,7 +14,7 @@ projects, the changelog and the issue tracker. Development happens in a separate
 Download `HypeDesktop-win-Setup.exe` from the
 [latest release](https://github.com/USACE-WRISES/hype-app/releases/latest) and run it.
 Per-user install, no admin rights; requires the Microsoft WebView2 Runtime (ships with Edge on
-Windows 10 and 11). First launch downloads the modeling runtime (about 470 MB, resumable,
+Windows 10 and 11). First launch downloads the modeling runtime (about 490 MB, resumable,
 checksum-verified). After that the app keeps itself current and offers each update in a banner.
 
 The same release page carries a portable zip: unzip it anywhere and run `HypeDesktop.exe`,
