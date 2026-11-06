@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.6.1 (2026-11-06)
+- Two-way coupling runs with the land surface on over a period, low ground trading water with the cell that holds it.
+- With the land surface on, two-way coupling takes a gridded rain on the groundwater outside the surface model's mesh.
+- Groundwater with the land surface on no longer stalls where an iteration carried a cell's head past its bracket.
+- Two-way Runs show seepage onto dry ground in every exchange view, and a chain stopped while preparing says it starts over.
+- A two-way Run over a period counts head above the ground outside its surface water only, and names seepage onto dry ground as a drain.
+- Drawn K zones and NRCS soil K land where they are drawn; earlier versions applied them mirrored north to south.
+- A new example, Coffey Road in Glades County, Florida: September's rain on a high water table, two-way, results included.
+- The Kissimmee River example starts with only its channels wet; the gallery offers version 3 in place of a copy opened in 1.6.0.
+- Example packs carry two-way Runs over a period, and a downloaded example keeps every Plan's groundwater results.
+- HTML viewer files: click a flow path for its card; a Display tab sets opacity, flow paths, particle animations and color scales.
+- HTML viewer files carry every results map and both particle animations with their controls, and open at the app's zoom.
+- A groundwater velocity map over a period follows the time bar, and viewer files carry it through time with its arrows.
+- Not yet in 1.6.1: a steady two-way pass with the land surface on, and tracking or transport on those Runs or groundwater-only ones.
+
 ## v1.6.0 (2026-11-02)
 - Model areas: draw or import any outline and name its boundaries; a project no longer starts from a reach.
 - Plans: each sets its components, period, coupling and solvers and keeps its own Runs; Run outdated reruns what changed.
